@@ -1,5 +1,5 @@
 {
-  "name": "teamai-cli",
+  "name": "@bhnan/teamai-cli",
   "version": "0.22.0",
   "description": "TeamAI — Make Every Team AI Native (skill sync + shared knowledge base, powered by Git)",
   "type": "module",
@@ -30,7 +30,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Tencent/teamai-cli.git"
+    "url": "git+https://github.com/bhnan/teamai-cli.git"
   },
   "homepage": "https://github.com/Tencent/teamai-cli#readme",
   "bugs": {
