@@ -673,8 +673,9 @@ async function pullForScope(
   const excludedSkills = new Set(localConfig.excludedSkills ?? []);
 
   // Step 2: Sync each resource type
+  // Fork: wiki (project-bound .wiki/) is part of the default sync set.
   const resourceTypes: readonly ResourceType[] = policy.resourceTypes
-    ?? ['skills', 'rules', 'docs', 'env', 'agents'];
+    ?? ['skills', 'rules', 'docs', 'wiki', 'env', 'agents'];
   let totalSynced = 0;
   let desiredSkillNames: Set<string> | null = null;
   let knownRepoSkillNames: Set<string> | null = null;

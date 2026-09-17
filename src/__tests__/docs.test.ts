@@ -41,10 +41,11 @@ describe('DocsHandler nested documents', () => {
     await handler.pullItem(items[0], teamConfig, localConfig);
 
     for (const docPath of visible) {
-      expect(await fse.readFile(path.join(tmpDir, '.teamai', 'docs', docPath), 'utf8')).toBe(`Content: ${docPath}\n`);
+      // Fork default localDir is `~/docs` (project-bound in project scope); user scope → $HOME/docs.
+      expect(await fse.readFile(path.join(tmpDir, 'docs', docPath), 'utf8')).toBe(`Content: ${docPath}\n`);
     }
     for (const docPath of hidden) {
-      expect(await fse.pathExists(path.join(tmpDir, '.teamai', 'docs', docPath))).toBe(false);
+      expect(await fse.pathExists(path.join(tmpDir, 'docs', docPath))).toBe(false);
     }
   });
 

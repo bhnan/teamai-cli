@@ -53,7 +53,12 @@ export const SharingConfigSchema = z.object({
     enforced: z.array(z.string()).default([]),
   }).default({}),
   docs: z.object({
-    localDir: z.string().default('~/.teamai/docs'),
+    /**
+     * Project-bound docs directory. `~/`-prefixed values re-root to projectRoot
+     * in project scope, so the default lands at `<projectRoot>/docs`.
+     * Fork change: was `~/.teamai/docs`.
+     */
+    localDir: z.string().default('~/docs'),
   }).default({}),
   env: z.object({
     injectShellProfile: z.boolean().default(true),
@@ -548,7 +553,7 @@ export interface TagsConfig {
 
 // ─── Resource types ─────────────────────────────────────
 
-export type ResourceType = 'skills' | 'rules' | 'docs' | 'env' | 'agents' | 'hooks' | 'mcp';
+export type ResourceType = 'skills' | 'rules' | 'docs' | 'wiki' | 'env' | 'agents' | 'hooks' | 'mcp';
 
 export type ResourceItemStatus = 'new' | 'modified';
 

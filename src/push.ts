@@ -509,7 +509,9 @@ async function pushCore(
 
   // Scan for pushable resources first, then resolve namespace for new skills only.
   // Modified skills already carry their namespace from scanLocalForPush.
-  const pushableTypes: ResourceType[] = ['skills', 'rules', 'env', 'agents'];
+  // Fork: docs (project-bound via sharing.docs.localDir) and wiki (.wiki/) are
+  // pushable too — their handlers diff local vs the clone per file.
+  const pushableTypes: ResourceType[] = ['skills', 'rules', 'docs', 'wiki', 'env', 'agents'];
   const fullScan: ResourceItem[] = [];
 
   for (const type of pushableTypes) {

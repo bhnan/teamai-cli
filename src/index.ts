@@ -98,6 +98,20 @@ program
   });
 
 program
+  .command('get [type] [name] [tool]')
+  .description('Get individual resources (skills|rules|docs|wiki) from the team repo clone into this project. `get list [type]` discovers what is available.')
+  .option('--all', 'Mirror the whole team docs directory into the project (docs only)')
+  .option('--diff', 'Preview team vs local wiki differences without writing (wiki only)')
+  .option('--prune', 'Remove local files missing from the team repo (wiki/docs mirror modes)')
+  .option('--force', 'Overwrite existing local copies')
+  .option('--refresh', 'Fast-forward the local team repo clone before reading')
+  .action(async (type, name, tool, cmdOpts) => {
+    const globalOpts = program.opts() as GlobalOptions;
+    const { get } = await import('./get-cmd.js');
+    await get({ ...globalOpts, ...cmdOpts, type, name, tool });
+  });
+
+program
   .command('status')
   .description('Show local vs team repo diff')
   .option('--all', 'List every project data partition under ~/.teamai/projects (flags stale/orphan ones)')
