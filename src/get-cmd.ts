@@ -3,8 +3,7 @@ import fse from 'fs-extra';
 import { detectProjectConfig, loadLocalConfigForScope, loadTeamConfig } from './config.js';
 import { resolveToolBaseDir, scopedToolPaths } from './types.js';
 import type { GlobalOptions, LocalConfig, ResourceItem, TeamaiConfig } from './types.js';
-import { getHandler } from './resources/index.js';
-import { isToolInstalledForConfig, ResourceHandler } from './resources/base.js';
+import { ResourceHandler, isToolInstalledForConfig } from './resources/base.js';
 import { ruleFileExtensionForTool, usesCopilotInstructions, usesCursorMdcRules } from './resources/rule-format.js';
 import { teamRuleToCursorMdc } from './resources/cursor-mdc.js';
 import { teamRuleToCopilotInstructions } from './resources/copilot-instructions.js';
@@ -37,9 +36,10 @@ interface Ctx {
 
 // ─── Pure helpers (unit-tested) ─────────────────────────
 
-/** Reject path traversal (`..`) and absolute paths in resource names. */
+/** Reject path traversal (`..`/`.` segments) and absolute paths in resource names. */
 export function isValidName(name: string): boolean {
-  return !name.includes('..') && !name.startsWith('/');
+  if (name.includes('..') || name.startsWith('/')) return false;
+  return !name.split('/').some((s) => s === '.' || s.length === 0);
 }
 
 /** Resolve `skills/<name>` or `skills/<ns>/<name>`; null when absent; throws on ambiguity. */
@@ -157,6 +157,7 @@ function usage(hint?: string): void {
       '  teamai get docs   --all [--prune]         # mirror the team docs directory',
       '  teamai get wiki   [page] [--force]        # omit page = whole-repo mirror',
       '  teamai get wiki   --diff                  # preview team vs local differences',
+      'Note: docs/wiki have no delete direction in v1 — remove pages in the team repo directly.',
       'Options: --refresh fast-forwards the local clone first (default: offline)',
     ].join('\n'),
   );
@@ -250,6 +251,9 @@ export async function get(options: GetOptions): Promise<void> {
   if (all && type !== 'docs') return usage('`--all` applies to docs only');
   if (prune && type !== 'wiki' && type !== 'docs') return usage('`--prune` applies to mirror modes only');
   if (type === 'wiki' && diff && prune) return usage('`--diff` is read-only; `--prune` not applicable');
+  if (all && name) return usage('`--all` mirrors the whole directory; drop the name');
+  if (diff && name) return usage('`--diff` previews the whole wiki; drop the name');
+  if ((type === 'docs' || type === 'wiki') && tool) return usage('`tool` applies to skills/rules only');
   if (name && !isValidName(name)) return fail(`Invalid path: ${name}`);
 
   const ctx = await detectContext();
@@ -282,22 +286,36 @@ export async function get(options: GetOptions): Promise<void> {
         return;
       }
       const item: ResourceItem = { name, type: 'skills', sourcePath: src, relativePath: `skills/${name}` };
-      const handler = getHandler('skills');
+      const allPaths = scopedToolPaths(ctx.teamConfig, { scope: ctx.scope });
+      const targetTools: string[] = [];
       if (tool) {
-        const paths = scopedToolPaths(ctx.teamConfig, { scope: ctx.scope });
-        const tp = paths[tool];
-        if (!tp?.skills) return fail(`Tool '${tool}' has no skills path`);
-        if (!(await isToolInstalledForConfig(tool, tp.skills, ctx.localConfig))) {
-          return fail(`Tool not installed: ${tool}`);
+        targetTools.push(tool);
+      } else {
+        for (const t of Object.keys(allPaths)) {
+          const tp = allPaths[t];
+          if (tp.skills && (await isToolInstalledForConfig(t, tp.skills, ctx.localConfig))) targetTools.push(t);
         }
-        const dest = path.join(resolveToolBaseDir(tool, ctx.localConfig), tp.skills, name);
+        if (targetTools.length === 0) return fail('No installed tools with a skills path');
+      }
+      // Overwrite guard (spec rule 2): refuse unless --force when any target already exists.
+      if (!force) {
+        const conflicts: string[] = [];
+        for (const t of targetTools) {
+          const existing = path.join(resolveToolBaseDir(t, ctx.localConfig), allPaths[t].skills!, name);
+          if (await pathExists(existing)) conflicts.push(existing);
+        }
+        if (conflicts.length > 0) {
+          return fail(
+            `Already exists: ${conflicts[0]}${conflicts.length > 1 ? ` (+${conflicts.length - 1} more)` : ''} (use --force to overwrite)`,
+          );
+        }
+      }
+      for (const t of targetTools) {
+        const dest = path.join(resolveToolBaseDir(t, ctx.localConfig), allPaths[t].skills!, name);
         await fse.remove(dest);
         await fse.ensureDir(path.dirname(dest));
         await fse.copy(src, dest);
         log.info(`✓ ${name} → ${dest}`);
-      } else {
-        await handler.pullItem(item, ctx.teamConfig, ctx.localConfig);
-        log.info(`✓ ${name} synced to installed tools`);
       }
       log.info('Note: a pulled copy may be overwritten by the next `teamai pull`.');
       return;
@@ -323,32 +341,53 @@ export async function get(options: GetOptions): Promise<void> {
       const rel = path.relative(path.join(ctx.repo, 'rules'), src);
       const stem = rel.replace(/\.md$/, '');
       const item: ResourceItem = { name: stem, type: 'rules', sourcePath: src, relativePath: `rules/${rel}` };
-      const handler = getHandler('rules');
+      const allPaths = scopedToolPaths(ctx.teamConfig, { scope: ctx.scope });
+      const targetTools: string[] = [];
       if (tool) {
-        const paths = scopedToolPaths(ctx.teamConfig, { scope: ctx.scope });
-        const tp = paths[tool];
-        if (!tp?.rules) return fail(`Tool '${tool}' has no rules path`);
-        if (!(await isToolInstalledForConfig(tool, tp.rules, ctx.localConfig))) {
-          return fail(`Tool not installed: ${tool}`);
+        targetTools.push(tool);
+      } else {
+        for (const t of Object.keys(allPaths)) {
+          const tp = allPaths[t];
+          if (tp.rules && (await isToolInstalledForConfig(t, tp.rules, ctx.localConfig))) targetTools.push(t);
         }
-        const destDir = path.join(resolveToolBaseDir(tool, ctx.localConfig), tp.rules);
+        if (targetTools.length === 0) return fail('No installed tools with a rules path');
+      }
+      // Overwrite guard (spec rule 2): per-tool rendered destination must not exist unless --force.
+      if (!force) {
+        const conflicts: string[] = [];
+        for (const t of targetTools) {
+          const existing = path.join(
+            resolveToolBaseDir(t, ctx.localConfig),
+            allPaths[t].rules!,
+            `${stem}${ruleFileExtensionForTool(t)}`,
+          );
+          if (await pathExists(existing)) conflicts.push(existing);
+        }
+        if (conflicts.length > 0) {
+          return fail(
+            `Already exists: ${conflicts[0]}${conflicts.length > 1 ? ` (+${conflicts.length - 1} more)` : ''} (use --force to overwrite)`,
+          );
+        }
+      }
+      const raw = await readFileSafe(src);
+      if (raw === null) return fail(`Cannot read rule source: ${src}`);
+      for (const t of targetTools) {
+        const destDir = path.join(resolveToolBaseDir(t, ctx.localConfig), allPaths[t].rules!);
         await fse.ensureDir(destDir);
-        const dest = path.join(destDir, `${stem}${ruleFileExtensionForTool(tool)}`);
-        const raw = await readFileSafe(src);
-        if (raw === null) return fail(`Cannot read rule source: ${src}`);
-        if (usesCursorMdcRules(tool)) {
+        const dest = path.join(destDir, `${stem}${ruleFileExtensionForTool(t)}`);
+        if (usesCursorMdcRules(t)) {
           await fse.writeFile(dest, teamRuleToCursorMdc(raw), 'utf-8');
+          // Mirror official RulesHandler: drop legacy `.md` copies that these tools ignore.
+          await fse.remove(path.join(destDir, `${stem}.md`));
           log.info(`✓ ${stem} → ${dest} (rendered .mdc)`);
-        } else if (usesCopilotInstructions(tool)) {
+        } else if (usesCopilotInstructions(t)) {
           await fse.writeFile(dest, teamRuleToCopilotInstructions(raw), 'utf-8');
+          await fse.remove(path.join(destDir, `${stem}.md`));
           log.info(`✓ ${stem} → ${dest} (rendered instructions)`);
         } else {
           await fse.copy(src, dest);
           log.info(`✓ ${stem} → ${dest}`);
         }
-      } else {
-        await handler.pullItem(item, ctx.teamConfig, ctx.localConfig);
-        log.info(`✓ ${stem} synced to installed tools`);
       }
       log.info('Note: a pulled copy may be overwritten by the next `teamai pull`.');
       return;

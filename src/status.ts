@@ -117,6 +117,13 @@ export async function status(options: GlobalOptions): Promise<void> {
 
   counts.mcp = (await parseTeamMcpServers(repoPath)).length;
 
+  try {
+    counts.wiki = (await listFilesRecursive(path.join(repoPath, '.wiki')))
+      .filter((f) => f.endsWith('.md')).length;
+  } catch {
+    counts.wiki = 0;
+  }
+
   for (const type of RESOURCE_TYPES) {
     console.log(`  ${type}: ${counts[type] ?? 0}`);
   }

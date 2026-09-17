@@ -40,6 +40,13 @@ describe('isValidName', () => {
     expect(isValidName('/abs')).toBe(false);
     expect(isValidName('a/../b')).toBe(false);
   });
+
+  it('rejects degenerate dot segments and empty segments', () => {
+    expect(isValidName('.')).toBe(false);
+    expect(isValidName('a/./b')).toBe(false);
+    expect(isValidName('ns/')).toBe(false);
+    expect(isValidName('')).toBe(false);
+  });
 });
 
 describe('resolveSkillSource', () => {

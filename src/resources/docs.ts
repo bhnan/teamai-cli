@@ -2,7 +2,7 @@ import path from 'node:path';
 import fse from 'fs-extra';
 import { ResourceHandler } from './base.js';
 import type { ResourceItem, TeamaiConfig, LocalConfig } from '../types.js';
-import { expandHome, listFilesRecursive, pathExists, readFileSafe } from '../utils/fs.js';
+import { expandHome, fileContentEqual, listFilesRecursive, pathExists } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
 
 /**
@@ -40,7 +40,8 @@ export class DocsHandler extends ResourceHandler {
       const localFile = path.join(localDocsDir, rel);
       const repoFile = path.join(repoDocsDir, rel);
       const exists = await pathExists(repoFile);
-      const same = exists && (await readFileSafe(localFile)) === (await readFileSafe(repoFile));
+      // Binary-safe comparison (utf-8 decode can collapse distinct binaries).
+      const same = exists && (await fileContentEqual(localFile, repoFile));
       if (!same) {
         items.push({
           name: rel,

@@ -767,7 +767,7 @@ export function getUpdateLockPath(): string {
   return path.join(getTeamaiHomeDir(), '.update-lock');
 }
 
-export const RESOURCE_TYPES: ResourceType[] = ['skills', 'rules', 'docs', 'env', 'agents', 'hooks', 'mcp'];
+export const RESOURCE_TYPES: ResourceType[] = ['skills', 'rules', 'docs', 'wiki', 'env', 'agents', 'hooks', 'mcp'];
 
 export const TEAMAI_RULES_START = '<!-- [teamai:rules:start] -->';
 export const TEAMAI_RULES_END = '<!-- [teamai:rules:end] -->';

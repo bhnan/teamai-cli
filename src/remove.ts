@@ -7,7 +7,9 @@ import { getHandler } from './resources/index.js';
 import type { GlobalOptions, ResourceType, LocalConfig, TeamaiConfig } from './types.js';
 import { askConfirmation } from './utils/prompt.js';
 
-const REMOVABLE_TYPES: ResourceType[] = ['skills', 'rules', 'agents', 'mcp', 'wiki'];
+// wiki/docs v1: no delete direction — `teamai remove` intentionally rejects them
+// (WikiHandler.removeItem / DocsHandler.removeItem only warn). Keep lists aligned.
+const REMOVABLE_TYPES: ResourceType[] = ['skills', 'rules', 'agents', 'mcp'];
 
 export async function remove(
   type: string,
