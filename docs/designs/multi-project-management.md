@@ -202,6 +202,36 @@ experience) both need it, without affecting the single-project main path.
 | old `members/<user>.yaml` / `config.yaml` without `projects` | parsed as `[]`, no error |
 | existing flat `learnings/*.md` | all stay at root = shared with everyone, **zero migration** |
 
+## Extension (003): docs and wiki join the project model via paths
+
+The original design namespaced skills/knowledge/learnings/agents through the
+manifest's `resources` keys and left `docs/` + `.wiki/` flat. Requirement
+003 (`docs/003-docs-wiki-project-namespace/`) extends coverage to docs and wiki
+through **path-based ownership** — deliberately NOT via new manifest keys:
+
+```text
+team-repo/
+  docs/                      # root = team-shared (unchanged)
+    <project-id>/            # project-private docs (sync while active)
+  .wiki/
+    <wiki-id>/               # team-shared wiki collection (unchanged shape)
+    <project-id>/            # project-private wiki home
+      <wiki-id>/             # one of the project's MANY wikis (extra namespace level)
+```
+
+- A first-level dir under `docs/` or `.wiki/` whose name equals a defined
+  project id is that project's namespace; everything else is shared. The
+  manifest is only the source of project ids — no `resources.docs`/`resources.wiki`
+  keys exist, so ownership cannot drift between manifest and path.
+- Sync scope = shared root + the active projects' namespaces (`localConfig.projects`).
+- Deactivation cleanup follows the skills data-safety rule: a local namespace dir
+  is removed on the next pull only when it matches the team repo byte-for-byte;
+  local edits are kept with a warning.
+- First-level names equal to a defined project id are reserved (a shared wiki or
+  docs dir must not be named after a project id) — same admin-side
+  disambiguation duty as same-named resources across namespaces.
+- Existing flat `docs/` files and `.wiki/` pages remain shared-root content.
+
 ## Open questions — resolved
 
 - **Q1: auto-activate when the manifest has exactly one project?** Roles auto-select

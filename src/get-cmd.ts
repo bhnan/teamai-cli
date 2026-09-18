@@ -8,6 +8,7 @@ import { ruleFileExtensionForTool, usesCopilotInstructions, usesCursorMdcRules }
 import { teamRuleToCursorMdc } from './resources/cursor-mdc.js';
 import { teamRuleToCopilotInstructions } from './resources/copilot-instructions.js';
 import { resolveDocsLocalDir } from './resources/docs.js';
+import { loadDefinedProjectIds, activeProjectIds, namespaceDirSafeToRemove } from './resources/namespace-utils.js';
 import { listDirs, listFilesRecursive, pathExists, readFileSafe } from './utils/fs.js';
 import { pullRepo } from './utils/git.js';
 import { log } from './utils/logger.js';
@@ -91,6 +92,42 @@ export async function resolveDocsSource(repoDocs: string, name: string): Promise
   return null;
 }
 
+/**
+ * Namespace-aware doc/wiki page resolution (003).
+ *
+ * Resolution order: shared root first, then each active project namespace dir.
+ * An explicit path that already carries a namespace prefix (e.g. `a/x.md`) is
+ * resolved directly against the root — explicit requests are not blocked by the
+ * active set (same rule as skills, review Y5). Multiple hits → throw with the
+ * candidate list (caller prints usage-style error).
+ */
+export async function resolveNamespacedSource(
+  repoRoot: string,
+  name: string,
+  projectDirs: string[],
+): Promise<string | null> {
+  const cands: string[] = [];
+  const probe = async (base: string) => {
+    const exact = path.join(base, name);
+    if (await pathExists(exact)) cands.push(exact);
+    const withMd = path.join(base, `${name}.md`);
+    if (await pathExists(withMd)) cands.push(withMd);
+  };
+  await probe(repoRoot);
+  for (const dir of projectDirs) {
+    await probe(path.join(repoRoot, dir));
+  }
+  if (cands.length === 1) return cands[0];
+  if (cands.length > 1) {
+    throw new Error(
+      `'${name}' exists in multiple namespaces:\n  ${cands
+        .map((c) => path.relative(repoRoot, c))
+        .join('\n  ')}`,
+    );
+  }
+  return null;
+}
+
 /** Discover pullable entries per type (what `get list` prints). */
 export async function listTypeEntries(repo: string, type: GetType): Promise<string[]> {
   const dirFor: Record<GetType, string> = { skills: 'skills', rules: 'rules', docs: 'docs', wiki: '.wiki' };
@@ -113,16 +150,29 @@ export async function listTypeEntries(repo: string, type: GetType): Promise<stri
   return files.filter((f) => (type === 'docs' ? !hasDotSegment(f) : f.endsWith('.md') && !hasDotSegment(f))).sort();
 }
 
-/** Compare the team repo wiki against the local wiki (read-only). */
+/**
+ * Compare the team repo wiki against the local wiki (read-only).
+ *
+ * Optional scope (003): when `definedProjectIds` is given, wiki collections
+ * under inactive project namespaces are excluded from the diff — the mirror
+ * scope is shared root + active project namespaces only.
+ */
 export async function computeWikiDiff(
   srcWiki: string,
   dstWiki: string,
+  definedProjectIds?: Set<string>,
+  active?: string[],
 ): Promise<{ onlyInSrc: string[]; onlyInDst: string[]; changed: string[] }> {
+  const inScope = (rel: string): boolean => {
+    if (!definedProjectIds || definedProjectIds.size === 0) return true;
+    const top = rel.split('/')[0];
+    return active && definedProjectIds.has(top) ? active.includes(top) : true;
+  };
   const srcFiles = (await pathExists(srcWiki))
-    ? (await listFilesRecursive(srcWiki)).filter((f) => f.endsWith('.md') && !hasDotSegment(f)).sort()
+    ? (await listFilesRecursive(srcWiki)).filter((f) => f.endsWith('.md') && !hasDotSegment(f) && inScope(f)).sort()
     : [];
   const dstFiles = (await pathExists(dstWiki))
-    ? (await listFilesRecursive(dstWiki)).filter((f) => f.endsWith('.md') && !hasDotSegment(f)).sort()
+    ? (await listFilesRecursive(dstWiki)).filter((f) => f.endsWith('.md') && !hasDotSegment(f) && inScope(f)).sort()
     : [];
   const dstSet = new Set(dstFiles);
   const srcSet = new Set(srcFiles);
@@ -396,14 +446,45 @@ export async function get(options: GetOptions): Promise<void> {
     case 'docs': {
       const localDocsDir = resolveDocsLocalDir(ctx.teamConfig, ctx.localConfig);
       const repoDocs = path.join(ctx.repo, 'docs');
+      const defined = await loadDefinedProjectIds(ctx.repo);
+      const active = activeProjectIds(ctx.localConfig);
       if (all) {
         if (!(await pathExists(repoDocs))) return fail('No docs in team repo');
         await fse.ensureDir(localDocsDir);
+        // Shared root: copy everything except first-level project namespace dirs.
         await fse.copy(repoDocs, localDocsDir, {
           overwrite: true,
-          filter: (srcPath: string) => !path.basename(srcPath).startsWith('.'),
+          filter: (srcPath: string) => {
+            const base = path.basename(srcPath);
+            if (base.startsWith('.')) return false;
+            const relToRoot = path.relative(repoDocs, srcPath);
+            return !(relToRoot && !relToRoot.includes(path.sep) && defined.has(relToRoot));
+          },
         });
+        // Active project namespaces.
+        for (const pid of active) {
+          const src = path.join(repoDocs, pid);
+          if (!(await pathExists(src))) continue;
+          await fse.ensureDir(path.join(localDocsDir, pid));
+          await fse.copy(src, path.join(localDocsDir, pid), {
+            overwrite: true,
+            filter: (p: string) => !path.basename(p).startsWith('.'),
+          });
+        }
         if (prune) {
+          // Inactive project namespaces are removed whole — with the same
+          // data-safety guard as pull (local edits are kept, never silent).
+          for (const top of await listDirs(localDocsDir)) {
+            if (defined.has(top) && !active.includes(top)) {
+              const dir = path.join(localDocsDir, top);
+              if (!(await namespaceDirSafeToRemove(dir, path.join(repoDocs, top)))) {
+                log.warn(`[${ctx.scope}] Kept docs/${top}: it has local changes or files not in the team repo. Push or back them up, then delete it manually.`);
+                continue;
+              }
+              await fse.remove(dir);
+              log.info(`  − removed inactive docs namespace: ${top}`);
+            }
+          }
           for (const rel of await listFilesRecursive(localDocsDir)) {
             if (hasDotSegment(rel)) continue;
             if (!(await pathExists(path.join(repoDocs, rel)))) {
@@ -419,7 +500,13 @@ export async function get(options: GetOptions): Promise<void> {
         await printType(ctx, 'docs');
         return;
       }
-      const src = await resolveDocsSource(repoDocs, name);
+      let src: string | null;
+      try {
+        src = await resolveNamespacedSource(repoDocs, name, active);
+      } catch (e) {
+        fail((e as Error).message);
+        return;
+      }
       if (!src) {
         fail(`Doc not found in team repo: ${name}. Available:`);
         await printType(ctx, 'docs');
@@ -442,8 +529,10 @@ export async function get(options: GetOptions): Promise<void> {
         ctx.scope === 'project' && ctx.localConfig.projectRoot
           ? path.join(ctx.localConfig.projectRoot, '.wiki')
           : path.join(getUserHome(), '.wiki');
+      const defined = await loadDefinedProjectIds(ctx.repo);
+      const active = activeProjectIds(ctx.localConfig);
       if (diff) {
-        const d = await computeWikiDiff(repoWiki, localWiki);
+        const d = await computeWikiDiff(repoWiki, localWiki, defined, active);
         let any = false;
         for (const f of d.onlyInSrc) { log.info(`  + ${f} (team repo only)`); any = true; }
         for (const f of d.onlyInDst) { log.info(`  − ${f} (local only)`); any = true; }
@@ -452,7 +541,13 @@ export async function get(options: GetOptions): Promise<void> {
         return;
       }
       if (name) {
-        const src = await resolveDocsSource(repoWiki, name);
+        let src: string | null;
+        try {
+          src = await resolveNamespacedSource(repoWiki, name, active);
+        } catch (e) {
+          fail((e as Error).message);
+          return;
+        }
         if (!src) {
           fail(`Wiki page not found in team repo: ${name}. Available:`);
           await printType(ctx, 'wiki');
@@ -471,11 +566,39 @@ export async function get(options: GetOptions): Promise<void> {
       if (!(await pathExists(repoWiki))) return fail('No .wiki in team repo');
       await fse.ensureDir(localWiki);
       const copyRoot = repoWiki;
+      // Shared root: exclude first-level project namespace dirs.
       await fse.copy(repoWiki, localWiki, {
         overwrite: true,
-        filter: (srcPath: string) => srcPath === copyRoot || !path.basename(srcPath).startsWith('.'),
+        filter: (srcPath: string) => {
+          if (srcPath === copyRoot) return true;
+          const base = path.basename(srcPath);
+          if (base.startsWith('.')) return false;
+          const relToRoot = path.relative(repoWiki, srcPath);
+          return !(relToRoot && !relToRoot.includes(path.sep) && defined.has(relToRoot));
+        },
       });
+      // Active project wikis (a project may own multiple wiki collections).
+      for (const pid of active) {
+        const src = path.join(repoWiki, pid);
+        if (!(await pathExists(src))) continue;
+        await fse.ensureDir(path.join(localWiki, pid));
+        await fse.copy(src, path.join(localWiki, pid), {
+          overwrite: true,
+          filter: (p: string) => p === src || !path.basename(p).startsWith('.'),
+        });
+      }
       if (prune) {
+        for (const top of await listDirs(localWiki)) {
+          if (defined.has(top) && !active.includes(top)) {
+            const dir = path.join(localWiki, top);
+            if (!(await namespaceDirSafeToRemove(dir, path.join(repoWiki, top)))) {
+              log.warn(`[${ctx.scope}] Kept .wiki/${top}: it has local changes or files not in the team repo. Push or back them up, then delete it manually.`);
+              continue;
+            }
+            await fse.remove(dir);
+            log.info(`  − removed inactive wiki namespace: ${top}`);
+          }
+        }
         for (const rel of await listFilesRecursive(localWiki)) {
           if (hasDotSegment(rel) || !rel.endsWith('.md')) continue;
           if (!(await pathExists(path.join(repoWiki, rel)))) {

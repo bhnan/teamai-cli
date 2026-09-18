@@ -8,7 +8,7 @@ import { learningsRoots } from './utils/learnings-roots.js';
 import { log, spinner } from './utils/logger.js';
 import { pathExists, remove, listFiles, listDirs, listFilesRecursive, readFileSafe, dirContentEqual, hasVcsMetadataRecursive } from './utils/fs.js';
 import { injectClaudeMdSection } from './utils/claudemd.js';
-import { getHandler, RulesHandler, DocsHandler, EnvHandler, AgentsHandler } from './resources/index.js';
+import { getHandler, RulesHandler, DocsHandler, WikiHandler, EnvHandler, AgentsHandler } from './resources/index.js';
 import { ResourceHandler } from './resources/base.js';
 import { ruleFileExtensionForTool } from './resources/rule-format.js';
 import { AGENT_FILE_EXTENSIONS } from './resources/agent-format.js';
@@ -777,15 +777,19 @@ async function pullForScope(
       continue;
     }
 
-    if (type === 'docs') {
-      const docsHandler = handler as DocsHandler;
-      const fileCount = await docsHandler.countDocFiles(items[0].sourcePath);
+    if (type === 'docs' || type === 'wiki') {
+      let fileCount = 0;
+      for (const item of items) {
+        if (!options.dryRun) {
+          await handler.pullItem(item, freshConfig, localConfig);
+        }
+        fileCount += await (handler as DocsHandler).countBundleFiles(item, localConfig);
+      }
 
       if (options.dryRun) {
-        log.info(`[${scopeLabel}] [dry-run] Would sync ${fileCount} docs`);
+        log.info(`[${scopeLabel}] [dry-run] Would sync ${fileCount} ${type}(s)`);
       } else {
-        await docsHandler.pullItem(items[0], freshConfig, localConfig);
-        log.success(`[${scopeLabel}] Synced ${fileCount} docs`);
+        log.success(`[${scopeLabel}] Synced ${fileCount} ${type}(s)`);
       }
       totalSynced += fileCount;
       continue;
@@ -843,6 +847,26 @@ async function pullForScope(
         localConfig,
         roleContext.activeNamespaces.agents,
       );
+    }
+  }
+
+  // Fork (003): project-deactivation cleanup for docs/wiki namespaces. Only
+  // runs when the type is in the pull policy (default includes both). Dry-run
+  // reports the candidates without removing (spec: dry-run 可预览).
+  if (resourceTypes.includes('docs')) {
+    const docsRemoved = await (getHandler('docs') as DocsHandler)
+      .cleanupInactiveNamespaces(freshConfig, localConfig, !!options.dryRun);
+    if (docsRemoved.length > 0) {
+      const verb = options.dryRun ? '[dry-run] Would remove' : 'Removed';
+      log.info(`[${scopeLabel}] ${verb} inactive docs namespace(s): ${docsRemoved.join(', ')}`);
+    }
+  }
+  if (resourceTypes.includes('wiki')) {
+    const wikiRemoved = await (getHandler('wiki') as WikiHandler)
+      .cleanupInactiveNamespaces(localConfig, !!options.dryRun);
+    if (wikiRemoved.length > 0) {
+      const verb = options.dryRun ? '[dry-run] Would remove' : 'Removed';
+      log.info(`[${scopeLabel}] ${verb} inactive wiki namespace(s): ${wikiRemoved.join(', ')}`);
     }
   }
 

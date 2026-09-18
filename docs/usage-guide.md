@@ -202,13 +202,26 @@ cd ~/work/hai-inference && teamai init <team-repo> --project hai-inference
 cd ~/work/billing       && teamai init <team-repo> --project billing
 ```
 
-Each directory then syncs only its own project's skills/rules/CLAUDE.md and
-learnings. Key points:
+Each directory then syncs only its own project's skills/rules/CLAUDE.md,
+docs, wiki, and learnings. Key points:
 
 - **Learnings isolation.** `learnings/` at the repo root is shared with the whole
   team; a project's private learnings live under `learnings/<project-id>/` and
   only surface in `teamai recall` for members of that project. A directory with
   no active project sees the shared root only.
+- **Docs isolation.** `docs/` at the repo root stays team-shared; a project's
+  private documents live under `docs/<project-id>/` and sync only while that
+  project is active. Deactivating a project removes its local namespace dir on
+  the next `pull` — but only when the local copy matches the team repo; local
+  changes are kept with a warning, never deleted silently.
+- **Wiki namespaces (project + wiki-id).** `.wiki/` holds named wiki
+  collections: `.wiki/<wiki-id>/` is a team-shared wiki, and
+  `.wiki/<project-id>/<wiki-id>/` are that project's private wikis — a project
+  can own any number of them. Sync scope = shared collections + the active
+  project's collections. Deactivation cleans the project's local wiki dir under
+  the same data-safety rule as docs. First-level dir names equal to a defined
+  project id are reserved for project namespaces — do not name a shared wiki
+  collection or a shared docs dir after a project id.
 - **Not auto-activated.** Unlike a lone role, a lone project is not auto-selected
   — a member may legitimately belong to no project (they still get `common` and
   the shared learnings root).
@@ -472,7 +485,7 @@ teamai pull --dry-run    # Dry run, no actual changes
 
 > Project scope is isolated by default. When the current working directory contains a project-scope `.teamai/config.yaml`, `pull` processes that project and skips user scope unless the local config has `inheritUserScope: true`; in that case it first refreshes the safe user-resource channel. Without a project config in the current directory, `pull` processes user scope. User `env`, MCP definitions, sources, reporting, and writes remain isolated in project mode. Hooks are the one exception: a project scope's hooks are injected into your **HOME** tool settings (`~/.claude/settings.json`, …), not `<projectRoot>`, because the built-in hooks gate on the `cwd` handed to `hook-dispatch` and `~/.claude` always exists so the "installed tool" gate passes (see the Hooks section). Self single-repo mode keeps its hooks in the business repo so they travel on clone.
 
-With role-based skills enabled, `pull`'s skill sync source becomes the contents of `skills/<namespace>/`, expanded according to `primaryRole + additionalRoles` and flattened into each local AI tool's skills directory. `rules/` and `docs/` keep their original sync behavior; `agents/<namespace>/` follows the role's `agents` namespaces (see [Agents Resource Type](#agents-resource-type)). `learnings/` at the root is shared with everyone, while `learnings/<project-id>/` subdirectories sync only for the directory's active projects (see [Multi-project](#multi-project-project-as-a-dimension-orthogonal-to-role)).
+With role-based skills enabled, `pull`'s skill sync source becomes the contents of `skills/<namespace>/`, expanded according to `primaryRole + additionalRoles` and flattened into each local AI tool's skills directory. `rules/` keep their original sync behavior and `docs/`/`.wiki/` carry no *role* namespaces (roles never select them); docs and wiki gain *project* namespaces instead — see [Multi-project](#multi-project-project-as-a-dimension-orthogonal-to-role). `agents/<namespace>/` follows the role's `agents` namespaces (see [Agents Resource Type](#agents-resource-type)). `learnings/` at the root is shared with everyone, while `learnings/<project-id>/` subdirectories sync only for the directory's active projects (see [Multi-project](#multi-project-project-as-a-dimension-orthogonal-to-role)).
 
 ### Team packages
 

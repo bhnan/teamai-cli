@@ -7,6 +7,7 @@ import {
   isValidName,
   listTypeEntries,
   resolveDocsSource,
+  resolveNamespacedSource,
   resolveRuleSource,
   resolveSkillSource,
 } from '../get-cmd.js';
@@ -134,6 +135,58 @@ describe('computeWikiDiff', () => {
     const diff = await computeWikiDiff(path.join(tmp, '.wiki'), path.join(tmp, 'local', '.wiki'));
     expect(diff.onlyInSrc).toEqual(['Home.md']);
     expect(diff.onlyInDst).toEqual([]);
+  });
+
+  it('scope filter (003): excludes inactive project namespace wikis from the diff', async () => {
+    write('.wiki/team/Home.md', 'h');
+    write('.wiki/alpha/tech/t.md', 't');
+    write('local/.wiki/team/Home.md', 'h2');
+    write('local/.wiki/alpha/tech/t.md', 't2');
+    const defined = new Set(['alpha', 'beta']);
+    const diff = await computeWikiDiff(
+      path.join(tmp, '.wiki'), path.join(tmp, 'local', '.wiki'), defined, ['beta'],
+    );
+    // alpha is a defined but INACTIVE project namespace → excluded from the diff.
+    expect(diff.changed).toEqual(['team/Home.md']);
+    expect(diff.onlyInSrc).toEqual([]);
+    expect(diff.onlyInDst).toEqual([]);
+  });
+});
+
+describe('resolveNamespacedSource (003)', () => {
+  it('treats shared-root + project namespace duplicates as ambiguous (001 rule 7)', async () => {
+    write('docs/shared.md', 'shared');
+    write('docs/alpha/shared.md', 'project');
+    const docs = path.join(tmp, 'docs');
+    await expect(resolveNamespacedSource(docs, 'shared.md', ['alpha']))
+      .rejects.toThrow(/multiple namespaces/);
+  });
+
+  it('falls through to active project namespace dirs', async () => {
+    write('docs/alpha/a.md', 'a');
+    const docs = path.join(tmp, 'docs');
+    expect(await resolveNamespacedSource(docs, 'a', ['alpha']))
+      .toBe(path.join(docs, 'alpha', 'a.md'));
+  });
+
+  it('explicit namespace prefix resolves even when the namespace is not in the active list', async () => {
+    write('docs/beta/b.md', 'b');
+    const docs = path.join(tmp, 'docs');
+    expect(await resolveNamespacedSource(docs, 'beta/b.md', []))
+      .toBe(path.join(docs, 'beta', 'b.md'));
+  });
+
+  it('throws listing candidates on ambiguity across namespaces', async () => {
+    write('docs/shared.md', 'shared');
+    write('docs/alpha/shared.md', 'project');
+    const docs = path.join(tmp, 'docs');
+    await expect(resolveNamespacedSource(docs, 'shared', ['alpha']))
+      .rejects.toThrow(/multiple namespaces/);
+  });
+
+  it('returns null when nothing matches', async () => {
+    const docs = path.join(tmp, 'docs');
+    expect(await resolveNamespacedSource(docs, 'nope', ['alpha'])).toBeNull();
   });
 });
 

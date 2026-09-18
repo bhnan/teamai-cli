@@ -194,11 +194,21 @@ cd ~/work/hai-inference && teamai init <team-repo> --project hai-inference
 cd ~/work/billing       && teamai init <team-repo> --project billing
 ```
 
-此后每个目录只同步自己项目的 skills/rules/CLAUDE.md 与 learnings。要点：
+此后每个目录只同步自己项目的 skills/rules/CLAUDE.md、docs、wiki 与 learnings。要点：
 
 - **learnings 隔离。** 仓库 `learnings/` 根目录对全团队共享；项目私有经验放在
   `learnings/<project-id>/` 子目录下，只对该项目成员的 `teamai recall` 可见。
   未激活任何项目的目录只能看到共享的根目录。
+- **docs 隔离。** 仓库 `docs/` 根目录保持全团队共享；项目私有文档放在
+  `docs/<project-id>/` 下，仅在该项目激活时同步。项目去激活后，下次 `pull`
+  会清理本地对应命名空间目录——但仅当本地副本与团队仓一致；本地有改动时
+  保留并警告，绝不静默删除。
+- **wiki 双层命名空间（项目 + wiki-id）。** `.wiki/` 下是命名 Wiki 集合：
+  `.wiki/<wiki-id>/` 为全团队共享 Wiki；`.wiki/<project-id>/<wiki-id>/` 为该项目
+  私有 Wiki——**一个项目可以拥有任意多个 Wiki**。同步范围 = 共享集合 + 活动项目
+  的集合；去激活清理走与 docs 相同的数据安全规则。第一层目录名与已定义
+  project id 相同即为项目命名空间保留词——不要用 project id 给共享 Wiki 集合或
+  共享 docs 目录命名。
 - **不自动激活。** 与「唯一 role 会被自动选中」不同，唯一的 project 不会自动选中
   —— 成员可以不属于任何项目（仍能获得 `common` 与共享的 learnings 根）。
 - **一次激活全部。** `--project all` 是保留值：展开为 manifest 声明的全部 id
@@ -450,7 +460,7 @@ teamai pull --dry-run    # 试运行，不实际修改
 
 > Project scope 默认与 user scope 隔离。当前工作目录包含 project scope 的 `.teamai/config.yaml` 时，`pull` 会处理该项目并跳过 user scope；仅当本地配置包含 `inheritUserScope: true` 时，才会先刷新安全的 user 资源通道。当前目录没有 project 配置时，`pull` 处理 user scope。project 模式下，user 的 `env`、MCP 定义、sources、reporting 和写入行为仍保持隔离。hooks 是唯一例外：project scope 的 hooks 会注入到你的 **HOME** 工具设置（`~/.claude/settings.json` 等），而非 `<projectRoot>`——因为内置 hooks 依据传给 `hook-dispatch` 的 `cwd` 门控，且 `~/.claude` 恒存在、能通过「已安装工具」门槛（详见 Hooks 章节）。self 单仓模式则把 hooks 保留在业务仓库里，随 clone 传播。
 
-启用角色化 skills 后，`pull` 的 skills 同步来源会变成 `skills/<namespace>/` 中的内容，按 `primaryRole + additionalRoles` 展开对应的 namespace，拍平安装到本地各 AI 工具 skills 目录。`rules/`、`docs/` 仍然保持原有同步逻辑；`agents/<namespace>/` 按角色的 `agents` namespace 同步（见 [Agents 资源类型](#agents-资源类型)）。`learnings/` 根目录对所有人共享，而 `learnings/<project-id>/` 子目录只对本目录激活的项目同步（见 [多项目](#多项目project-作为与-role-正交的维度)）。
+启用角色化 skills 后，`pull` 的 skills 同步来源会变成 `skills/<namespace>/` 中的内容，按 `primaryRole + additionalRoles` 展开对应的 namespace，拍平安装到本地各 AI 工具 skills 目录。`rules/` 保持原有同步逻辑；`docs/`、`.wiki/` 没有 *角色* namespace（role 不选择它们），它们获得的是 *项目* 命名空间——见[多项目](#多项目project-作为与-role-正交的维度)。`agents/<namespace>/` 按角色的 `agents` namespace 同步（见 [Agents 资源类型](#agents-资源类型)）。`learnings/` 根目录对所有人共享，而 `learnings/<project-id>/` 子目录只对本目录激活的项目同步（见 [多项目](#多项目project-作为与-role-正交的维度)）。
 
 ### 团队包
 
