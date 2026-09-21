@@ -1,6 +1,6 @@
 # Plan — wiki/docs 对齐 teamwiki 模式：纯 Git 原生管理（004）
 
-Status: draft（待需求方批准 spec 后实施）
+Status: completed（2026-09-19：实现/测试/E2E 完成，提交见分支 feat/docs-wiki-project-namespace）
 
 ## 实现步骤
 
