@@ -1,0 +1,49 @@
+name: Build install package
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies (include dev for tsup/vitest/tsc)
+        run: npm ci --include=dev --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npx vitest run src/__tests__/get-cmd.test.ts src/__tests__/docs.test.ts src/__tests__/wiki-source-anchor.test.ts src/__tests__/namespace-resolver.test.ts
+
+      - name: Build
+        run: npm run build
+
+      - name: Pack install package
+        run: |
+          mkdir -p out
+          npm pack --pack-destination ./out
+          echo "PACKAGE=$(ls out/*.tgz)" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-package
+          path: out/*.tgz
+
+      - name: Create release with install package (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" out/*.tgz --generate-notes --title "${GITHUB_REF_NAME}"
