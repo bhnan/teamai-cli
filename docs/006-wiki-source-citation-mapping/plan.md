@@ -1,6 +1,7 @@
 # Plan — 团队仓 Wiki 的检索与原文引用（006）
 
-Status: draft（开放问题已确认；P0 基线对齐与仓库收敛已完成，待需求方批准进入 P2 实现）
+Status: in_progress（P2 实现与验证完成，提交 `6b12c7a`/`1cdd9b7`/`1fc8063`；
+待需求方验收与独立评审，验收通过后置 completed）
 
 基线：`v0.26.0-beta.5`（上游最新 tag，需求方指定）
 工作区：已从 worktree 收敛回主工作目录 `/root/teamai-cli`（分支
