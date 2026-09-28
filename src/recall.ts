@@ -1,16 +1,18 @@
 import path from 'node:path';
 import { existsSync } from 'node:fs';
-import { requireInit, detectProjectConfig, describeUnreadableConfig, loadLocalConfigForScope } from './config.js';
+import { requireInit, detectProjectConfig, describeUnreadableConfig, loadLocalConfigForScope, loadTeamConfig } from './config.js';
 import { loadIndex, buildIndex, search, isLegacyIndex } from './utils/search-index.js';
 import type { BuildIndexOptions, SearchResult } from './utils/search-index.js';
-import { ensureDir, pathExists } from './utils/fs.js';
+import { ensureDir, pathExists, readFileSafe } from './utils/fs.js';
 import { log } from './utils/logger.js';
 import type { GlobalOptions, SearchIndex, LocalConfig } from './types.js';
-import { getProjectSearchIndexPath, getUserSearchIndexPath, getVotesDir } from './types.js';
+import { getProjectSearchIndexPath, getUserSearchIndexPath, getVotesDir, getWikiSharing } from './types.js';
 import { queryCodeKnowledge } from './code-knowledge-recall.js';
 import type { SourceAnchor } from './code-knowledge-recall.js';
 import { recordRecallQuality } from './recall-quality.js';
 import { deriveSessionId } from './utils/session-id.js';
+import { splitFrontmatter } from './utils/frontmatter.js';
+import { resolveWikiPageSources } from './utils/wiki-source-anchor.js';
 
 /** Relevance threshold for codebase graph hits.
  *  These are log-compressed to a bounded [0,10] range (see `queryCodeKnowledge`
@@ -417,7 +419,14 @@ async function loadOrBuildScopeIndex(
  */
 export async function recall(
   query: string,
-  options: GlobalOptions & { depth?: 'route' | 'context' | 'lookup'; check?: boolean },
+  options: GlobalOptions & {
+    depth?: 'route' | 'context' | 'lookup';
+    check?: boolean;
+    /** Machine-readable output (results, or verified sources for --wiki-page). */
+    json?: boolean;
+    /** Resolve + verify one wiki page's source anchors (repo-relative path). */
+    wikiPage?: string;
+  },
 ): Promise<void> {
   const emitCheckVerdict = (score: number, isCodebaseHit = false, baseline = 1, topResult?: ScopedSearchResult): void => {
     const rounded = Math.round(score * 10) / 10;
@@ -445,6 +454,64 @@ export async function recall(
     }
     process.stdout.write(`${line}\n`);
   };
+
+  // ── Wiki page source resolution mode ─────────────────────────────────
+  // The agent reads a wiki page from the team-repo clone (convention:
+  // `.wiki/<pid>/<name>wiki/…`), then asks the CLI to resolve and verify the
+  // page's frontmatter `sources[].path` against the clone. Only anchors that
+  // map to a unique in-scope file whose SHA-256 matches are `verified` and may
+  // be cited; everything else is reported with a reason. Retrieval is never
+  // gated on these checks — this mode only decides citability.
+  if (options.wikiPage) {
+    const pageRepoPath = options.wikiPage.replace(/^\.\//, '');
+    if (!pageRepoPath.startsWith('.wiki/') || pageRepoPath.split('/').includes('..')) {
+      log.error(`Invalid wiki page path: ${options.wikiPage} (expected a repo-relative path under .wiki/)`);
+      process.exitCode = 1;
+      return;
+    }
+    let localConfig: LocalConfig | null = null;
+    try {
+      localConfig = await detectProjectConfig();
+    } catch {
+      log.debug('recall --wiki-page: project scope detection failed');
+    }
+    if (!localConfig) {
+      try {
+        const r = await requireInit();
+        localConfig = r.localConfig;
+      } catch {
+        log.error('teamai is not initialized. Run `teamai init` first.');
+        process.exitCode = 1;
+        return;
+      }
+    }
+    const cloneRoot = localConfig.repo.localPath;
+    const pagePath = path.join(cloneRoot, pageRepoPath);
+    const content = await readFileSafe(pagePath);
+    if (content === null) {
+      log.error(`Wiki page not found: ${options.wikiPage}`);
+      process.exitCode = 1;
+      return;
+    }
+    const { data } = splitFrontmatter(content);
+    const rawSources = Array.isArray(data.sources) ? data.sources : [];
+    const anchors: Array<{ path: string; sha256?: string }> = [];
+    for (const s of rawSources) {
+      if (s && typeof s === 'object' && 'path' in s && typeof (s as { path: unknown }).path === 'string') {
+        const sha = (s as { sha256?: unknown }).sha256;
+        anchors.push({
+          path: (s as { path: string }).path,
+          sha256: typeof sha === 'string' ? sha : undefined,
+        });
+      }
+    }
+    const teamConfig = await loadTeamConfig(cloneRoot);
+    const wiki = getWikiSharing(teamConfig ?? {});
+    const projectId = (localConfig.projects ?? []).length === 1 ? localConfig.projects![0] : undefined;
+    const verified = await resolveWikiPageSources(pageRepoPath, anchors, { cloneRoot, projectId, wiki });
+    process.stdout.write(`${JSON.stringify({ page: pageRepoPath, projectId, sources: verified }, null, 2)}\n`);
+    return;
+  }
 
   const noQuery = !query || !query.trim();
   if (noQuery && !options.check) {
@@ -645,6 +712,20 @@ export async function recall(
   }
 
   // Output results (STDOUT — AI reads this)
+  if (options.json) {
+    process.stdout.write(`${JSON.stringify({
+      query,
+      results: topResults.map((r) => ({
+        title: r.entry.title,
+        type: r.entry.type,
+        scope: r.scope,
+        score: Math.round(r.score * 10) / 10,
+        file: resolveReadablePath(r.entry.path, r.entry.filename, r.learningsBase),
+        sources: r.sources?.map((s) => (s.desc ? `${s.path} (${s.desc})` : s.path)),
+      })),
+    }, null, 2)}\n`);
+    return;
+  }
   const output = formatResults(topResults);
   process.stdout.write(output + '\n');
 

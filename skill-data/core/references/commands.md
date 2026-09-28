@@ -305,6 +305,8 @@ Generated: do not edit by hand. Regenerate with
 - `teamai recall [query...]` — Search team learnings knowledge base
   - `--depth <level>` — Recall depth: route (entry-points only) | context (module-level, default) | lookup (full graph traversal)
   - `--check` — Relevance precheck only: print RELEVANT/NOT_RELEVANT + top score; no file reads, no upvote
+  - `--json` — Output machine-readable JSON (results, or verified sources for --wiki-page)
+  - `--wiki-page <path>` — Resolve and verify the source anchors of one wiki page (repo-relative path under .wiki/); implies --json
   - `teamai recall disable` — Disable automatic knowledge-base recall
   - `teamai recall enable` — Enable automatic knowledge-base recall
   - `teamai recall status` — Show recall feature status

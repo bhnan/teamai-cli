@@ -1063,11 +1063,19 @@ const recallCmd = program
   .description('Search team learnings knowledge base')
   .option('--depth <level>', 'Recall depth: route (entry-points only) | context (module-level, default) | lookup (full graph traversal)', 'context')
   .option('--check', 'Relevance precheck only: print RELEVANT/NOT_RELEVANT + top score; no file reads, no upvote')
+  .option('--json', 'Output machine-readable JSON (results, or verified sources for --wiki-page)')
+  .option('--wiki-page <path>', 'Resolve and verify the source anchors of one wiki page (repo-relative path under .wiki/); implies --json')
   .action(async (queryParts, cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;
     const query = (queryParts as string[]).join(' ');
     const { recall } = await import('./recall.js');
-    await recall(query, { ...globalOpts, depth: cmdOpts.depth, check: cmdOpts.check });
+    await recall(query, {
+      ...globalOpts,
+      depth: cmdOpts.depth,
+      check: cmdOpts.check,
+      json: cmdOpts.json,
+      wikiPage: cmdOpts.wikiPage,
+    });
   });
 
 recallCmd

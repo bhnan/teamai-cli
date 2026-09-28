@@ -147,7 +147,60 @@ export const SharingConfigSchema = z.object({
       retries: z.number().default(3),
     })).default([]),
   }).optional(),
+  // Optional (not .default) so existing TeamaiConfig literals stay valid; use
+  // getWikiSharing() for the defaulted view.
+  wiki: z.object({
+    /**
+     * Configured team-repo wiki sources. Each entry declares one wiki
+     * collection (`<name>wiki` directory under `.wiki/<pid>/`) and optional
+     * explicit `from → to` path mappings for its source anchors.
+     *
+     * Recall uses this to resolve a wiki page's frontmatter `sources[].path`
+     * (project-root relative, e.g. `docs/usage-guide.md`) to the real file in
+     * the local team-repo clone and verify its SHA-256 before offering it as a
+     * citable original. Without a matching entry the default convention
+     * (`docs/…` → `docs/<pid>/…`) still applies — configuration is optional,
+     * never required for mapping to work.
+     */
+    sources: z.array(z.object({
+      /** Wiki collection id — the `<name>wiki` directory name. */
+      id: z.string().min(1),
+      /** Explicit path prefix mappings, applied before the default convention. */
+      map: z.array(z.object({
+        /** Prefix of the anchor `path` (e.g. `docs/`). */
+        from: z.string().min(1),
+        /** Replacement prefix, team-repo-relative (e.g. `docs/teamai-cli/`). */
+        to: z.string().min(1),
+      })).default([]),
+    })).default([]),
+  }).optional(),
 });
+
+/** Explicit `from → to` path prefix mapping for one wiki source anchor. */
+export interface WikiPathMap {
+  from: string;
+  to: string;
+}
+
+/** One configured wiki source (`sharing.wiki.sources[]`). */
+export interface WikiSourceConfig {
+  /** Wiki collection id — the `<name>wiki` directory name. */
+  id: string;
+  /** Explicit path prefix mappings, applied before the default convention. */
+  map: WikiPathMap[];
+}
+
+/** The resolved `sharing.wiki` config consumed by recall. */
+export interface WikiSharingConfig {
+  sources: WikiSourceConfig[];
+}
+
+/** Defaulted view of the optional `sharing.wiki` config. */
+export function getWikiSharing(config: {
+  sharing?: { wiki?: { sources?: Array<{ id: string; map?: Array<{ from: string; to: string }> }> } };
+}): WikiSharingConfig {
+  return { sources: (config.sharing?.wiki?.sources ?? []).map((s) => ({ id: s.id, map: s.map ?? [] })) };
+}
 
 /** Defaulted view of the optional `sharing.intervention` config. */
 export function getInterventionSharing(config: {

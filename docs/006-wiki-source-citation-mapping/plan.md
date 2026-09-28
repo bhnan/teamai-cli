@@ -1,9 +1,11 @@
 # Plan — 团队仓 Wiki 的检索与原文引用（006）
 
-Status: draft（等待需求方对 intent/spec 的开放问题确认；确认后开工）
+Status: draft（开放问题已确认；P0 基线对齐与仓库收敛已完成，待需求方批准进入 P2 实现）
 
 基线：`v0.26.0-beta.5`（上游最新 tag，需求方指定）
-工作区：worktree `.worktrees/feat-wiki-source-map`，分支 `feat/wiki-source-path-mapping`
+工作区：已从 worktree 收敛回主工作目录 `/root/teamai-cli`（分支
+`feat/get-command`，合并提交 `e06c2cf`）；`feat/wiki-source-path-mapping`
+分支保留，后续在其上实现 006。
 
 ## P0 基线对齐（需求方前置要求）
 
@@ -15,77 +17,111 @@ Status: draft（等待需求方对 intent/spec 的开放问题确认；确认后
 - [x] **已确认**：新基线**不带** fork 线的 003/004 语义与 `get` 命令
       （需求方决策，spec §9）——本需求在裸 `v0.26.0-beta.5` 上独立落地，
       自持「`docs/<pid>/` 团队仓命名空间」这一只读约定
-- [ ] 装依赖并确认工具链：`npm ci`（worktree 无 `node_modules`）+
-      `npx tsc --noEmit` 基线绿灯
-- [ ] 确认基线全量单测基线（记录既有失败数，作为零回归对照）
+- [x] 装依赖并确认工具链：`npm ci` + `npx tsc --noEmit`
+- [x] **基线对照（v0.26.0-beta.5 裸 tag）**：
+      - typecheck：26 个错误，全部在 `src/__tests__/namespace-resolver.test.ts`
+        （基线固有，非本需求引入）
+      - 全量单测：**7 failed / 5226 passed / 7 skipped（336 文件，6 个文件失败）**
+        ——`contribute-self-learnings`(2)、`github-provider`(1)、
+        `import-mr-learnings-checkout`(2)、`namespace-resolver`(文件级)、
+        `post-pull`(1)、`skill-content`(1)
+      - `npm run lint` 在本机不可用：`oxlint` 未安装（`sh: 1: oxlint: not found`）
+
+## P0.5 仓库收敛（需求方追加要求，2026-09-28）
+
+- [x] 干跑评估合并冲突（`git merge-tree`）：`feat/get-command` ×
+      `feat/wiki-source-path-mapping` 冲突 4 个文件
+- [x] 冲突解决原则（需求方决策）：**以上游为准，丢掉 fork 的 docs/wiki 语义**
+- [x] 实际解决：
+      - `src/pull.ts`、`src/resources/docs.ts` → 取上游（上游以
+        `pullDocs`/`resolveDesiredDocs` 重写了投递逻辑，fork 的逐文件
+        `pullItem` 已被替换）
+      - `docs/usage-guide.md`、`docs/usage-guide.zh-CN.md` → 取上游措辞
+      - `src/push.ts` → `pushableTypes` 收敛为上游的
+        `['skills','rules','env','agents']`（自动合并残留了 fork 的 docs/wiki）
+      - `src/types.ts` → `sharing.docs.localDir` 默认值回到上游 `~/.teamai/docs`
+        （自动合并残留 fork 的 `~/docs`，导致上游 2 个投递用例失败）
+      - `src/get-cmd.ts` → 跟随上游改名 `resolveDocsLocalDir` →
+        `resolveDocsDestination`
+      - `src/__tests__/docs.test.ts` → 断言改为上游投递目标
+      - `skill-data/core/references/commands.md` → 用
+        `npx vitest run --update` 重新生成（fork 的 `get` 命令进入命令表）
+- [x] 合并结果验证：typecheck 26 个基线错误（零新增）；
+      全量单测 **6 failed / 5243 passed**（零新增回归，且比基线少 1 个）
+- [x] 合并提交：`e06c2cf`（双父 merge commit，父为 `9995df2` 与 `70821ca`）
+- [x] 主工作目录 `git reset --hard e06c2cf` 收敛；`npm run build` 重建 dist
+- [x] 移除全部 worktree：`.worktrees/feat-wiki-source-map`、
+      `.worktrees/tmp-merge-test`、`/root/teamai-baseline`、
+      `/root/teamai-cli-merge2`、`/root/teamai-cli-wt-003`、
+      `/root/teamai-upstream-baseline` —— 现在只剩 `/root/teamai-cli`
+- [x] 005 草案：本地任何分支均无此文件（仅存于旧 tag `v0.23.0-bhnan.0`），
+      需求方确认无需删除
 
 ## P1 需求文档（本阶段产出）
 
 - [x] `docs/006-wiki-source-citation-mapping/intent.md`
 - [x] `docs/006-wiki-source-citation-mapping/spec.md`
 - [x] `docs/006-wiki-source-citation-mapping/plan.md`（本文件）
-- [ ] 需求方确认 intent/spec 的 9.1–9.3 开放问题 → 依确认结果修订 spec
-- [ ] 获批后进入 P2（在此之前不改实现代码）
+- [x] 需求方确认 intent/spec 的开放问题 → 结论回写 spec §9
+- [x] 需求方两次指示继续实现（2026-09-28 后半与下一轮），P2 已开工
 
-## P2 实现（待 P1 关闭）
+## P2 实现（进行中）
 
-### P2-1 配置模型
+### P2-1 配置模型 ✅
 
-- [ ] `src/types.ts`：`SharingConfigSchema` 新增可选 `wiki`
-      （`sources: [{ id, allow?, map?: [{ from, to }] }]`），沿用
-      `hooks`/`mcp`/`coAuthor` 的「可选而非 default」惯例，保证既有
-      `teamai.yaml` 字面量继续合法
-- [ ] 提供 defaulted 读取视图（同 `getHooksSharing` 形态），供 recall 消费
-- [ ] **待定（奥卡姆）**：`allow` 是否保留——若不打算真正放宽/收窄范围，
-      按「拒绝过度设计」应删除该字段，硬编码 `docs/<pid>/`
+- [x] `src/types.ts`：`SharingConfigSchema` 新增可选 `wiki`
+      （`sources: [{ id, map?: [{ from, to }] }]`），沿用「可选而非 default」
+      惯例；`allow` 按奥卡姆不实现（spec §9.3）
+- [x] 提供 defaulted 读取视图 `getWikiSharing()`，供 recall 消费
+- [x] 类型导出：`WikiPathMap` / `WikiSourceConfig` / `WikiSharingConfig`
 
-### P2-2 锚点解析与校验（核心，纯函数 + 只读 IO）
+### P2-2 锚点解析与校验 ✅（`src/utils/wiki-source-anchor.ts`）
 
-- [ ] 新模块（建议 `src/utils/wiki-source-anchor.ts`，与 `recall-quality.ts`
-      同级的单职责工具模块）：
-  - `resolveAnchorPath(anchorPath, pagePath, map, pid)` → 克隆内相对路径
-    （显式 `map` 优先 → 默认「项目根相对 → `docs/<pid>/`」→ 页面相对形态
-    先归一化再套默认规则 → 无命中 `unmapped`）
-  - `verifyAnchor(...)` → `{ status, resolved?, sha256?, reason? }`，
-    实现 spec §4 的四条判定与封闭状态枚举
-  - 允许范围判定按**真实路径**（`realpath`）比较，拒绝符号链接逃逸
-- [ ] 复用而非重造：`sanitizeSources`（URL/目录过滤）与
-      `extractSourceDescriptions`（`src/code-knowledge-recall.ts`）保持不动，
-      新逻辑只做「锚点 → 可引用路径」这一段
-- [ ] 安全边界：路径归一化后必须仍落在允许子树内（`..` 逃逸 →
-      `out_of_scope`）；不读允许范围外的文件
+- [x] `mapAnchorPath(...)` → 克隆内相对路径（显式 `map` 优先 → 默认
+      「项目根相对 → `docs/<pid>/`」→ 无命中 `unmapped`）
+- [x] `verifyWikiSource(...)` → 四条判定 + 封闭状态枚举（`verified`/
+      `missing`/`out_of_scope`/`content_changed`/`unmapped`/`unverifiable`）
+- [x] 允许范围按 `realpath` 判定，拒绝符号链接逃逸
+- [x] 单测 11 例全绿：`src/__tests__/wiki-source-anchor.test.ts`
+- [x] **解耦确认**：CLI 只消费 frontmatter `sources[]` 契约（`{path, sha256}`），
+      不依赖生成页面的工具；默认映射 `docs/…` → `docs/<pid>/…` 只是约定，
+      其他形态靠配置 `map` 覆盖
 
-### P2-3 接入输出
+### P2-3 接入输出 ✅
 
-- [ ] `src/recall.ts`：`recall` 增加 `--json`（spec §9.2）；人类可读输出同步
-      给出同构状态
-- [ ] `--json` 为严格 JSON：既有结果字段不变，新增 `sources[]` 的
-      `path`/`status`/`resolved`/`sha256`/`reason`
-- [ ] 未配置 `sharing.wiki` 时**完全不激活**（文本输出与基线逐字节一致，
-      JSON 不出现未经校验的 `verified`）
-- [ ] **已确认（spec §9.1）**：CLI **不输出 Wiki 位置**——位置由 Agent 按
-      `.wiki/<pid>/<name>wiki/` 规范自行定位；CLI 只在有页面锚点时工作
-- [ ] `src/index.ts`：为现有 `recall` 命令加 `--json` 选项（不新增子命令）
+- [x] `src/recall.ts`：新增 `--wiki-page <repo相对路径>` 模式（解析单页锚点，
+      隐含 `--json`）+ 普通 `recall --json`（结果 JSON 化）
+- [x] `src/index.ts`：为现有 `recall` 命令加 `--json` / `--wiki-page` 选项
+      （不新增子命令）
+- [x] 未配置 `sharing.wiki` 时完全不激活（`--wiki-page` 不依赖配置即可用）
+- [x] 页面路径校验（必须 `.wiki/` 前缀、无 `..`）；页面不存在/未初始化 → 报错
+      退出码 1
 
-### P2-4 测试
+### P2-4 测试 ✅
 
-- [ ] 单测：映射规则（显式覆盖/默认两种形态/无命中）× 四条判定 ×
-      全部状态枚举（`verified`/`missing`/`ambiguous`/`out_of_scope`/
-      `content_changed`/`unmapped`/`unverifiable`）
-- [ ] 单测：边界表（无 `sha256`、非法 sha256 格式、符号链接、`..` 逃逸、
-      URL/目录锚点、目标为目录、多候选同名）
-- [ ] 单测：未配置 wiki 时 `formatResults` 输出与基线一致（快照）
-- [ ] 单测：`--json` 结构与封闭枚举（含不可引用必带 `reason`）
-- [ ] E2E（真实 CLI，夹具团队仓）：按 spec §8 的 1–4 条跑通，含
-      `recall --json` 的真实输出
+- [x] 单测：映射 × 四条判定 × 全部状态枚举 + 边界表（缺/非法 sha256、符号
+      链接逃逸、URL/目录锚点、`../` 形态、绝对路径）
+- [x] 单测：未配置 wiki 时既有 recall 测试零回归（recall 5 个测试文件 43 例）
+- [x] E2E（真实 CLI，真实团队仓 + 沙箱夹具）：verified / content_changed /
+      missing 三态真实输出全部验证通过（见下方「E2E 记录」）
+- [x] 全量回归：6 failed / 5254 passed —— 与合并基线一致，**零新增回归**
 
-### P2-5 文档与 skill 同步
+### P2-5 文档与 skill 同步（进行中）
 
+- [x] `skill-data/core/references/commands.md`：`npx vitest run
+      commands-reference -u` 重新生成（`--json`/`--wiki-page` 入表）
 - [ ] `docs/usage-guide.md` + `docs/usage-guide.zh-CN.md`：新增「Wiki 引用
-      校验」章节（配置形态 + 状态枚举 + 失败含义）
+      校验」章节（待需求方确认入口形态后落笔）
 - [ ] 受影响的 `skill-data/`（若 Agent 使用方式变化）；grep 旧措辞
-- [ ] 若命令/flag 有改动：`npx vitest run commands-reference -u` 重新生成
-      `skill-data/core/references/commands.md`
+
+## E2E 记录（2026-09-28，真实 CLI，`dist/index.js`）
+
+| 场景 | 命令 | 结果 |
+|---|---|---|
+| 真实团队仓 verified | `recall --wiki-page ".wiki/teamai-cli/docs-wiki/topics/usage-guide.md"` | 两条锚点 `verified`，`resolved` 指向 `docs/teamai-cli/…`，sha256 与 frontmatter 记录一致 |
+| 内容篡改 | 同上（目标文件追加一行） | `content_changed`，reason 带 expected/actual |
+| 文件删除 | 同上（删目标文件） | `missing`，reason 带路径 |
+| 全量回归 | `npx vitest run` | 6 failed（基线固有）/ 5254 passed，零新增 |
 
 ## 测试策略
 
