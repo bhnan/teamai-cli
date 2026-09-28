@@ -1133,6 +1133,42 @@ teamai recall "GPU 内存不足"
 - 提供轻量相关性预检 `teamai recall --check "<关键词>"`，输出 `RELEVANT score=<n> threshold=<n>` 或 `NOT_RELEVANT score=<n> threshold=<n>`，不读取文件、不 upvote —— recall subagent 用它在任务与团队知识无关时跳过检索。当 top 命中为 `RELEVANT` 时，还会输出 `matched=`/`missing=`，即命中/未命中其 title 与 tag 的查询词
 - `RELEVANT` 表示分数越过阈值、值得花成本读文件，**不代表**知识库覆盖了你要找的主题。请用 `matched=`/`missing=`（以及完整结果里的 `Matched:`/`Missing:` 行）自行判断：若关键区分词全部落在 missing 里，那条只是主题相邻，并非答案
 
+#### 引用 Wiki 页面原文
+
+团队仓 Wiki 页面（`.wiki/<pid>/<name>wiki/…`）在 frontmatter 的 `sources[]`
+里声明它们所依据的原文，每个元素带 `path` 与撰写时该文件字节内容的
+SHA-256。项目内容发布到 `docs/<pid>/…` 之后，这些路径不再能直接解析。
+`recall --wiki-page` 把每条锚点映射回本机团队仓克隆里的真实文件，并在你
+引用前完成校验：
+
+```bash
+teamai recall --wiki-page ".wiki/teamai-cli/docs-wiki/topics/usage-guide.md"
+# JSON: { "page": …, "projectId": …, "sources": [ {path, status, resolved, sha256|reason}, … ] }
+```
+
+- `--wiki-page` 接收 `.wiki/` 下的仓库相对路径，隐含 `--json`。只有映射到
+  `docs/<pid>/` 允许范围内唯一存在、且 SHA-256 一致的文件才报告为
+  `verified`，并给出可直接打开的 `resolved` 路径；其余锚点一律携带封闭状态
+  —— `missing`、`out_of_scope`、`content_changed`、`unmapped`、
+  `unverifiable` 之一加人类可读的 `reason`。**不要引用任何非 `verified` 的锚点**
+- 映射可在 `teamai.yaml` 中配置：
+
+  ```yaml
+  sharing:
+    wiki:
+      sources:
+        - id: docs-wiki          # .wiki/<pid>/ 下的目录名
+          map:                   # 可选；在默认规则（docs/ → docs/<pid>/）之前生效
+            - from: docs/
+              to: docs/teamai-cli/
+  ```
+
+- 校验是只读的，且从不影响检索：某条锚点不可校验（例如克隆已落后远端——
+  运行 `teamai pull`）不会隐藏页面。Wiki 页面的检索仍由 Agent 直接读克隆
+  完成，本模式只决定「这条原文能否被引用」
+- `teamai recall "<查询词>" --json` 同样输出普通检索路径的机器可读结果
+  （title/type/scope/score/file/sources）
+
 ### 开启 / 关闭 Recall
 
 Recall 功能通过两级配置控制——管理员设置团队默认值，成员可在本地覆盖：

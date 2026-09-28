@@ -1230,6 +1230,46 @@ teamai recall "GPU out of memory"
 - A lightweight relevance precheck is available via `teamai recall --check "<keywords>"`, which prints `RELEVANT score=<n> threshold=<n>` or `NOT_RELEVANT score=<n> threshold=<n>` without reading files or upvoting — the recall subagent uses it to skip retrieval on unrelated tasks. For a `RELEVANT` top hit it also reports `matched=`/`missing=` — the query terms that hit its title/tags and those that did not
 - `RELEVANT` means a hit cleared the score threshold, i.e. reading files is worth the cost — it does not mean the knowledge base covers your subject. Use the `matched=`/`missing=` terms (and the `Matched:`/`Missing:` lines on full results) to make that judgement: a hit missing all your distinctive terms is topically adjacent, not an answer
 
+#### Citing wiki page originals
+
+Team-repo wiki pages (`.wiki/<pid>/<name>wiki/…`) declare the files they were
+written from as frontmatter `sources[]`, each with a `path` and the SHA-256 of
+that file's bytes at authoring time. After project content is published under
+`docs/<pid>/…`, those paths no longer resolve on their own. `recall
+--wiki-page` maps each anchor back to the real file in your local team-repo
+clone and verifies it before you cite it:
+
+```bash
+teamai recall --wiki-page ".wiki/teamai-cli/docs-wiki/topics/usage-guide.md"
+# JSON: { "page": …, "projectId": …, "sources": [ {path, status, resolved, sha256|reason}, … ] }
+```
+
+- `--wiki-page` takes a repo-relative path under `.wiki/` and implies `--json`.
+  Only anchors that map to a single existing file inside the allowed
+  `docs/<pid>/` scope whose SHA-256 matches are reported `verified` with a
+  ready-to-open `resolved` path. Anything else carries a closed status —
+  `missing`, `out_of_scope`, `content_changed`, `unmapped`, `unverifiable` —
+  plus a human-readable `reason`; never cite an anchor that is not `verified`
+- Mapping is configurable in `teamai.yaml`:
+
+  ```yaml
+  sharing:
+    wiki:
+      sources:
+        - id: docs-wiki          # directory name under .wiki/<pid>/
+          map:                   # optional; applied before the default rule
+            - from: docs/        #   default: docs/ → docs/<pid>/
+              to: docs/teamai-cli/
+  ```
+
+- Verifying is read-only and never gates retrieval: an anchor being
+  unverifiable (for example because the clone is stale — run `teamai pull`)
+  does not hide the page. Retrieval of wiki pages themselves stays with the
+  agent reading the clone directly; this mode only decides whether an original
+  may be cited
+- `teamai recall "<query>" --json` also prints machine-readable results
+  (title/type/scope/score/file/sources) for the normal search path
+
 ### Enabling / Disabling Recall
 
 The Recall feature is controlled by a two-tier configuration — admins set the team default, and members can override it locally:
