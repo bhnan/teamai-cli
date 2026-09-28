@@ -1146,6 +1146,12 @@ teamai recall --wiki-page ".wiki/teamai-cli/docs-wiki/topics/usage-guide.md"
 # JSON: { "page": …, "projectId": …, "sources": [ {path, status, resolved, sha256|reason}, … ] }
 ```
 
+**团队仓 wiki 页面的检索归 wiki 工具，不由这个 flag 承担**：把 project-wiki
+的 `search` 指向克隆并用 `WIKI_DIR` 指定集合（例如
+`WIKI_DIR=".wiki/teamai-cli/docs-wiki" wiki.py search --root <克隆> --query "…"`），
+或读该集合的 `index.md`/`overview.md` 导引。检索命中的页面自带 `sources[]`；
+本模式只决定「这条原文能否被引用」。
+
 - `--wiki-page` 接收 `.wiki/` 下的仓库相对路径，隐含 `--json`。只有映射到
   `docs/<pid>/` 允许范围内唯一存在、且 SHA-256 一致的文件才报告为
   `verified`，并给出可直接打开的 `resolved` 路径；其余锚点一律携带封闭状态
@@ -1164,8 +1170,8 @@ teamai recall --wiki-page ".wiki/teamai-cli/docs-wiki/topics/usage-guide.md"
   ```
 
 - 校验是只读的，且从不影响检索：某条锚点不可校验（例如克隆已落后远端——
-  运行 `teamai pull`）不会隐藏页面。Wiki 页面的检索仍由 Agent 直接读克隆
-  完成，本模式只决定「这条原文能否被引用」
+  运行 `teamai pull`）不会隐藏页面。**检索与校验分离**：wiki 工具负责找到
+  页面，本模式只决定「能否引用」
 - `teamai recall "<查询词>" --json` 同样输出普通检索路径的机器可读结果
   （title/type/scope/score/file/sources）
 

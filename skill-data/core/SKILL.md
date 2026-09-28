@@ -100,7 +100,8 @@ teamai status      # Show local vs team differences
 teamai doctor      # Diagnose configuration and hook problems
 teamai list        # List resources (skills|rules|docs|env|agents|hooks|mcp)
 teamai recall <q>  # Search what the team has already learned
-teamai recall --wiki-page .wiki/<pid>/<name>wiki/.../<page>.md  # Verify a wiki page's cited originals before quoting them (implies --json; only status "verified" sources may be cited)
+# Team-repo wiki: retrieve via the wiki tooling (WIKI_DIR=<clone>/.wiki/<pid>/<name>wiki/ wiki.py search --root <clone> --query "…", or browse index.md/overview.md), then verify the cited originals before quoting them:
+teamai recall --wiki-page .wiki/<pid>/<name>wiki/.../<page>.md  # implies --json; only status "verified" sources may be cited
 ```
 
 Every other command, every flag, and the flags `--help` hides live in the

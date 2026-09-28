@@ -1244,6 +1244,13 @@ teamai recall --wiki-page ".wiki/teamai-cli/docs-wiki/topics/usage-guide.md"
 # JSON: { "page": …, "projectId": …, "sources": [ {path, status, resolved, sha256|reason}, … ] }
 ```
 
+**Retrieving team-repo wiki pages** is the job of the wiki tooling, not this
+flag: point the project-wiki `search` at the clone with `WIKI_DIR` set to the
+collection (e.g. `WIKI_DIR=".wiki/teamai-cli/docs-wiki" wiki.py search --root
+<clone> --query "…"`), or browse that collection's `index.md`/`overview.md`.
+The retrieved page carries its `sources[]`; this mode then decides whether an
+original may be cited.
+
 - `--wiki-page` takes a repo-relative path under `.wiki/` and implies `--json`.
   Only anchors that map to a single existing file inside the allowed
   `docs/<pid>/` scope whose SHA-256 matches are reported `verified` with a
@@ -1264,9 +1271,8 @@ teamai recall --wiki-page ".wiki/teamai-cli/docs-wiki/topics/usage-guide.md"
 
 - Verifying is read-only and never gates retrieval: an anchor being
   unverifiable (for example because the clone is stale — run `teamai pull`)
-  does not hide the page. Retrieval of wiki pages themselves stays with the
-  agent reading the clone directly; this mode only decides whether an original
-  may be cited
+  does not hide the page. Retrieval and verification stay separate: the wiki
+  tooling finds pages, this mode only decides whether an original may be cited
 - `teamai recall "<query>" --json` also prints machine-readable results
   (title/type/scope/score/file/sources) for the normal search path
 

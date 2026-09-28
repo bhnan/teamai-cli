@@ -115,12 +115,19 @@ sharing:
 - 校验**不缓存**结果：`sha256` 是内容一致性的断言，缓存会让「内容已变化」
   在缓存有效期内被误报为可引用。
 
-## 5. 输出形态（CLI 负责并给结论）
+## 5. 职责分工与输出（检索归 skill，引用解析归 CLI）
 
-调用方（Agent）需要机器可判定的结论，而不是自己去猜路径。**主通道是
-`recall --wiki-page <repo相对路径> --json`**——Agent 从团队仓克隆读到 Wiki
-页面后，让 CLI 解析该页的锚点；输出为严格 JSON（§9.2 的结构，每锚点一个
-对象）：
+**团队仓 wiki 的检索与本地项目 wiki 的检索是两个不同场景，检索方式各归各，
+CLI 不提供第二个检索器：**
+
+| 场景 | 用途 | 检索方式 |
+|---|---|---|
+| 本地项目 wiki（`<项目根>/.wiki/`） | 本项目开发时给 Agent 提建议 | project-wiki skill：`wiki.py search --root <项目根>` + `index.md`/`overview.md` 导引（**不碰**，skill 已有） |
+| 团队仓 wiki（`.wiki/<pid>/<name>wiki/`） | 跨项目参考别人的经验/架构 | 同一 skill 的检索工具，**用 `WIKI_DIR` 环境变量指向团队仓克隆内的集合**：`WIKI_DIR=".wiki/<pid>/<name>wiki/" wiki.py search --root <团队仓克隆> --query "…"`（实测可用）；或读该集合的 `index.md`/`overview.md` 导引 |
+
+检索命中页面（如 `topics/usage-guide.md`）后，页面上自带 `sources[]`（引用的
+原文路径 + sha256）。**引用解析由 CLI 负责**：`recall --wiki-page <克隆相对路径>`
+把该页的锚点映射回真实文件并校验，输出严格 JSON（每锚点一个对象）：
 
 ```
 {
@@ -172,15 +179,19 @@ sharing:
 
 ## 8. 验收（对应 intent 成功标准）
 
-1. 夹具团队仓：`.wiki/<pid>/docs-wiki/topics/usage-guide.md` 的
+1. 团队仓 wiki 可被检索：`WIKI_DIR=".wiki/<pid>/<name>wiki/" wiki.py search
+   --root <团队仓克隆> --query "…"` 命中页面（实测通过），或按该集合的
+   `index.md`/`overview.md` 导引定位页面。
+2. 命中页面 `.wiki/<pid>/docs-wiki/topics/usage-guide.md` 的
    `sources: [docs/usage-guide.md]` 在 `docs/<pid>/usage-guide.md` 存在且
-   哈希一致时 → `verified` 且 `resolved` 指向该文件，Agent 可直接打开。
-2. 同夹具把 `docs/<pid>/usage-guide.md` 内容改一位 → 同锚点 `content_changed`
+   哈希一致时 → `recall --wiki-page` 输出 `verified` 且 `resolved` 指向该
+   文件，Agent 可直接打开。
+3. 同夹具把 `docs/<pid>/usage-guide.md` 内容改一位 → 同锚点 `content_changed`
    且带 expected/actual，仍可打开但明确不可引用。
-3. 删除目标文件 → `missing`；锚点改为 `../secrets/x.md` → `unmapped`
+4. 删除目标文件 → `missing`；锚点改为 `../secrets/x.md` → `unmapped`
    （页面相对形态不做猜测）；符号链接指向范围外 → `out_of_scope`。
-4. 未配置 `sharing.wiki` 时，`recall` 输出与基线逐字节一致（快照对比）。
-5. 单测覆盖四条判定 × 全部状态枚举；E2E 在真实夹具仓库上跑通第 1、2 条。
+5. 未配置 `sharing.wiki` 时，`recall` 输出与基线逐字节一致（快照对比）。
+6. 单测覆盖四条判定 × 全部状态枚举；E2E 在真实夹具仓库上跑通第 2、3、4 条。
 
 ## 9. 需求方确认（2026-09-28）
 
@@ -191,6 +202,13 @@ sharing:
 | 1 | 新基线是否带上 fork 的 003/004 语义与 `get` 命令 | **不带**。本需求在裸 `v0.26.0-beta.5` 上独立落地；只读解析团队仓克隆的 `.wiki/` 与 `docs/<pid>/`，不依赖 fork 的同步机制 |
 | 2 | 推导出的 Wiki 位置如何交给 Agent | **CLI 不输出 Wiki 位置**，只在文档/skill 里写清目录规范；Agent 按规范自行定位页面 |
 | 3 | 是否需要机器可读通道 | **需要**。`recall` 增加 `--json`（含 `--wiki-page` 锚点解析模式） |
+
+后续澄清（2026-09-28 第二轮，需求方确认）：
+
+| # | 问题 | 确认结论 |
+|---|---|---|
+| 4 | 团队仓 wiki 的检索由谁提供 | **不新增 CLI 检索器**。本地 wiki 与团队仓 wiki 是不同场景、检索方式各归各：本地走 skill 既有检索；团队仓用**同一 skill 的检索工具 + `WIKI_DIR` 指向克隆内集合**（实测可用），或导引浏览。CLI 只负责引用解析（`--wiki-page`） |
+| 5 | 检索范围 | **只搜用户指定的 wiki**（`WIKI_DIR` 指向的那个集合） |
 
 ### 9.1 Wiki 位置的规范（由文档承载，非 CLI 输出）
 
@@ -207,9 +225,10 @@ CLI 不提供位置查询命令；位置不可推导时（无激活项目、同�
 
 ### 9.2 `--json` 通道（实现为两个模式）
 
-**模式 A — `recall --wiki-page <repo相对路径>`**（隐含 `--json`）：Agent 把
-从克隆读到的 Wiki 页面路径交给 CLI，CLI 解析该页 frontmatter 的 `sources[]`
-并逐个映射/校验，输出 §5 的结构（`page` / `projectId` / `sources[]`）。
+**模式 A — `recall --wiki-page <repo相对路径>`**（隐含 `--json`）：Agent 从
+团队仓克隆读到 Wiki 页面（检索用 skill 工具 + `WIKI_DIR`，或导引浏览）后，
+把页面路径交给 CLI，CLI 解析该页 frontmatter 的 `sources[]` 并逐个映射/校验，
+输出 §5 的结构（`page` / `projectId` / `sources[]`）。
 
 **模式 B — `recall <query> --json`**：既有结果 JSON 化（`title`/`type`/
 `scope`/`score`/`file`/`sources`），与 text 版同构；不含未经校验的
@@ -221,3 +240,5 @@ CLI 不提供位置查询命令；位置不可推导时（无激活项目、同�
 - **`ambiguous` 状态不实现**：每条锚点经前缀映射恰好一个候选（见 §4 注）。
 - **页面相对形态不映射**：默认约定只重写 `docs/…` 形态；`../`、绝对路径等
   不在默认范围内，需显式 `map` 覆盖，否则 `unmapped`（不做猜测）。
+- **不新增 CLI 检索器**：团队仓检索归 skill 工具（`WIKI_DIR`）+ 导引，CLI
+  只做引用解析（§5 职责分工）。
