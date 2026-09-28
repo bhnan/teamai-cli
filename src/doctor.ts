@@ -4,22 +4,67 @@ import { pathExists, readFileSafe } from './utils/fs.js';
 import { log, setStderrOnly } from './utils/logger.js';
 import type { GlobalOptions } from './types.js';
 import {
+  CLAUDE_TOOL_ID,
   COPILOT_TOOL_ID,
-  TEAMAI_ENV_START,
+  DEFAULT_CLAUDE_ROOT,
+  detectClaudeConfigRoot,
+  resolveToolRootDir,
+  toolRootRejection,
   resolveHookScope,
   resolveToolBaseDir,
-  getDataHome,
   isAgentExcluded,
   scopedToolPaths,
   type LocalConfig,
   type TeamaiConfig,
 } from './types.js';
 import { isToolInstalledForConfig } from './resources/base.js';
+import { skillsDirForTool } from './resources/skills.js';
 import { TEAMAI_HOOK_SUBCOMMANDS, isCodexTrustGatedTool, codexTrustReminder } from './hooks.js';
-import { getUserHome } from './utils/home.js';
+import {
+  buildDeliveryChecks,
+  buildRulesDeliveryChecks,
+  buildAgentsDeliveryChecks,
+  buildNamespaceNotes,
+  buildMcpDeliveryChecks,
+  buildEnvDeliveryCheck,
+  buildEntryResolutionChecks,
+  buildEntryScopeKeyCheck,
+  entryNamespaceNotes,
+  buildDocsCheck,
+} from './doctor-delivery.js';
+
+/**
+ * Where a check gets its answer. `provider` checks shell out to a provider CLI
+ * or the network; `local` checks only read this machine. Callers that run the
+ * registry outside `teamai doctor` filter on it — see the post-pull pass in
+ * `pull()`, which has just used the provider successfully and must not pay for
+ * an auth probe on every sync.
+ */
+export type CheckSource = 'local' | 'provider';
+import { hasPiHooks } from './pi-hooks.js';
 
 export interface Check {
   name: string;
+  source: CheckSource;
+  /**
+   * Names something `teamai pull` says in its own words, better than a static
+   * `fix` can: the queue warning carries the push error, which `doctor` cannot
+   * learn without attempting a push of its own, and a read-only diagnostic must
+   * not. The post-pull pass drops a check whose topic that run actually
+   * reported. Not every run does: a scope whose team repo fails to refresh
+   * returns before the publish step, and a publish that throws is swallowed
+   * into a debug line. On those paths nobody has spoken, so the check is the
+   * only voice left and must be heard.
+   */
+  reportedByPull?: string;
+  /**
+   * True for a check whose failure is a cleanup opportunity, not a sign that
+   * anything a user asked for is actually broken. `doctor` still reports it
+   * like any other check; `pull`'s post-pull summary excludes it from the
+   * "N check(s) failed" count so a healthy delivery is not announced as
+   * broken because of unrelated leftover state (#693 review round 6).
+   */
+  informational?: boolean;
   check: () => Promise<boolean>;
   fix?: string;
 }
@@ -34,6 +79,14 @@ export interface DoctorContext {
   teamConfig: TeamaiConfig | null;
   /** Tool paths already narrowed to the enabled, non-excluded agents. */
   toolPaths: TeamaiConfig['toolPaths'];
+  /**
+   * The same tool paths resolved at the scope hooks are injected into, which is
+   * not the config's scope: a non-self project scope injects into HOME (#264).
+   * Hook checks must use these, or a tool whose user-scope prefix differs from
+   * its project-scope one is looked for under the wrong prefix and always
+   * reported missing.
+   */
+  hookToolPaths: TeamaiConfig['toolPaths'];
   /** Where hooks are actually injected — see `resolveHookScope` (#264). */
   baseDir: string;
 }
@@ -58,25 +111,147 @@ export interface DoctorReport {
   checks: CheckResult[];
   /** Present only when the team repo declares packages. Human text, not checks. */
   packages?: { ok: boolean; lines: string[] };
-  /** Advisories that are not checks — today, the Codex trust-gate reminder. */
+  /** Advisories that are not checks: namespace overrides, the Codex trust-gate reminder. */
   notes?: string[];
 }
 
 /**
- * Build hook checks only for tools whose settings parent directory already
- * exists (i.e. the tool is installed). Tools that are not installed are skipped.
+ * Check that every tool the team declares and the user enabled is actually here.
+ * Scope note: the loop is over `ctx.toolPaths`, already narrowed to the enabled,
+ * non-excluded agents, so a name in `enabledAgents` that `teamai.yaml` declares
+ * no paths for is out of scope — nothing would be written to it either way.
+ *
+ * That list is the user's own claim that they use the tool, and every writer —
+ * skills, rules, agents, hooks — silently skips a tool whose root is missing.
+ * Answering the claim with silence reproduces inside `doctor` the skip #574
+ * reports in `pull`: "Synced N" while the tool receives nothing. Without
+ * `enabledAgents` the team's tool list is aspirational, so an absent tool stays
+ * silent, as it always has.
+ *
+ * The probe uses a resource path rather than the settings path: resources land
+ * under `resolveToolBaseDir` (the project root in project scope), which is the
+ * root a pull would have to write into.
+ */
+async function buildEnabledToolChecks(ctx: DoctorContext): Promise<Check[]> {
+  const { localConfig, toolPaths } = ctx;
+  if (!localConfig.enabledAgents) return [];
+
+  const checks: Check[] = [];
+  for (const [tool, paths] of Object.entries(toolPaths)) {
+    // Copilot counts itself installed as soon as enabledAgents names it
+    // (isToolInstalledForConfig), so this check could never fail for it. Its
+    // delivery check still reports what did not arrive.
+    if (tool === COPILOT_TOOL_ID) continue;
+
+    const probePath = paths.skills ?? paths.rules ?? paths.agents ?? paths.settings ?? paths.hooks;
+    if (!probePath) continue;
+
+    // A tool that receives skills is asked the way the skills write path asks:
+    // OpenClaw lives at its workspace directory, not at the tool root, so the
+    // generic probe passes for a `~/.openclaw` with no workspace while delivery
+    // silently skips it — the same "reported success, received nothing" this
+    // check exists to catch. A tool with no skills path (rules only) has no
+    // such resolver, so it keeps the generic probe.
+    const skillsPath = paths.skills;
+    const isInstalled = skillsPath
+      ? async (): Promise<boolean> => await skillsDirForTool(tool, skillsPath, localConfig) !== null
+      : (): Promise<boolean> => isToolInstalledForConfig(tool, probePath, localConfig);
+
+    // Pushed whether or not it passes. Every other check in the registry
+    // reports both ways, and `doctor --json` is consumed by hooks and CI, where
+    // a missing entry cannot be told apart from one that passed.
+    checks.push({
+      name: `${tool} is installed`,
+      source: 'local',
+      check: isInstalled,
+      fix: `enabledAgents lists ${tool}, but it has no directory under `
+        + `${resolveToolBaseDir(tool, localConfig)}, so a pull delivers nothing to it. `
+        + `Install ${tool} (in project scope, opening a session there creates its root), `
+        + `or run \`teamai uninstall --agent ${tool}\` to stop syncing to it.`,
+    });
+  }
+
+  return checks;
+}
+
+/**
+ * Check that a relocated Claude Code root is the one teamai writes to.
+ *
+ * `CLAUDE_CONFIG_DIR` moves everything Claude Code reads — settings, skills,
+ * rules, CLAUDE.md — and teamai learns about it only when `init` records it in
+ * `toolRoots.claude`. Without the check, a member who sets the variable after
+ * initializing (or changes it) keeps getting a green report while every synced
+ * resource lands in a directory their Claude never opens.
+ *
+ * Skipped only when the variable is unset — then there is nothing to relocate
+ * and a member who never used it should not be told about a setting they do not
+ * have. A value equal to the default root is not that case: it still moves
+ * `.claude.json` inside the directory, so it has to be recorded like any other.
+ */
+function buildClaudeRootCheck(localConfig: LocalConfig, toolPaths: TeamaiConfig['toolPaths']): Check[] {
+  // Nothing to compare for a config that never writes to Claude Code.
+  if (!(CLAUDE_TOOL_ID in toolPaths)) return [];
+  const detected = detectClaudeConfigRoot();
+  if (!detected) return [];
+  // The effective root, not the recorded string: `~/.claude-work` written by
+  // hand is the same directory as the expanded one, while a root the sync
+  // refuses (outside HOME, or nested too deep) resolves back to the default —
+  // so the check fails exactly when the sync would write somewhere else.
+  const recorded = localConfig.toolRoots?.[CLAUDE_TOOL_ID];
+  const effective = resolveToolRootDir(CLAUDE_TOOL_ID, DEFAULT_CLAUDE_ROOT, localConfig.toolRoots);
+  // A value init refuses cannot be fixed by re-running init: say why instead.
+  const rejection = toolRootRejection(detected);
+  return [{
+    name: 'Claude Code root matches CLAUDE_CONFIG_DIR',
+    source: 'local',
+    // Recording matters even when the directories agree: an unrecorded root
+    // leaves the MCP config at ~/.claude.json, while a Claude Code told to use
+    // that directory reads .claude.json from inside it.
+    check: async () => recorded !== undefined && effective === detected,
+    fix: rejection
+      ? `CLAUDE_CONFIG_DIR is ${detected}, which teamai cannot sync to (${rejection}); `
+        + `this config syncs Claude Code to ${effective}. Point CLAUDE_CONFIG_DIR at a directory `
+        + 'in your home (or ~/.config/<name>) and re-run `teamai init`.'
+      : `CLAUDE_CONFIG_DIR is ${detected}; this config syncs Claude Code to ${effective}`
+        + `${recorded === undefined ? ' (no root recorded)' : ''}. `
+        + 'Re-run `teamai init` to record it.',
+  }];
+}
+
+/**
+ * Build hook checks for tools whose settings parent directory already exists
+ * (i.e. the tool is installed). Tools that are not installed are skipped.
  */
 async function buildHookChecks(
   toolPaths: TeamaiConfig['toolPaths'],
+  hookToolPaths: TeamaiConfig['toolPaths'],
   baseDir: string,
   localConfig: LocalConfig,
 ): Promise<Check[]> {
   const checks: Check[] = [];
   for (const [tool, paths] of Object.entries(toolPaths)) {
+    if (tool === 'pi') {
+      const installed = await isToolInstalledForConfig(tool, paths.skills ?? '.pi/skills', localConfig);
+      if (!installed) continue;
+      checks.push({
+        name: 'teamai hooks in pi extension',
+        source: 'local',
+        check: async () => hasPiHooks(),
+        fix: 'Run `teamai hooks inject` to inject/update hooks',
+      });
+      continue;
+    }
+    // A standalone hooks file (Copilot) is injected at the config's own scope
+    // (`reconcileTeamHooksForConfig` joins resolveToolBaseDir with the
+    // config-scoped `hooks`), so it is probed from `toolPaths`. Settings-based
+    // hooks follow resolveHookScope and are probed from `hookToolPaths`.
+    // Mixing the two — userScope `hooks/teamai.json` under <projectRoot> —
+    // reported Copilot missing right after a successful `hooks inject` (#732).
+    const settings = hookToolPaths[tool]?.settings;
     const hookPath = paths.hooks
       ? path.join(resolveToolBaseDir(tool, localConfig), paths.hooks)
-      : paths.settings
-        ? path.join(baseDir, paths.settings)
+      : settings
+        ? path.join(baseDir, settings)
         : undefined;
     if (!hookPath) continue;
     const settingsPath = hookPath;
@@ -84,9 +259,12 @@ async function buildHookChecks(
     const installed = tool === COPILOT_TOOL_ID
       ? await isToolInstalledForConfig(tool, paths.hooks ?? paths.settings ?? '', localConfig)
       : await pathExists(parentDir);
+    // An uninstalled tool has no hooks to check. Whether it should be installed
+    // at all is a different question — see buildEnabledToolChecks.
     if (!installed) continue;
     checks.push({
       name: `teamai hooks in ${tool} settings`,
+      source: 'local',
       check: async () => {
         if (!await pathExists(settingsPath)) return false;
         const content = await readFileSafe(settingsPath);
@@ -102,6 +280,7 @@ async function buildHookChecks(
   }
   return checks;
 }
+
 
 /**
  * True if a trust-gated Codex tool (the public `codex`) already has teamai hooks
@@ -140,19 +319,44 @@ export async function resolveDoctorContext(): Promise<DoctorContext | null> {
   // Hook checks must look where hooks are actually injected. resolveHookScope
   // maps a non-self project scope to HOME (#264), matching the injection path in
   // init/pull/hooks-cmd — otherwise doctor checks <projectRoot>/.claude while the
-  // hooks live in ~/.claude and always reports them missing.
-  const baseDir = resolveHookScope(localConfig).baseDir;
+  // hooks live in ~/.claude and always reports them missing. The paths have to
+  // follow the same scope, or a tool whose user-scope prefix differs from its
+  // project-scope one (`qoder-cn`, OpenCode) is probed under the wrong prefix.
+  const hookScope = resolveHookScope(localConfig);
+  const hookToolPaths: TeamaiConfig['toolPaths'] = teamConfig
+    ? Object.fromEntries(
+      Object.entries(scopedToolPaths(teamConfig, { ...localConfig, scope: hookScope.scope }))
+        .filter(([tool]) => !isAgentExcluded(localConfig, tool)),
+    )
+    : {};
+  const baseDir = hookScope.baseDir;
 
-  return { localConfig, teamConfig, toolPaths, baseDir };
+  return { localConfig, teamConfig, toolPaths, hookToolPaths, baseDir };
 }
+
+/**
+ * Which caller the registry is being built for.
+ *
+ * `pull` runs the registry again at the end of an interactive sync, under a
+ * budget that covers building it as well as running it. Skills and docs cost a
+ * stat per item; rules cost a read per rule per tool and agents parse every
+ * spec. Spending the budget on those loses the cheap checks that catch the bug
+ * this whole line of work exists for, so they are `doctor`-only.
+ *
+ * The stage is a property of the caller, not of a check, which is why it is an
+ * argument here rather than a third optional flag on `Check` beside `source`
+ * and `reportedByPull`.
+ */
+export type CheckStage = 'pull' | 'doctor';
 
 /**
  * The check registry. Exported so callers other than `teamai doctor` can run
  * the same diagnostics and act on the result.
  */
-export async function buildChecks(ctx: DoctorContext): Promise<Check[]> {
-  const { localConfig, teamConfig, toolPaths, baseDir } = ctx;
-  const providerName = teamConfig?.provider;
+export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'doctor'): Promise<Check[]> {
+  const { localConfig, teamConfig, toolPaths, hookToolPaths, baseDir } = ctx;
+  // A member's `init --provider` choice outranks the team's provider (#789).
+  const providerName = localConfig.provider ?? teamConfig?.provider;
   const checks: Check[] = [];
 
   // Provider-specific checks: gf CLI only needed for TGit, gh CLI for GitHub
@@ -162,11 +366,13 @@ export async function buildChecks(ctx: DoctorContext): Promise<Check[]> {
     checks.push(
       {
         name: 'gf CLI is installed',
+        source: 'provider',
         check: async () => isGfInstalled(),
         fix: 'Run `teamai init` to install gf CLI automatically',
       },
       {
         name: 'gf CLI is authenticated',
+        source: 'provider',
         check: async () => gfIsAuthenticated(),
         fix: 'Run `teamai init` to authenticate via gf auth login',
       },
@@ -177,11 +383,13 @@ export async function buildChecks(ctx: DoctorContext): Promise<Check[]> {
     checks.push(
       {
         name: 'gh CLI is installed',
+        source: 'provider',
         check: async () => isGhInstalled(),
         fix: 'Install from https://cli.github.com/ or run `brew install gh`',
       },
       {
         name: 'gh CLI is authenticated',
+        source: 'provider',
         check: async () => ghIsAuthenticated(),
         fix: 'Run `gh auth login` to authenticate',
       },
@@ -191,6 +399,7 @@ export async function buildChecks(ctx: DoctorContext): Promise<Check[]> {
     const { gitlabIsAuthenticated } = await import('./providers/gitlab/index.js');
     checks.push({
       name: 'GitLab token is configured',
+      source: 'provider',
       check: async () => gitlabIsAuthenticated(),
       fix: 'Export GITLAB_TOKEN (a Personal Access Token with `api` scope). '
         + 'GITLAB_PRIVATE_TOKEN and GITLAB_PAT are accepted as aliases.',
@@ -200,6 +409,7 @@ export async function buildChecks(ctx: DoctorContext): Promise<Check[]> {
     const { gitcodeIsAuthenticated } = await import('./providers/gitcode/index.js');
     checks.push({
       name: 'GitCode token is configured',
+      source: 'provider',
       check: async () => gitcodeIsAuthenticated(),
       fix: 'Export GITCODE_TOKEN (a GitCode Personal Access Token), or run `teamai init` '
         + 'to paste one interactively. GC_TOKEN is accepted as an alias.',
@@ -209,47 +419,48 @@ export async function buildChecks(ctx: DoctorContext): Promise<Check[]> {
   checks.push(
     {
       name: 'Team repo exists locally',
+      source: 'local',
       check: async () => pathExists(localConfig.repo.localPath),
       fix: 'Run `teamai init` to clone the team repo',
     },
     {
       name: 'Team config (teamai.yaml) is valid',
+      source: 'local',
       check: async () => {
         const config = await loadTeamConfig(localConfig.repo.localPath);
         return config !== null;
       },
       fix: 'Check teamai.yaml in team repo for syntax errors',
     },
-    ...await buildHookChecks(toolPaths, baseDir, localConfig),
     {
-      name: 'Env variables injected in shell profile',
+      // A contribution is kept locally when it cannot be published. Without
+      // this check a member whose pushes are rejected queues notes forever and
+      // is told each time that the next pull will retry.
+      name: 'Contributed learnings are published',
+      source: 'local',
+      // pullForScope warns about the queue on its own, with the push error
+      // attached; this check is the standing version of it for `teamai doctor`.
+      reportedByPull: 'pending-learnings',
       check: async () => {
-        if (teamConfig?.sharing?.env?.injectShellProfile === false) return true;
-
-        const envYamlPath = path.join(localConfig.repo.localPath, 'env', 'env.yaml');
-        if (!await pathExists(envYamlPath)) return true;
-
-        const home = getUserHome();
-
-        // env.sh lives under teamaiHome, which is <projectRoot>/.teamai in
-        // project scope and ~/.teamai in user scope — mirror the path that
-        // `teamai pull` actually writes to, not a hardcoded user-home path.
-        const envShPath = path.join(
-          getDataHome(localConfig),
-          'env.sh',
-        );
-        if (!await pathExists(envShPath)) return false;
-
-        const shell = process.env.SHELL ?? '';
-        const profilePath = shell.includes('zsh')
-          ? path.join(home, '.zshrc')
-          : path.join(home, '.bashrc');
-        if (!await pathExists(profilePath)) return false;
-        const content = await readFileSafe(profilePath);
-        return content?.includes(TEAMAI_ENV_START) ?? false;
+        const { listPendingLearnings } = await import('./utils/pending-learnings.js');
+        return (await listPendingLearnings(localConfig)).length === 0;
       },
-      fix: 'Run `teamai pull` to inject env variables into shell profile',
+      fix: 'Run `teamai pull` to publish them. If they stay queued, check that you '
+        + 'can push to the team repo (run with --verbose to see the push error).',
     },
+    ...buildClaudeRootCheck(localConfig, toolPaths),
+    ...await buildEnabledToolChecks(ctx),
+    ...await buildHookChecks(toolPaths, hookToolPaths, baseDir, localConfig),
+    ...await buildDeliveryChecks(ctx),
+    // Built only for `doctor`: the work is in building these, not in running
+    // them, so skipping them post-pull is what keeps the budget for the rest.
+    ...(stage === 'doctor' ? await buildRulesDeliveryChecks(ctx) : []),
+    ...(stage === 'doctor' ? await buildAgentsDeliveryChecks(ctx) : []),
+    ...await buildMcpDeliveryChecks(ctx),
+    ...await buildDocsCheck(ctx),
+    ...await buildEnvDeliveryCheck(ctx),
+    ...await buildEntryResolutionChecks(ctx),
+    ...await buildEntryScopeKeyCheck(ctx),
   );
 
   return checks;
@@ -260,7 +471,7 @@ export async function buildChecks(ctx: DoctorContext): Promise<Check[]> {
  * lands, so the human rendering keeps streaming while a slow check (a provider
  * CLI auth probe) is still running.
  */
-async function runChecks(
+export async function runChecks(
   checks: Check[],
   onResult?: (result: CheckResult) => void,
 ): Promise<CheckResult[]> {
@@ -279,14 +490,18 @@ function emitReport(report: DoctorReport): void {
   console.log(JSON.stringify(report, null, 2));
 }
 
-/** The human rendering of one finished check. */
-function renderResult({ name, ok, fix }: CheckResult): void {
-  if (ok) {
-    console.log(`  ✔ ${name}`);
-    return;
-  }
-  console.log(`  ✖ ${name}`);
-  if (fix) console.log(`    → ${fix}`);
+/**
+ * The human rendering of one finished check, as lines. Exported because `pull`
+ * prints the same shape through the logger rather than stdout — one definition
+ * of the glyphs and the indent, two sinks.
+ */
+export function formatCheckResult({ name, ok, fix }: CheckResult): string[] {
+  if (ok) return [`  ✔ ${name}`];
+  return fix ? [`  ✖ ${name}`, `    → ${fix}`] : [`  ✖ ${name}`];
+}
+
+function renderResult(result: CheckResult): void {
+  for (const line of formatCheckResult(result)) console.log(line);
 }
 
 export async function doctor(options: DoctorOptions): Promise<boolean> {
@@ -334,6 +549,13 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
   const codexNote = await hasInstalledCodexHooks(toolPaths, baseDir)
     ? codexTrustReminder()
     : null;
+  // Info, not checks: which namespace item or entry replaces which root one
+  // (#707).
+  const notes = [
+    ...await buildNamespaceNotes(ctx),
+    ...await entryNamespaceNotes(ctx),
+    ...(codexNote ? [codexNote] : []),
+  ];
 
   if (jsonMode) {
     emitReport({
@@ -342,7 +564,7 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
       checks: results,
       // pkgDoctorReport renders its own lines; they are human text, not checks.
       ...(packageReport ? { packages: { ok: packageReport.allPassed, lines: packageReport.lines } } : {}),
-      ...(codexNote ? { notes: [codexNote] } : {}),
+      ...(notes.length > 0 ? { notes } : {}),
     });
     return allPassed;
   }
@@ -351,9 +573,9 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
     for (const line of packageReport.lines) console.log(line);
   }
 
-  if (codexNote) {
+  if (notes.length > 0) {
     console.log('');
-    log.info(codexNote);
+    for (const note of notes) log.info(note);
   }
 
   console.log('');

@@ -11,7 +11,6 @@ import { DocsHandler } from './resources/docs.js';
 import { detectInstalledAgents, type ResolvedAgent } from './known-agents.js';
 import {
   buildClassifyContext,
-  classifySkill,
   formatSkillSource,
   scanAgentSkills,
   truncate,
@@ -20,8 +19,13 @@ import {
 import { RESOURCE_TYPES, LocalConfigSchema, getDataHome, type GlobalOptions, type ResourceType } from './types.js';
 import { projectsRootDir, readAnchorFile, projectSlug, legacyProjectSlug } from './utils/partition.js';
 import { maskEnvValue } from './resources/env.js';
-import { parseTeamMcpServers } from './resources/mcp.js';
-import { parseHooksYaml } from './resources/hooks.js';
+import { mcpEntryReader } from './resources/mcp.js';
+import { resolveTeamHookEntries } from './resources/hooks.js';
+import { envEntryReader } from './resources/env.js';
+import {
+  describeEntryFailure, describeOrigin, describeOrigins, resolveEntriesFor,
+  type EntryResolution, type EntryType,
+} from './namespaced-entries.js';
 
 export interface ListOptions extends GlobalOptions {
   /** Where to look for resources: 'repo' (default for backwards compat),
@@ -90,32 +94,25 @@ export async function status(options: GlobalOptions): Promise<void> {
 
   counts.docs = await new DocsHandler().countDocFiles(path.join(repoPath, 'docs'));
 
-  const envYamlPath = path.join(repoPath, 'env', 'env.yaml');
-  let envCount = 0;
-  if (await pathExists(envYamlPath)) {
-    const envContent = await readFileSafe(envYamlPath);
-    if (envContent) {
-      try {
-        const envData = YAML.parse(envContent) as { variables?: unknown[] };
-        envCount = Array.isArray(envData?.variables) ? envData.variables.length : 0;
-      } catch {
-        // invalid yaml
-      }
-    }
-  }
-  counts.env = envCount;
+  // Env, hooks and MCP count what reaches this directory: root plus the active
+  // namespace files. A set that cannot be resolved counts as 0; `teamai doctor`
+  // and the list commands say why.
+  // A type with namespace entries says where they come from: `env: 3 (2 root, 1 checkout)`.
+  const origins: Partial<Record<ResourceType, string>> = {};
+  const count = (type: EntryType & ResourceType, resolution: EntryResolution<unknown>): void => {
+    counts[type] = resolution.kind === 'resolved' ? resolution.entries.length : 0;
+    if (resolution.kind === 'failed') origins[type] = ' (cannot be resolved; run `teamai doctor`)';
+    else if (resolution.entries.some((entry) => entry.namespace !== null)) origins[type] = ` (${describeOrigins(resolution.entries)})`;
+  };
+  count('env', await resolveEntriesFor(envEntryReader, localConfig));
 
   const agentsHandler = getAllHandlers().find((h) => h.type === 'agents');
   counts.agents = agentsHandler
     ? (await agentsHandler.scanTeamForPull(teamConfig, localConfig)).length
     : 0;
 
-  const hooksHandler = getAllHandlers().find((h) => h.type === 'hooks') as
-    | { countHooks: (repoPath: string) => Promise<number> }
-    | undefined;
-  counts.hooks = hooksHandler ? await hooksHandler.countHooks(repoPath) : 0;
-
-  counts.mcp = (await parseTeamMcpServers(repoPath)).length;
+  count('hooks', (await resolveTeamHookEntries(localConfig)).resolution);
+  count('mcp', await resolveEntriesFor(mcpEntryReader, localConfig));
 
   try {
     counts.wiki = (await listFilesRecursive(path.join(repoPath, '.wiki')))
@@ -125,15 +122,25 @@ export async function status(options: GlobalOptions): Promise<void> {
   }
 
   for (const type of RESOURCE_TYPES) {
-    console.log(`  ${type}: ${counts[type] ?? 0}`);
+    console.log(`  ${type}: ${counts[type] ?? 0}${origins[type] ?? ''}`);
   }
 
   // Local pushable items
   console.log('');
   log.info('Local resources not yet pushed:');
   let anyNew = false;
+  let anyUnscanned = false;
   for (const handler of getAllHandlers()) {
-    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    let items;
+    try {
+      items = await handler.scanLocalForPush(teamConfig, localConfig);
+    } catch (e) {
+      // A manifest that does not parse fails the pull and the push; status is
+      // where the member looks to find out why, so it reports and goes on.
+      log.warn(`  [${handler.type}] could not scan: ${(e as Error).message}`);
+      anyUnscanned = true;
+      continue;
+    }
     if (items.length > 0) {
       anyNew = true;
       console.log(`  [${handler.type}] ${items.length} new`);
@@ -145,7 +152,8 @@ export async function status(options: GlobalOptions): Promise<void> {
     }
   }
   if (!anyNew) {
-    console.log('  (none)');
+    // A bare "(none)" would read as a clean result for the types it never saw.
+    console.log(anyUnscanned ? '  (none in the types that could be scanned)' : '  (none)');
   }
 
   console.log('');
@@ -310,54 +318,49 @@ async function printRepoSection(
   options: ListOptions,
   ctx: { repoPath: string; teamConfig: Awaited<ReturnType<typeof autoDetectInit>>['teamConfig']; localConfig: Awaited<ReturnType<typeof autoDetectInit>>['localConfig'] },
 ): Promise<void> {
-  const { repoPath, teamConfig, localConfig } = ctx;
+  const { teamConfig, localConfig } = ctx;
   console.log('');
   console.log(`=== REPO ${t.toUpperCase()} ===`);
 
+  // Env, hooks and MCP list what reaches this directory, each with its
+  // namespace: root plus the active namespace files.
   if (t === 'env') {
-    const envYamlPath = path.join(repoPath, 'env', 'env.yaml');
-    if (await pathExists(envYamlPath)) {
-      const envContent = await readFileSafe(envYamlPath);
-      if (envContent) {
-        try {
-          const envData = YAML.parse(envContent) as { variables?: Array<{ key: string; value: string; description?: string }> };
-          if (envData?.variables && envData.variables.length > 0) {
-            if (options.reveal) {
-              process.stderr.write('[warn] Env values will be shown in plaintext\n');
-            }
-            for (const v of envData.variables) {
-              const display = options.reveal ? v.value : maskEnvValue(v.value);
-              console.log(`  ${v.key}=${display}`);
-              if (options.verbose && v.description) {
-                console.log(`    ${v.description}`);
-              }
-            }
-          } else {
-            console.log('  (none)');
-          }
-        } catch {
-          console.log('  (invalid env.yaml)');
-        }
-      } else {
-        console.log('  (none)');
-      }
-    } else {
+    const env = await resolveEntriesFor(envEntryReader, localConfig);
+    if (env.kind === 'failed') {
+      console.log(`  ${describeEntryFailure(env.failure)}`);
+    } else if (env.entries.length === 0) {
       console.log('  (none)');
+    } else {
+      if (options.reveal) {
+        process.stderr.write('[warn] Env values will be shown in plaintext\n');
+      }
+      for (const v of env.entries) {
+        const display = options.reveal ? v.entry.value : maskEnvValue(v.entry.value);
+        console.log(`  ${v.name}=${display}  (${describeOrigin(v)})`);
+        if (options.verbose && v.entry.description) {
+          console.log(`    ${v.entry.description}`);
+        }
+      }
     }
     return;
   }
 
   if (t === 'mcp') {
-    const servers = await parseTeamMcpServers(repoPath);
-    if (servers.length === 0) {
+    const mcp = await resolveEntriesFor(mcpEntryReader, localConfig);
+    if (mcp.kind === 'failed') {
+      console.log(`  ${describeEntryFailure(mcp.failure)}`);
+      return;
+    }
+    if (mcp.entries.length === 0) {
       console.log('  (none)');
       return;
     }
-    for (const s of servers) {
+    for (const resolved of mcp.entries) {
+      const s = resolved.entry;
       const endpoint = s.transport === 'stdio'
         ? `${s.command ?? ''} ${(s.args ?? []).join(' ')}`.trim()
         : (s.url ?? '');
-      console.log(`  ${s.name}  [${s.transport}]  ${endpoint}`);
+      console.log(`  ${s.name}  [${s.transport}]  ${endpoint}  (${describeOrigin(resolved)})`);
       if (options.verbose && s.description) {
         console.log(`    ${s.description}`);
       }
@@ -366,14 +369,18 @@ async function printRepoSection(
   }
 
   if (t === 'hooks') {
-    const parsed = await parseHooksYaml(repoPath);
-    const hooks = parsed?.hooks ?? [];
-    if (hooks.length === 0) {
+    const { resolution: hooks } = await resolveTeamHookEntries(localConfig);
+    if (hooks.kind === 'failed') {
+      console.log(`  ${describeEntryFailure(hooks.failure)}`);
+      return;
+    }
+    if (hooks.entries.length === 0) {
       console.log('  (none)');
       return;
     }
-    for (const h of hooks) {
-      console.log(`  ${h.id}  [${h.event}]`);
+    for (const resolved of hooks.entries) {
+      const h = resolved.entry;
+      console.log(`  ${h.id}  [${h.event}]  (${describeOrigin(resolved)})`);
       if (options.verbose && h.description) {
         console.log(`    ${h.description}`);
       }

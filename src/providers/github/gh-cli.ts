@@ -1,18 +1,12 @@
 import { spawnSync } from 'node:child_process';
 import crossSpawn from 'cross-spawn';
-import { log, spinner } from '../../utils/logger.js';
+import { log } from '../../utils/logger.js';
 import { resolveCliPath } from '../../utils/cli-path.js';
+import { isInteractive } from '../../utils/prompt.js';
 
 // ─── Constants ───────────────────────────────────────────
 
 const GITHUB_API = 'https://api.github.com';
-
-// ─── Shell helpers ───────────────────────────────────────
-
-/** Shell-quote a string using single quotes. */
-function shellQuote(s: string): string {
-  return "'" + s.replace(/'/g, "'\\''") + "'";
-}
 
 // ─── gh CLI detection ────────────────────────────────────
 
@@ -61,14 +55,14 @@ export function ghExec(
   if (options?.inheritStdio) {
     const result = crossSpawn.sync(ghPath, args, {
       stdio: 'inherit',
-      env: { ...process.env, ...(options.env ?? {}) },
+      env: { ...process.env, ...options.env },
       cwd: options.cwd,
     });
     return { stdout: '', stderr: '', status: result.status ?? 1 };
   }
 
   const result = crossSpawn.sync(ghPath, args, {
-    env: { ...process.env, ...(options?.env ?? {}) },
+    env: { ...process.env, ...options?.env },
     encoding: 'utf-8',
     maxBuffer: 10 * 1024 * 1024,
     cwd: options?.cwd,
@@ -225,6 +219,17 @@ export async function ensureGhAuthenticated(): Promise<string> {
   const existing = await ghAuthWhoami();
   if (existing) return existing;
 
+  // `gh auth login --web` inherits stdio and waits for a browser device flow.
+  // Without a person at a terminal that is a job stuck until gh's deadline
+  // (issue #711), so refuse up front and name the credential that would work.
+  if (!isInteractive()) {
+    throw new Error(
+      'GitHub authentication unavailable without a terminal. ' +
+        'Export GITHUB_TOKEN (or GH_TOKEN) with "repo" scope, ' +
+        'or run `gh auth login` in an interactive shell first.',
+    );
+  }
+
   // Need to log in — only possible via gh CLI
   ghAuthLogin();
 
@@ -260,6 +265,7 @@ export function ghRepoClone(repo: string, localPath: string): void {
     encoding: 'utf-8',
     stdio: ['pipe', 'pipe', 'pipe'],
     timeout: 120_000,
+    windowsHide: true,
   });
 
   const allOutput = `${result.stderr ?? ''} ${result.stdout ?? ''}`;

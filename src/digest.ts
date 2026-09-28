@@ -7,7 +7,7 @@ import { parseLearningDoc, titleFromFilename } from './utils/search-index.js';
 import { requireInit, detectProjectConfig } from './config.js';
 import { calculateTeamHealth } from './skill-health.js';
 import { createGit } from './utils/git.js';
-import type { GlobalOptions, UserStats, TokenUsage } from './types.js';
+import type { UserStats, TokenUsage } from './types.js';
 import { totalTokens } from './types.js';
 import { mergeDailyStats, summarizeTrendWindow, type TrendPeriod } from './session-trends.js';
 
@@ -405,7 +405,7 @@ export function formatTrendLines(periods: { current: TrendPeriod; previous: Tren
 /**
  * Generate and display weekly team digest.
  */
-export async function generateDigest(options: GlobalOptions): Promise<void> {
+export async function generateDigest(): Promise<void> {
   try {
     const projectConfig = await detectProjectConfig();
     const localConfig = projectConfig ?? (await requireInit()).localConfig;
@@ -417,10 +417,9 @@ export async function generateDigest(options: GlobalOptions): Promise<void> {
     let reportsRoot = repoPath;
     const { usesBranchWorktree } = await import('./types.js');
     if (usesBranchWorktree(localConfig)) {
-      const { ensureReportsWorktree, refreshReportsWorktree } = await import('./utils/reports-branch.js');
+      const { readableReportsWorktree } = await import('./utils/reports-branch.js');
       // Read-only: never publish a missing reports branch.
-      await refreshReportsWorktree(localConfig, { pushIfCreated: false });
-      reportsRoot = await ensureReportsWorktree(localConfig, { pushIfCreated: false });
+      reportsRoot = await readableReportsWorktree(localConfig);
     }
 
     const teamStats = await loadTeamStats(reportsRoot);
@@ -483,9 +482,11 @@ export async function generateDigest(options: GlobalOptions): Promise<void> {
     }
 
     // Learnings
-    const { learningsRoots } = await import('./utils/learnings-roots.js');
+    // Not another repository's learnings checkout, if one sits where this
+    // project's would (#808).
+    const { indexableLearningsRoots } = await import('./utils/learnings-roots.js');
     const { recent: recentLearnings, total: totalLearnings } = await getRecentLearnings(
-      learningsRoots(localConfig).read,
+      await indexableLearningsRoots(localConfig),
     );
     if (recentLearnings.length > 0) {
       console.log(`📚 New Learnings This Week: ${recentLearnings.length}`);

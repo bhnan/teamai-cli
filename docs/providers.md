@@ -33,7 +33,15 @@ git@git.example.com:group/repo.git      → 检查 GitLab，未确认则 git
 
 已知 host 和显式配置的 GitLab 实例优先。对于未知 host，`init` 会匿名探测 GitLab 登录页；确认是未配置的 GitLab 实例时，先提示设置 `GITLAB_URL` 和 `GITLAB_TOKEN` 后重试，不会直接把探测结果写入配置。未确认则继续使用 `git`。
 
-初始化成功后，provider 选择会写入 team 仓库的 `teamai.yaml` 的 `provider` 字段，后续 `push` / `pull` 都按这个值来。探测不会自动修改已有的 provider。
+初始化成功后，provider 选择会写入 team 仓库的 `teamai.yaml` 的 `provider` 字段，后续 `push` / `pull` 都按这个值来；成员用 `--provider` 保存在本机的选择优先于它（见下节）。探测不会自动修改已有的 provider。
+
+### 手动指定 provider（`--provider`）
+
+`teamai init <input> --provider <name>` 跳过上面的自动检测（包括 GitLab 探测），直接使用指定的 provider，取值与 `teamai.yaml` 的 `provider` 相同：`tgit`、`github`、`cnb`、`gitlab`、`gitcode`、`git`。典型用法是团队仓库在自建 GitLab 上、但成员只需要普通 Git：`--provider git` 不做平台登录、不检查 `GITLAB_TOKEN`，clone/pull/push 走已有的 Git 凭据。
+
+该选择写入成员本机的本地配置（`provider` 字段），只影响这台机器：创建 PR/MR（`push`、`remove` 等）和 `doctor` 的 provider 检查优先使用它，已有的 `teamai.yaml` 不变。`init` 新建 `teamai.yaml`（空仓库，或单仓库模式首次初始化）时，`--provider git` 写入的仍是不带该参数时检测到的 provider（包括 GitLab 探测）；探测到尚未配置的自建 GitLab 时 `init` 会停止并提示设置 `GITLAB_URL`，不会把 `git` 写成团队默认值。其他值按指定值写入。不带 `--provider` 重新运行 `init` 即恢复自动检测。
+
+自建 GitLab 使用 `--provider gitlab` 时仍需设置 `GITLAB_URL`（以及 `GITLAB_TOKEN`）。GitLab API 地址取自 `GITLAB_URL`，未设置时指向 gitlab.com，所以检测无法识别该 host 时 `init` 会直接报错退出，不会把 token 发往别处。
 
 ## 通用 Git Provider（自建/私有仓库）
 
@@ -78,8 +86,10 @@ sudo apt install gh
 
 ```bash
 teamai init yourorg/yourrepo
-# 检测到未登录时会自动调起 gh auth login --web
+# 检测到未登录时会自动调起 gh auth login --web（仅限交互式终端）
 ```
+
+无人值守运行（stdin 不是 TTY，或设置了 `CI` / `TEAMAI_NONINTERACTIVE`）不会调起该登录：浏览器 device flow 无人完成，只会把任务挂到超时（[#711](https://github.com/Tencent/teamai-cli/issues/711)）。此时 `init` 立即失败并提示导出带 `repo` 权限的 `GITHUB_TOKEN`（或 `GH_TOKEN`）。
 
 **方式 2：`GITHUB_TOKEN` 环境变量**
 
@@ -119,7 +129,9 @@ TeamAI 通过 `getDefaultBranch()` 自动识别默认分支：先看 `origin/HEA
 
 ### 认证
 
-`teamai init` 会自动下载工蜂 CLI `gf` 到 `~/.teamai/gf/`，然后运行 `gf auth login`（支持 iOA SSO / 浏览器 device code / 手动 token）。登录后 token 存在 `~/.netrc`，所有后续 git 操作自动带上。
+`teamai init` 会自动下载工蜂 CLI `gf` 到 `~/.teamai/gf/`，然后在交互式终端里运行 `gf auth login`（支持 iOA SSO / 浏览器 device code / 手动 token）。登录后 token 存在 `~/.netrc`，所有后续 git 操作自动带上。
+
+无人值守运行（stdin 不是 TTY，或设置了 `CI` / `TEAMAI_NONINTERACTIVE`）不会调起该登录，而是立即失败并提示先在交互式终端执行一次 `gf auth login`（[#711](https://github.com/Tencent/teamai-cli/issues/711)）。这里没有可替代的 token：`TGIT_TOKEN` 仅用于 REST API，git.woa.com 的 git 端点不接受它，因此无法用它 clone；登录一次之后，后续无人值守运行会复用它保存的凭据。
 
 ### 多级命名空间
 
@@ -149,7 +161,7 @@ cnb login --host cnb.cool   # OAuth2 device flow，登录后 `cnb git-credential
 teamai init https://cnb.cool/yourorg/yourrepo
 ```
 
-> **为什么要带 `--host`**：`cnb` CLI 在未显式指定 host 时，会从当前目录第一个 git remote 推断平台地址。若在一个 remote 指向非 CNB 平台（如内网 git 服务器）的仓库里直接跑 `cnb login`，请求会被打到那个 host 并返回 `401`。显式 `--host cnb.cool` 可避免此问题（自托管实例改用对应域名）。由 `teamai init` 自动触发登录时，teamai 已按 `TEAMAI_CNB_HOST`（默认 `cnb.cool`）带上 `--host`，无需手动处理。
+> **为什么要带 `--host`**：`cnb` CLI 在未显式指定 host 时，会从当前目录第一个 git remote 推断平台地址。若在一个 remote 指向非 CNB 平台（如内网 git 服务器）的仓库里直接跑 `cnb login`，请求会被打到那个 host 并返回 `401`。显式 `--host cnb.cool` 可避免此问题（自托管实例改用对应域名）。由 `teamai init` 自动触发登录时，teamai 已按 `TEAMAI_CNB_HOST`（默认 `cnb.cool`）带上 `--host`，无需手动处理；该自动登录仅在交互式终端里发生，无人值守运行改为立即失败并提示设置 `CNB_TOKEN`（见方式 2，[#711](https://github.com/Tencent/teamai-cli/issues/711)）。
 
 **方式 2：`CNB_TOKEN` 环境变量（headless / CI）**
 
@@ -225,7 +237,7 @@ export GITLAB_TOKEN=glpat-xxx
 ### 自托管实例检测
 
 - **公有 gitlab.com**：URL host 直接命中，自动选择 gitlab provider。
-- **自托管实例**：设置 `GITLAB_URL` 后，URL host 与 `GITLAB_URL` 的 host 相同时自动识别为 gitlab；也可用 `TEAMAI_GITLAB_HOST` 直接指定 host。仓库参数需使用完整 HTTP(S) 或 SSH URL：
+- **自托管实例**：设置 `GITLAB_URL` 后，URL host 与 `GITLAB_URL` 的 host 相同时自动识别为 gitlab；也可用 `TEAMAI_GITLAB_HOST` 直接指定 host，未设 `GITLAB_URL` 时 API 指向 `https://<该 host>`。两者同时设置但 host 不同时，teamai 会在发送 token 前报错停止。仓库参数需使用完整 HTTP(S) 或 SSH URL：
   ```bash
   export GITLAB_URL=https://git.example.com
   teamai init https://git.example.com/yourgroup/yourrepo     # → gitlab

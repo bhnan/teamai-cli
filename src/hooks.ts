@@ -1,6 +1,8 @@
+import { CODEX_TOOL_IDS } from './utils/tool-names.js';
 import path from 'node:path';
 import { realpathSync } from 'node:fs';
-import { readJson, writeJson, expandHome, ensureDir, pathExists } from './utils/fs.js';
+import { rm } from 'node:fs/promises';
+import { readJson, writeJson, readFileSafe, writeFile, expandHome, ensureDir, pathExists } from './utils/fs.js';
 import { log } from './utils/logger.js';
 import {
   COPILOT_TOOL_ID,
@@ -13,11 +15,11 @@ import {
   resolveLegacyProjectHookScope,
   resolveToolBaseDir,
   scopedToolPaths,
+  toolInstallRoot,
 } from './types.js';
-import type { HookDef, TeamaiConfig, LocalConfig } from './types.js';
+import type { HookDef, TeamaiConfig, LocalConfig, Scope } from './types.js';
 import { isSelfMode } from './types.js';
-import { activeRoleIds } from './roles.js';
-import { builtinHookDefs, applyBuiltinOverride, skipToolsWithoutShell } from './builtin-hooks.js';
+import { builtinHookDefs, applyBuiltinOverride, skipToolsWithoutShell, toolUsesCmdShell } from './builtin-hooks.js';
 import type { BuiltinHookOverride } from './builtin-hooks.js';
 import { resolveTeamHooks } from './resources/hooks.js';
 import { getUserHome } from './utils/home.js';
@@ -54,6 +56,7 @@ export const CLAUDE_TO_CURSOR_EVENTS: Record<string, string> = {
  */
 export const CLAUDE_TO_COPILOT_EVENTS: Record<string, string> = {
   SessionStart: 'SessionStart',
+  SessionEnd: 'SessionEnd',
   Stop: 'Stop',
   UserPromptSubmit: 'UserPromptSubmit',
   PreToolUse: 'PreToolUse',
@@ -170,7 +173,7 @@ type ToolFormat = 'claude' | 'cursor' | 'codex' | 'copilot' | 'zcode';
 export type HookStatus = 'installed' | 'missing';
 
 const CURSOR_TOOLS = new Set(['cursor']);
-const CODEX_TOOLS = new Set(['codex', 'codex-internal', 'tcodex']);
+const CODEX_TOOLS = new Set<string>(CODEX_TOOL_IDS);
 const ZCODE_TOOLS = new Set(['zcode']);
 
 function detectFormat(tool: string): ToolFormat {
@@ -215,11 +218,6 @@ const TEAMAI_COMMAND_MARKERS = [
   'teamai auto-recall', 'teamai todowrite-hint', 'teamai mr-hint', 'teamai hook-dispatch',
 ];
 
-function extractTeamaiSubcommand(command: string): string | null {
-  const match = command.match(/teamai\s+([\w-]+)/);
-  return match ? match[1] : null;
-}
-
 function isTeamaiHookCommand(command: string): boolean {
   return /(?:^|"|\s)teamai\s/.test(command);
 }
@@ -263,6 +261,14 @@ export interface ManagedHookRecord {
 /** ~/.teamai/managed-hooks.json — team hooks injected per tool. */
 export type ManagedHooksManifest = Record<string, ManagedHookRecord[]>;
 
+/**
+ * Install the built-in hooks alone, for a team set that did not resolve:
+ * `with-overrides` in each tool missing one of them, applying the given
+ * overrides; `defaults-where-none` only in a tool with no teamai hook at all,
+ * for when hooks/hooks.yaml does not parse and the overrides are unknown.
+ */
+export type BuiltinsOnly = 'with-overrides' | 'defaults-where-none';
+
 async function readManifest(manifestPath: string): Promise<ManagedHooksManifest> {
   const data = await readJson<ManagedHooksManifest>(expandHome(manifestPath));
   return data && typeof data === 'object' ? data : {};
@@ -277,29 +283,93 @@ function canonicalProjectRoot(projectRoot: string): string {
   try { return realpathSync.native(projectRoot); } catch { return path.resolve(projectRoot); }
 }
 
-/** Keep a project-scope team hook from firing in every project on the machine. */
-function gateTeamHookCommand(command: string, projectRoot?: string): string {
-  if (!projectRoot) return command;
-  const root = shellQuote(canonicalProjectRoot(projectRoot));
-  return `if [ "$PWD" = ${root} ] || case "$PWD" in ${root}/*) true;; *) false;; esac; then (${command}); fi`;
+/**
+ * Embed a Windows path in a cmd.exe command line so the child receives it
+ * byte-for-byte.
+ *
+ * A path interpolated into cmd text is re-parsed: `%…%` expands and
+ * `& ^ ( ) | < >` act on the line even inside double quotes, so a project at
+ * `C:\src\x&whoami&` would run part of its own name every time a hook fires.
+ * Caret escapes stop that during cmd's parsing, but cmd consumes them before
+ * CreateProcess and the child then re-splits the line, where a caret cannot
+ * keep a space in one token. Emitting the quotes as `^"` covers both: cmd
+ * consumes the caret and hands over a real quote, so the value reaches the
+ * child literally and spaces stay inside one argument.
+ */
+function cmdLiteral(value: string): string {
+  return `^"${value.replace(/[%^&()<>|,;=]/g, (ch) => `^${ch}`)}^"`;
 }
 
+/**
+ * cmd.exe equivalent of the POSIX project gate, as a prefix that resolves to
+ * true only inside `root`.
+ *
+ * The cwd is read with a bare `cd`, whose output goes straight into the pipe:
+ * unlike `echo %CD%`, the directory name is never part of a parsed command, so
+ * `&`, `%` and `^` in it cannot be re-interpreted. `cd` prints no trailing
+ * separator, so the root itself needs its own end-anchored test. The
+ * separator-suffixed `/b` form covers everything below the root while a
+ * sibling that merely shares the prefix (`C:\a\proj` vs `C:\a\proj-2`) does
+ * not; `/e` accepts the root's own `C:\a\proj`, and a longer line ending in it
+ * is not a valid absolute Windows path. `/l` keeps the pattern literal and
+ * `/i` matches the case-insensitive Windows path. The pattern ends in `\\`
+ * because findstr's CRT argument parser consumes one backslash.
+ */
+function cmdProjectGate(root: string): string {
+  // A root that ends in a separator (a drive root, `C:\`) would end the quoted
+  // literal with a backslash and escape its closing quote, unbalancing the
+  // whole command line. Stripping it also leaves the `/b` form matching the
+  // drive root's own `C:\` cwd.
+  const literal = cmdLiteral(root.replace(/[\\/]+$/, ''));
+  return `cd| findstr /i /b /l /c:${literal}\\\\ >nul || cd| findstr /i /e /l /c:${literal} >nul`;
+}
+
+/**
+ * Keep a project-scope team hook from firing in every project on the machine.
+ * The gate is rendered in the syntax of the shell that will actually run it:
+ * cmd.exe for tools whose Windows hook runner is cmd.exe — a POSIX
+ * `if [ "$PWD" ... ]` there is a syntax error that kills the whole command,
+ * gate and payload alike, before it ever runs — and POSIX sh for every other
+ * tool.
+ *
+ * Exit-status contract, identical for both renderings: outside the project the
+ * gate is a no-op that exits 0, and inside it the command's own status is
+ * passed through. A gate mismatch that returned non-zero would make CodeBuddy
+ * read the hook as `allowed:false` and BLOCK every UserPromptSubmit outside the
+ * project, so the cmd form must not inherit `findstr`'s failure status. That is
+ * also why the cmd form is not `${gate} || exit /b 0 && (…)`: the `||` would
+ * swallow a genuine payload failure along with the mismatch, losing the
+ * pass-through the POSIX `if …; then …; fi` gives for free.
+ */
+function gateTeamHookCommand(command: string, projectRoot: string | undefined, tool: string): string {
+  if (!projectRoot) return command;
+  const root = canonicalProjectRoot(projectRoot);
+  if (toolUsesCmdShell(tool)) {
+    return `${cmdProjectGate(root)} & if not errorlevel 1 (${command}) else exit /b 0`;
+  }
+  const quoted = shellQuote(root);
+  return `if [ "$PWD" = ${quoted} ] || case "$PWD" in ${quoted}/*) true;; *) false;; esac; then (${command}); fi`;
+}
+
+/** Recognise a project gate written by either renderer (entries outlive a platform switch). */
 function isGatedForProject(command: string, projectRoot: string): boolean {
-  return command.startsWith(`if [ "$PWD" = ${shellQuote(canonicalProjectRoot(projectRoot))} ]`);
+  const root = canonicalProjectRoot(projectRoot);
+  return command.startsWith(`if [ "$PWD" = ${shellQuote(root)} ]`)
+    || command.startsWith(cmdProjectGate(root));
 }
 
 function isProjectGatedCommand(command: string): boolean {
-  return command.startsWith('if [ "$PWD" = ');
+  return command.startsWith('if [ "$PWD" = ') || command.startsWith('cd| findstr ');
 }
 
-function scopedTeamDefs(teamDefs: HookDef[], projectRoot?: string): HookDef[] {
+function scopedTeamDefs(teamDefs: HookDef[], projectRoot: string | undefined, tool: string): HookDef[] {
   if (!projectRoot) return teamDefs;
-  return teamDefs.map((def) => ({ ...def, command: gateTeamHookCommand(def.command, projectRoot) }));
+  return teamDefs.map((def) => ({ ...def, command: gateTeamHookCommand(def.command, projectRoot, tool) }));
 }
 
 function manifestRecordsForTool(teamDefs: HookDef[], tool: string, removeAll: boolean, projectRoot?: string): ManagedHookRecord[] {
   if (removeAll) return [];
-  return teamDefsForTool(scopedTeamDefs(teamDefs, projectRoot), tool).map((d) => ({
+  return teamDefsForTool(scopedTeamDefs(teamDefs, projectRoot, tool), tool).map((d) => ({
     id: d.key,
     event: d.event,
     ...(d.matcher && d.matcher !== '*' ? { matcher: d.matcher } : {}),
@@ -344,26 +414,41 @@ function toCodexEntry(def: HookDef): CodexHookMatcher {
   return entry;
 }
 
-const COPILOT_BUILTIN_COMMAND_RE = /^bash -lc "(teamai hook-dispatch [^"]+) 2>\/dev\/null" \|\| true$/;
+// getDispatchCommand() prefixes the launcher with a quoted, forward-slash Git
+// Bash path on Windows and keeps bare `bash` everywhere else (and on Windows
+// machines where Git Bash cannot be found).
+const COPILOT_BUILTIN_COMMAND_RE = /^("[^"]+"|bash) -lc "(teamai hook-dispatch [^"]+) 2>\/dev\/null" \|\| true$/;
 
 /** Render a valid PowerShell equivalent for TeamAI's generated bash wrapper. */
 function copilotPowershellCommand(command: string): string {
   const match = command.match(COPILOT_BUILTIN_COMMAND_RE);
-  return match ? `${match[1]} 2>$null; exit 0` : command;
+  if (!match) return command;
+  // PowerShell needs the call operator before a quoted executable path, and
+  // `|| true` maps to `; exit 0`. The dispatch command inside is
+  // builtin-generated (no `$`, backticks or double quotes), so echoing it
+  // inside a double-quoted PowerShell string is interpolation-safe.
+  return match[1] === 'bash'
+    ? `${match[2]} 2>$null; exit 0`
+    : `& ${match[1]} -lc "${match[2]} 2>/dev/null"; exit 0`;
 }
 
 function toCopilotEntry(def: HookDef): CopilotHookEntry {
+  const matcher = def.source === 'builtin'
+    && def.event === 'PostToolUse'
+    && def.matcher === 'Skill'
+    ? 'skill'
+    : def.matcher;
   return {
     type: 'command',
     bash: def.command,
     powershell: copilotPowershellCommand(def.command),
     command: def.command,
-    ...(def.matcher && def.matcher !== '*' ? { matcher: def.matcher } : {}),
+    ...(matcher && matcher !== '*' ? { matcher } : {}),
     ...(def.timeout !== undefined ? { timeoutSec: def.timeout } : {}),
   };
 }
 
-function toZcodeEntry(def: HookDef): ZcodeHookMatcher {
+function toZcodeEntry(def: HookDef, vbsPath: string): ZcodeHookMatcher {
   // ZCode sessions run hooks inline: a session-start dispatch carries a network
   // pull (SSH to the team host), which on slower links exceeds the 10–15s
   // builtin defaults and gets killed mid-pull — so the timeouts here are
@@ -374,6 +459,15 @@ function toZcodeEntry(def: HookDef): ZcodeHookMatcher {
     PostToolUse: 30000,
     UserPromptSubmit: 60000,
   };
+  // wscript.exe is a GUI-subsystem binary: unlike cmd/bash it never allocates
+  // a console window, so hook runs don't flash a black box over the desktop.
+  // The VBS launcher preserves the STDIN contract (ZCode's payload reaches
+  // hook-dispatch via a spooled temp file), waits for the dispatch bounded by
+  // the per-event timeout, and runs everything hidden (window style 0) with
+  // the dispatch tail cmd-level quoted so team-declared commands survive
+  // cmd's operator parsing. The payload travels verbatim as a single argument
+  // so managed-entry detection and the manifest keep one command
+  // representation.
   // The table is ZCode's DEFAULT, not an override: a timeout the team stated in
   // hooks.yaml (per-hook `timeout`, or `builtin.overrides.<key>.timeout`) is the
   // one the user asked for and still wins, as it does on every other tool.
@@ -383,17 +477,22 @@ function toZcodeEntry(def: HookDef): ZcodeHookMatcher {
   const entry: ZcodeHookEntry =
     process.platform === 'win32'
       ? {
-          // Windows must NOT spawn bare `bash`: CreateProcess resolves it to
-          // System32's WSL launcher before any PATH directory, and the WSL side
-          // has a different $HOME (no ~/.teamai state) and often no Node ≥ 20.
-          // cmd.exe is always present in System32 and resolves teamai from the
-          // Windows PATH (the npm shim is a .cmd, so a shell is required).
+          // wscript.exe is a GUI-subsystem binary: unlike cmd/bash it never
+          // allocates a console window, so hook runs don't flash a black box
+          // over the desktop. The VBS launcher preserves the STDIN contract
+          // (ZCode's payload reaches hook-dispatch via a spooled temp file),
+          // waits bounded by the per-event timeout, and runs hidden (window
+          // style 0). The payload travels verbatim as a single argument so
+          // managed-entry detection and the manifest keep one command
+          // representation.
           type: 'process',
-          command: 'cmd',
-          args: ['/c', def.command],
+          command: 'wscript.exe',
+          args: [vbsPath, def.command],
           timeoutMs,
         }
       : {
+          // POSIX has no console-flash problem: run the tail directly, like
+          // every other shell-based tool format.
           type: 'process',
           command: 'bash',
           // Stored verbatim: the shell payload must equal `def.command` exactly
@@ -412,8 +511,14 @@ function toZcodeEntry(def: HookDef): ZcodeHookMatcher {
 /** Shell payload of a ZCode hook entry, for managed-entry matching. */
 function zcodeEntryCommand(entry: ZcodeHookMatcher): string {
   const hook = entry.hooks?.[0];
-  // Both variants (posix bash -lc / win32 cmd /c) carry the payload at args[1].
-  if (Array.isArray(hook?.args) && hook.args.length > 1) return hook.args[1] ?? '';
+  // The wscript launcher carries the command tail as its LAST argument —
+  // [vbsPath, tail] today; an earlier generation used a mode slot
+  // ([vbsPath, 'wait', tail]). Reading the last slot recognizes both shapes
+  // (and team commands, which carry no teamai marker and are matched against
+  // the managed-hooks manifest) so they get replaced or removed, not duplicated.
+  if (Array.isArray(hook?.args) && hook.args.length > 0) {
+    return hook.args[hook.args.length - 1] ?? '';
+  }
   return hook?.command ?? '';
 }
 
@@ -445,6 +550,16 @@ function isTeamClaudeEntry(entry: HookMatcher): boolean {
   return (entry.description ?? '').startsWith(TEAMAI_CUSTOM_HOOK_PREFIX);
 }
 
+/** The hook id carried by a team entry's marker, `[teamai:hook:<id>] …`. */
+function teamHookIdOf(description: string | undefined): string | null {
+  const marker = description ?? '';
+  if (!marker.startsWith(TEAMAI_CUSTOM_HOOK_PREFIX)) return null;
+  const end = marker.indexOf(']');
+  return end > TEAMAI_CUSTOM_HOOK_PREFIX.length
+    ? marker.slice(TEAMAI_CUSTOM_HOOK_PREFIX.length, end)
+    : null;
+}
+
 async function reconcileClaudeFormat(
   settingsPath: string,
   tool: string,
@@ -457,6 +572,11 @@ async function reconcileClaudeFormat(
   // Built-in management never removes team hooks; team hooks are reconciled only
   // when a team pass is active (manifest present). This keeps the builtin-only
   // refresh path (injectHooks / autoMigrate) non-destructive to team hooks (§5).
+  // Hook ids this reconcile declares for the tool, used to recognise our own
+  // entries even when an older CLI rendered them differently.
+  const desiredTeamIds = new Set(
+    teamDefs.filter((d) => !d.tools || d.tools.includes(tool)).map((d) => d.key),
+  );
   const isManaged = (e: HookMatcher): boolean => {
     if (isBuiltinClaudeEntry(e) || (!!opts.removeAll && isAgentClaudeEntry(e))) return true;
     if (!teamActive || !isTeamClaudeEntry(e)) return false;
@@ -465,6 +585,15 @@ async function reconcileClaudeFormat(
     // project B pull must not delete project A's hooks.
     if (opts.teamHookProjectRoot) {
       const command = e.hooks?.[0]?.command ?? '';
+      // An entry gated for this project belongs to this project even when an
+      // older CLI rendered the gate in another syntax (or the payload changed):
+      // replace it instead of leaving a dead duplicate that removal can no
+      // longer match.
+      if (isGatedForProject(command, opts.teamHookProjectRoot)) {
+        if (opts.removeAll) return true;
+        const id = teamHookIdOf(e.description);
+        if (id !== null && desiredTeamIds.has(id)) return true;
+      }
       return desiredTeamCommands.has(command) || priorTeamCommands.has(command);
     }
     return true;
@@ -697,6 +826,37 @@ async function reconcileZcodeFormat(
 ): Promise<void> {
   const expanded = expandHome(settingsPath);
   await ensureDir(path.dirname(expanded));
+  const vbsPath = path.join(path.dirname(expanded), 'teamai-hook-dispatch.vbs');
+  // Hidden launcher: wscript.exe is a GUI-subsystem binary, so hook runs don't
+  // flash a black box over the desktop, and the spool file keeps the STDIN
+  // payload contract intact (ZCode's JSON reaches hook-dispatch even though
+  // WScript.Shell.Run cannot forward a live stdin pipe).
+  const vbsScript = [
+    "' TeamAI hook dispatcher - hidden, timeout-bounded, stdin-preserving.",
+    'Option Explicit',
+    'Dim sh, fso, spool, f',
+    'Set sh = CreateObject("WScript.Shell")',
+    'Set fso = CreateObject("Scripting.FileSystemObject")',
+    'spool = fso.GetSpecialFolder(2) & "\\teamai-hook-" & fso.GetTempName',
+    'Set f = fso.CreateTextFile(spool, True)',
+    'On Error Resume Next',
+    'f.Write WScript.StdIn.ReadAll()',
+    'f.Close',
+    'sh.Run "cmd /d /s /c """ & WScript.Arguments(0) & " < """ & spool & """ >nul 2>&1""", 0, True',
+    'fso.DeleteFile spool, True',
+  ].join('\r\n');
+  if (opts.removeAll) {
+    // Unconditional: after a normal inject the file equals the template, so a
+    // content-diff gate never fires and the script would be left behind.
+    await rm(vbsPath, { force: true });
+  } else if (process.platform === 'win32') {
+    // POSIX never runs the launcher — writing it there would litter ~/.zcode
+    // with a script no entry references.
+    const existingVbs = await readFileSafe(vbsPath);
+    if (existingVbs !== vbsScript) {
+      await writeFile(vbsPath, vbsScript);
+    }
+  }
   const cfg: ZcodeHooksJson = (await readJson<ZcodeHooksJson>(expanded)) ?? {};
   if (!cfg.hooks) cfg.hooks = {};
   let changed = false;
@@ -736,7 +896,7 @@ async function reconcileZcodeFormat(
   for (const event of events) {
     const existing = eventsMap[event] ?? [];
     const untouched = existing.filter((e) => !isManaged(e));
-    const desiredEntries = defs.filter((d) => d.event === event).map(toZcodeEntry);
+    const desiredEntries = defs.filter((d) => d.event === event).map((d) => toZcodeEntry(d, vbsPath));
     const newArr = [...untouched, ...desiredEntries];
     if (JSON.stringify(existing) !== JSON.stringify(newArr)) {
       eventsMap[event] = newArr;
@@ -942,7 +1102,7 @@ export async function reconcileHooks(
     ? allPriorRecords.filter((r) => isGatedForProject(r.command, opts.teamHookProjectRoot!))
     : allPriorRecords;
   const priorTeamCommands = new Set(priorRecords.map((r) => r.command));
-  const scopedDefs = scopedTeamDefs(teamDefs, opts.teamHookProjectRoot);
+  const scopedDefs = scopedTeamDefs(teamDefs, opts.teamHookProjectRoot, tool);
   const desiredTeamCommands = new Set(scopedDefs.filter((d) => !d.tools || d.tools.includes(tool)).map((d) => d.command));
 
   const format = detectFormat(tool);
@@ -1001,11 +1161,19 @@ export async function removeHooks(settingsPath: string, tool?: string): Promise<
  * Report whether the current built-in (A) hook set is present in a tool settings
  * file. Computed against the unified HookDef model: every built-in entry for the
  * tool must already exist on disk.
+ *
+ * `builtinOverride` is the team's §4.8 override. Reconciliation applies it when
+ * writing, so the status check must apply it too — otherwise a hook the team
+ * disabled is still expected on disk and every tool reads as `missing`.
  */
-export async function getHookStatus(settingsPath: string, tool?: string): Promise<HookStatus> {
+export async function getHookStatus(
+  settingsPath: string,
+  tool?: string,
+  builtinOverride?: BuiltinHookOverride,
+): Promise<HookStatus> {
   const toolName = tool ?? 'claude';
   const expanded = expandHome(settingsPath);
-  const defs = builtinHookDefs(toolName);
+  const defs = applyBuiltinOverride(builtinHookDefs(toolName), builtinOverride);
 
   const format = detectFormat(toolName);
   if (format === 'cursor') {
@@ -1051,11 +1219,15 @@ export async function getHookStatus(settingsPath: string, tool?: string): Promis
   }
 
   if (format === 'zcode') {
+    const vbsPath = path.join(path.dirname(expanded), 'teamai-hook-dispatch.vbs');
     const cfg = await readJson<ZcodeHooksJson>(expanded);
     const eventsMap = cfg?.hooks?.events;
     if (!eventsMap) return 'missing';
+    // On Windows the entries are dead without the launcher script — a deleted,
+    // stale, or AV-quarantined VBS must not be reported as installed.
+    if (process.platform === 'win32' && !(await readFileSafe(vbsPath))) return 'missing';
     const present = defs.every((def) => {
-      const want = toZcodeEntry(def);
+      const want = toZcodeEntry(def, vbsPath);
       const wantCmd = zcodeEntryCommand(want);
       const entries = eventsMap[def.event] ?? [];
       return entries.some((e) => e.matcher === want.matcher && zcodeEntryCommand(e) === wantCmd);
@@ -1178,6 +1350,102 @@ async function reconcileOpencodePlugin(baseDir: string, removeAll = false, insta
 }
 
 /**
+ * Reconcile the single teamai OMP extension.
+ *
+ * OMP auto-loads extensions from BOTH ~/.omp/agent/extensions (user) and
+ * <cwd>/.omp/extensions (project), and dedups by absolute path — two copies
+ * of the teamai file would dispatch every event twice. teamai therefore
+ * writes exactly one copy, in the user agent dir, matching the OpenCode
+ * plugin policy and the settings.json hooks of every other tool (which also
+ * live in HOME and gate on the `cwd` fed to hook-dispatch). Install only when
+ * ~/.omp exists, so a machine without OMP never grows a config dir.
+ */
+async function reconcileOmpExtension(removeAll = false): Promise<void> {
+  const home = getUserHome();
+  const { injectOmpHooks, removeOmpHooks } = await import('./omp-hooks.js');
+  if (removeAll) {
+    await removeOmpHooks();
+    return;
+  }
+  if (await pathExists(path.join(home, '.omp'))) {
+    await injectOmpHooks();
+  }
+}
+
+/** True when Pi looks installed at the user or the resolved project root. */
+async function isPiInstalled(baseDir: string, installedBaseDir?: string): Promise<boolean> {
+  return await pathExists(path.join(getUserHome(), '.pi'))
+    || await pathExists(path.join(installedBaseDir ?? baseDir, '.pi'));
+}
+
+/**
+ * Pi cannot run custom team hooks — it supports built-in lifecycle hooks only —
+ * so anything the team scoped to Pi is skipped, and a real reconcile says so.
+ * Extracted from the reconcile loop so a dry run, which stops before the
+ * per-tool stage, prints the same report without writing anything and its
+ * "Would apply" line does not promise hooks no tool will run.
+ *
+ * Only warns when Pi is actually installed: Pi is in every team's default
+ * toolPaths, so without this gate teammates who never use Pi see this warning
+ * on every reconcile whenever the team defines a Pi-targeted hook.
+ */
+async function reportPiSkippedTeamHooks(
+  defs: HookDef[],
+  baseDir: string,
+  installedBaseDir: string | undefined,
+  builtinOverride: BuiltinHookOverride | undefined,
+): Promise<void> {
+  if (!await isPiInstalled(baseDir, installedBaseDir)) return;
+  const applicableTeamDefs = teamDefsForTool(defs, 'pi');
+  if (applicableTeamDefs.length > 0) {
+    log.warn(
+      `Pi supports built-in lifecycle hooks only; skipping ${applicableTeamDefs.length} custom team hook(s) from hooks/hooks.yaml`,
+    );
+  }
+  const builtinOverrideCount = (builtinOverride?.disabled?.length ?? 0)
+    + Object.keys(builtinOverride?.overrides ?? {}).length;
+  if (builtinOverrideCount > 0) {
+    log.warn(
+      `Pi supports built-in lifecycle hooks only; skipping ${builtinOverrideCount} built-in hook override(s) from hooks/hooks.yaml`,
+    );
+  }
+}
+
+/**
+ * Reconcile the single TeamAI Pi extension in the user agent directory. Pi
+ * also auto-loads a project extensions dir with absolute-path dedup, so
+ * writing a second copy there would dispatch every event twice (the same
+ * single-copy policy as the OMP adapter) — only the user-scope copy is ever
+ * written. A TeamAI-marked project copy left by an earlier revision is
+ * cleaned up when reconciling that project. Mirrors the OMP adapter on
+ * removal too: any `removeAll` pass — a scoped `uninstall --agent pi` or the
+ * explicit `hooks remove` command — deletes the single global copy outright.
+ * Pi has no way to scope a shared file to one project, so a "preserve for
+ * other projects" guarantee was never actually enforceable at dispatch time
+ * anyway (the generated extension fires for every Pi session regardless of
+ * which project asked to be excluded).
+ */
+async function reconcilePiExtension(
+  baseDir: string,
+  removeAll = false,
+  installedBaseDir?: string,
+): Promise<void> {
+  const home = getUserHome();
+  const { injectPiHooks, removePiHooks, removePiProjectHooks } = await import('./pi-hooks.js');
+  const inferredProjectScope = path.resolve(baseDir) !== path.resolve(home);
+  const projectRoot = installedBaseDir ?? (inferredProjectScope ? baseDir : undefined);
+
+  if (projectRoot && path.resolve(projectRoot) !== path.resolve(home)) {
+    await removePiProjectHooks(projectRoot);
+  }
+  if (removeAll) {
+    await removePiHooks();
+    return;
+  }
+  if (await isPiInstalled(baseDir, installedBaseDir)) await injectPiHooks();
+}
+
+/**
  * Inject teamai built-in hooks into all AI tool settings.
  * Only writes to tools whose root directory already exists on disk,
  * preventing creation of config dirs for tools the user hasn't installed.
@@ -1190,8 +1458,14 @@ export async function injectHooksToAllTools(toolPaths: Record<string, { settings
   for (const [tool, paths] of Object.entries(toolPaths)) {
     if (filterAgents && !filterAgents.includes(tool)) continue;
     if (skipped.has(tool)) continue;
-    if (paths.settings) {
-      const toolRoot = path.join(resolvedBaseDir, paths.settings.split('/')[0]);
+    if (tool === 'pi') {
+      try {
+        await reconcilePiExtension(resolvedBaseDir);
+      } catch (e) {
+        log.warn(`Failed to inject Pi hook: ${(e as Error).message}`);
+      }
+    } else if (paths.settings) {
+      const toolRoot = path.join(resolvedBaseDir, toolInstallRoot(paths.settings));
       if (!await pathExists(toolRoot)) continue;
       const settingsPath = path.join(resolvedBaseDir, paths.settings);
       try {
@@ -1219,6 +1493,37 @@ export async function injectHooksToAllTools(toolPaths: Record<string, { settings
       } catch (e) {
         log.warn(`Failed to inject OpenCode hook into ${tool}: ${(e as Error).message}`);
       }
+    } else if (tool === 'omp') {
+      try {
+        await reconcileOmpExtension();
+      } catch (e) {
+        log.warn(`Failed to inject OMP hook into ${tool}: ${(e as Error).message}`);
+      }
+    }
+  }
+}
+
+/**
+ * True when a `builtinsOnly` pass has nothing to install in this tool file, so
+ * it is left byte-for-byte as it is. False for a normal reconcile.
+ */
+async function builtinsInstalled(
+  builtinsOnly: BuiltinsOnly | undefined,
+  settingsPath: string,
+  tool: string,
+  manifestPath: string,
+  builtinOverride: BuiltinHookOverride | undefined,
+): Promise<boolean> {
+  switch (builtinsOnly) {
+    case undefined:
+      return false;
+    case 'with-overrides':
+      return await getHookStatus(settingsPath, tool, builtinOverride) === 'installed';
+    case 'defaults-where-none':
+      return hasTeamaiHooks(settingsPath, tool, manifestPath);
+    default: {
+      const unhandled: never = builtinsOnly;
+      return unhandled;
     }
   }
 }
@@ -1229,19 +1534,27 @@ export async function injectHooksToAllTools(toolPaths: Record<string, { settings
  * injection path used by `teamai pull` / `init` / `hooks inject`.
  *
  * `settingsOnly` restricts the pass to tools reconciled through their settings
- * file, skipping Hermes and OpenCode. Those two go through global adapters that
- * ignore `baseDir` — `removeHermesHooks()` takes none, and the OpenCode
- * adapter's removeAll branch always targets HOME — so a caller sweeping a
- * secondary location (the legacy `<projectRoot>` copy) must opt out, or it
- * deletes the hooks the primary pass just installed.
+ * file, skipping Hermes, OpenCode, and OMP. Those three go through global
+ * adapters that ignore `baseDir` — `removeHermesHooks()` takes none, and the
+ * OpenCode / OMP adapters' removeAll branches always target HOME — so a caller
+ * sweeping a secondary location (the legacy `<projectRoot>` copy) must opt out,
+ * or it deletes the hooks the primary pass just installed.
+ *
+ * `builtinsOnly` (see BuiltinsOnly) installs the built-in hooks where they are
+ * missing and leaves every installed team hook and the manifest as they are.
  */
 export async function reconcileHooksToAllTools(
   toolPaths: Record<string, { settings?: string }>,
   baseDir: string,
   teamDefs: HookDef[],
   manifestPath: string,
-  opts: { removeAll?: boolean; builtinOverride?: BuiltinHookOverride; filterAgents?: string[]; settingsOnly?: boolean; installedBaseDir?: string; teamHookProjectRoot?: string } = {},
+  opts: { removeAll?: boolean; builtinOverride?: BuiltinHookOverride; filterAgents?: string[]; settingsOnly?: boolean; installedBaseDir?: string; teamHookProjectRoot?: string; scope?: Scope; builtinsOnly?: BuiltinsOnly } = {},
 ): Promise<void> {
+  // Without the manifest, reconcileHooks manages the built-in entries only.
+  const teamManifestPath = opts.builtinsOnly ? undefined : manifestPath;
+  const defs = opts.builtinsOnly ? [] : teamDefs;
+  const skipInstalled = async (settingsPath: string, tool: string): Promise<boolean> =>
+    builtinsInstalled(opts.builtinsOnly, settingsPath, tool, manifestPath, opts.builtinOverride);
   // Removal is JSON editing and needs no shell, so the gate only applies to
   // injection passes — otherwise tools without a shell could never clean up
   // their injected entries.
@@ -1250,6 +1563,25 @@ export async function reconcileHooksToAllTools(
     : skipToolsWithoutShell(
         Object.keys(toolPaths).filter(t => !opts.filterAgents || opts.filterAgents.includes(t)),
       );
+  // One settings file is one install. Two targets can resolve to the same file —
+  // Qoder CN's project scope IS Qoder's `<root>/.qoder/settings.json` — and this
+  // pass is per tool, so a second pass over the file re-renders every built-in
+  // entry with the *other* tool's dispatch identity (`teamai hook-dispatch …
+  // --tool <tool>`) and drops the team hooks scoped to the first one. Reconcile
+  // each file once, for the first target that reaches it.
+  //
+  // The owner is the first *enabled* target, not the first in the shipped table:
+  // `filterAgents` is applied above, so a tool the user excluded is skipped before
+  // it can claim a file, and an install that enabled Qoder CN without Qoder gets
+  // `--tool qoder-cn` built-ins plus its `tools: [qoder-cn]` team hooks in the
+  // shared project file instead of Qoder's identity (and Qoder's team hooks).
+  //
+  // With both editions enabled (the default: no whitelist) `qoder` comes first in
+  // the table and keeps ownership, so a `tools: [qoder-cn]` team hook has no file
+  // to land in and is dropped silently by the per-tool filter in reconcileHooks.
+  // One physical file can carry only one dispatch identity; this is the documented
+  // limit of sharing a project scope, not a bug this pass can fix.
+  const claimedSettingsFiles = new Set<string>();
   for (const [tool, paths] of Object.entries(toolPaths)) {
     if (opts.filterAgents && !opts.filterAgents.includes(tool)) continue;
     if (skipped.has(tool)) continue;
@@ -1273,6 +1605,29 @@ export async function reconcileHooksToAllTools(
       }
       continue;
     }
+    // OpenClaw has no settings hook list either: its hook is a HOOK.md +
+    // handler.ts pair under the resolved workspace dir. Route it to that
+    // adapter, which no-ops when the workspace cannot be resolved, so an
+    // uninstalled OpenClaw never grows a config dir. Only `openclaw` itself:
+    // resolveOpenclawWorkspaceDir resolves the OpenClaw workspace, so routing
+    // the other claw variants here would make them overwrite that one handler
+    // with each other's --tool value.
+    if (tool === 'openclaw') {
+      if (opts.settingsOnly) continue;
+      try {
+        if (opts.removeAll) {
+          const { removeOpenClawHooks, resolveOpenclawWorkspaceDir } = await import('./openclaw-hooks.js');
+          const wsDir = await resolveOpenclawWorkspaceDir();
+          if (wsDir) await removeOpenClawHooks(path.join(wsDir, 'hooks'));
+        } else {
+          const { injectOpenClawHooks } = await import('./openclaw-hooks.js');
+          await injectOpenClawHooks(undefined, tool);
+        }
+      } catch (e) {
+        log.warn(`Failed to reconcile OpenClaw hooks for ${tool}: ${(e as Error).message}`);
+      }
+      continue;
+    }
     // OpenCode has no settings.json hook list; it auto-loads JS/TS plugins from
     // its config dirs. Route it to the plugin-file adapter instead of the
     // settings-based path.
@@ -1285,21 +1640,69 @@ export async function reconcileHooksToAllTools(
       }
       continue;
     }
+    // OMP likewise has no settings hook list: it auto-loads TS extensions from
+    // the agent dir. Route it to the extension adapter.
+    if (tool === 'omp') {
+      if (opts.settingsOnly) continue;
+      try {
+        await reconcileOmpExtension(opts.removeAll);
+      } catch (e) {
+        log.warn(`Failed to reconcile OMP hooks: ${(e as Error).message}`);
+      }
+      continue;
+    }
+    if (tool === 'pi') {
+      if (opts.settingsOnly) continue;
+      try {
+        if (!opts.removeAll) {
+          await reportPiSkippedTeamHooks(defs, baseDir, opts.installedBaseDir, opts.builtinOverride);
+        }
+        await reconcilePiExtension(baseDir, opts.removeAll, opts.installedBaseDir);
+      } catch (e) {
+        log.warn(`Failed to reconcile Pi hooks: ${(e as Error).message}`);
+      }
+      continue;
+    }
+    // DeepSeek Harness has no settings-file hook surface. Its official
+    // Claude-hook bridge is a Cordis plugin loaded through a user-supplied
+    // profile patch, so keep the generated config and patch in ~/.teamai.
+    if (tool === 'dsh') {
+      if (opts.settingsOnly) continue;
+      try {
+        const dshHome = getUserHome();
+        if (opts.removeAll || await pathExists(path.join(dshHome, '.dsh'))) {
+          const { reconcileDshHooks, resolveDshHookConfigPath } = await import('./dsh-hooks.js');
+          if (await skipInstalled(resolveDshHookConfigPath(), 'dsh')) continue;
+          await reconcileDshHooks(defs, {
+            manifestPath: teamManifestPath,
+            removeAll: opts.removeAll,
+            builtinOverride: opts.builtinOverride,
+          });
+        }
+      } catch (e) {
+        log.warn(`Failed to reconcile DeepSeek Harness hooks: ${(e as Error).message}`);
+      }
+      continue;
+    }
     if (!paths.settings) continue;
     // Only reconcile hooks for tools the user actually has installed. Without
     // this gate, `hooks inject`/`remove` would create root directories for
     // every configured tool (e.g. ~/.tclaude, ~/.tcodex) via reconcileHooks's
     // ensureDir — making uninstalled tools look installed and pulling skills
     // into them on later `pull`s.
-    const toolRoot = path.join(baseDir, paths.settings.split('/')[0]);
+    const toolRoot = path.join(baseDir, toolInstallRoot(paths.settings));
     const installedRoot = opts.installedBaseDir
-      ? path.join(opts.installedBaseDir, paths.settings.split('/')[0])
+      ? path.join(opts.installedBaseDir, toolInstallRoot(paths.settings))
       : toolRoot;
     if (!await pathExists(toolRoot) && !await pathExists(installedRoot)) continue;
     const settingsPath = path.join(baseDir, paths.settings);
+    const settingsFileKey = path.resolve(settingsPath);
+    if (claimedSettingsFiles.has(settingsFileKey)) continue;
+    claimedSettingsFiles.add(settingsFileKey);
     try {
-      await reconcileHooks(settingsPath, tool, teamDefs, {
-        manifestPath,
+      if (await skipInstalled(settingsPath, tool)) continue;
+      await reconcileHooks(settingsPath, tool, defs, {
+        manifestPath: teamManifestPath,
         removeAll: opts.removeAll,
         builtinOverride: opts.builtinOverride,
         teamHookProjectRoot: opts.teamHookProjectRoot,
@@ -1326,7 +1729,7 @@ export async function hasInstalledCodexTrustGatedTool(
 ): Promise<boolean> {
   for (const [tool, paths] of Object.entries(toolPaths)) {
     if (!isCodexTrustGatedTool(tool) || !paths.settings) continue;
-    const toolRoot = path.join(baseDir, paths.settings.split('/')[0]);
+    const toolRoot = path.join(baseDir, toolInstallRoot(paths.settings));
     if (await pathExists(toolRoot)) return true;
   }
   return false;
@@ -1369,27 +1772,58 @@ export async function sweepLegacyProjectHooks(
       log.warn(`Failed to remove legacy OpenCode project plugin: ${(e as Error).message}`);
     }
   }
+  if (toolPaths.pi) {
+    try {
+      const { removePiProjectHooks } = await import('./pi-hooks.js');
+      await removePiProjectHooks(legacy.baseDir);
+    } catch (e) {
+      log.warn(`Failed to remove legacy Pi project extension: ${(e as Error).message}`);
+    }
+  }
 }
 
 /**
+ * What a team-hooks reconcile did. When the team hooks do not resolve, every
+ * installed team hook is kept and the built-in hooks, the session-start pull
+ * among them, are still installed where missing: with the root file's
+ * overrides when hooks/hooks.yaml parses, and otherwise with their defaults,
+ * only in a tool that has no teamai hook yet (a first install).
+ */
+export type TeamHooksReconcile =
+  | { ok: true; defs: HookDef[] }
+  | { ok: false; builtins: BuiltinsOnly };
+
+/**
  * Reconcile built-in (A) + team (B) hooks for a single scope's tools.
- * Parses the scope's hooks/hooks.yaml, resolves the scope base dir + manifest,
- * and reconciles every tool. Returns the team defs that were applied (for
- * logging/transparency). Used by `pull`, `init`, and `hooks inject`.
+ * Resolves the scope's team hooks, the scope base dir + manifest, and
+ * reconciles every tool. Returns the team defs that were applied (for
+ * logging/transparency), or `ok: false` when the team hooks could not be
+ * resolved (see TeamHooksReconcile). Used by `pull`, `init`, and `hooks inject`.
  */
 export async function reconcileTeamHooksForConfig(
   teamConfig: TeamaiConfig,
   localConfig: LocalConfig,
-  opts: { removeAll?: boolean; auto?: boolean; silent?: boolean; filterAgents?: string[] } = {},
-): Promise<HookDef[]> {
-  const { defs: teamDefs, builtin } = opts.removeAll
-    ? { defs: [] as HookDef[], builtin: undefined }
-    : await resolveTeamHooks(teamConfig, localConfig.repo.localPath, {
+  opts: { removeAll?: boolean; auto?: boolean; silent?: boolean; filterAgents?: string[]; dryRun?: boolean } = {},
+): Promise<TeamHooksReconcile> {
+  const resolved: Awaited<ReturnType<typeof resolveTeamHooks>> = opts.removeAll
+    ? { ok: true, defs: [], builtin: undefined }
+    : await resolveTeamHooks(teamConfig, localConfig, {
         auto: opts.auto,
         silent: opts.silent,
-        activeRoles: activeRoleIds(localConfig),
+        // Resolve and report, then stop: a dry run must show the entry warnings
+        // and the hooks it would apply without touching any tool's settings
+        // (#822).
+        preview: opts.dryRun,
       });
-  const { baseDir, manifestPath } = resolveHookScope(localConfig);
+  // The team's hooks could not be resolved (reported by resolveTeamHooks).
+  // Reconciling the team set now would remove every installed team hook, so
+  // only the built-in hooks are reconciled.
+  const builtinsOnly: BuiltinsOnly | undefined = resolved.ok ? undefined
+    : resolved.builtin.known ? 'with-overrides' : 'defaults-where-none';
+  const teamDefs = resolved.ok ? resolved.defs : [];
+  const builtin = resolved.ok ? resolved.builtin
+    : resolved.builtin.known ? resolved.builtin.override : undefined;
+  const { baseDir, manifestPath, scope: hookScope } = resolveHookScope(localConfig);
   const explicitlySelectedAgents = opts.filterAgents ?? localConfig.enabledAgents;
   let filterAgents = explicitlySelectedAgents;
   const disabled = localConfig.disabledAgents;
@@ -1399,7 +1833,27 @@ export async function reconcileTeamHooksForConfig(
     const universe = filterAgents ?? Object.keys(teamConfig.toolPaths);
     filterAgents = universe.filter((t) => !disabled.includes(t));
   }
-  await reconcileHooksToAllTools(teamConfig.toolPaths, baseDir, teamDefs, manifestPath, {
+  // Resolve the tool paths at the scope hooks actually live in, not at the
+  // config's scope: a non-self project scope puts hooks in HOME, so its paths
+  // must be the user-scope ones.
+  //
+  // A dry run stops here. The resolution above already reported the entry
+  // warnings and the hooks it would apply; everything below writes a tool's
+  // settings or the managed-hooks manifest. The result mirrors what a real
+  // reconcile would report, so a caller cannot tell them apart by the shape.
+  //
+  // One report happens below the stop point and a dry run must still make it:
+  // a tool that cannot run team hooks says so during the per-tool pass, and
+  // the preview is only honest when the dry run repeats it — for the tools the
+  // pass would actually reach, which is what hookToolPaths decides below too.
+  const hookToolPaths = scopedToolPaths(teamConfig, { ...localConfig, scope: hookScope });
+  if (opts.dryRun) {
+    if (!opts.removeAll && 'pi' in hookToolPaths && (!filterAgents || filterAgents.includes('pi'))) {
+      await reportPiSkippedTeamHooks(teamDefs, baseDir, localConfig.scope === 'project' ? (localConfig.projectRoot ?? baseDir) : undefined, builtin);
+    }
+    return resolved.ok ? { ok: true, defs: teamDefs } : { ok: false, builtins: builtinsOnly ?? 'with-overrides' };
+  }
+  await reconcileHooksToAllTools(hookToolPaths, baseDir, teamDefs, manifestPath, {
     removeAll: opts.removeAll,
     builtinOverride: builtin,
     filterAgents,
@@ -1407,6 +1861,8 @@ export async function reconcileTeamHooksForConfig(
       ? localConfig.projectRoot
       : undefined,
     installedBaseDir: localConfig.scope === 'project' ? (localConfig.projectRoot ?? baseDir) : undefined,
+    scope: localConfig.scope,
+    builtinsOnly,
   });
 
   const copilotExcluded = disabled?.includes(COPILOT_TOOL_ID) ?? false;
@@ -1419,19 +1875,44 @@ export async function reconcileTeamHooksForConfig(
   const copilotPaths = scopedToolPaths(teamConfig, localConfig)[COPILOT_TOOL_ID];
   if (copilotEnabled && copilotPaths?.hooks) {
     const copilotBase = resolveToolBaseDir(COPILOT_TOOL_ID, localConfig);
-    if (copilotSelected || await pathExists(getCopilotHome())) {
+    const copilotHooksPath = path.join(copilotBase, copilotPaths.hooks);
+    const copilotManifestPath = getManagedHooksPath(localConfig.scope, localConfig.projectRoot);
+    const copilotInstalled = await builtinsInstalled(
+      builtinsOnly, copilotHooksPath, COPILOT_TOOL_ID, copilotManifestPath, builtin);
+    if (!copilotInstalled && (copilotSelected || await pathExists(getCopilotHome()))) {
       await reconcileHooks(
-        path.join(copilotBase, copilotPaths.hooks),
+        copilotHooksPath,
         COPILOT_TOOL_ID,
         teamDefs,
         {
-          manifestPath: getManagedHooksPath(localConfig.scope, localConfig.projectRoot),
+          manifestPath: builtinsOnly ? undefined : copilotManifestPath,
           removeAll: opts.removeAll,
           builtinOverride: builtin,
         },
       );
     }
   }
+  if (builtinsOnly) return { ok: false, builtins: builtinsOnly };
   await sweepLegacyProjectHooks(teamConfig.toolPaths, localConfig);
-  return teamDefs;
+  return { ok: true, defs: teamDefs };
+}
+
+/**
+ * The line `init` and bootstrap print when the team hooks did not resolve. The
+ * reason, naming the file, was already reported by the resolution.
+ */
+export function describeUnappliedTeamHooks(result: { builtins: BuiltinsOnly }): string {
+  switch (result.builtins) {
+    case 'with-overrides':
+      return 'Team hooks were not installed (see the warning above); the built-in hooks were. '
+        + 'Once the team repo is fixed, the next pull installs the team hooks.';
+    case 'defaults-where-none':
+      return 'Team hooks were not installed: hooks/hooks.yaml in the team repo does not parse, so its built-in '
+        + 'hook overrides are unknown, and the built-in hooks were installed with their defaults where none were '
+        + 'installed yet. Fix hooks/hooks.yaml in the team repo and push; the next pull then applies both.';
+    default: {
+      const unhandled: never = result.builtins;
+      return String(unhandled);
+    }
+  }
 }

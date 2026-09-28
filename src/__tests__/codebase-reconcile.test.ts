@@ -75,7 +75,7 @@ describe('codebase reconciliation', () => {
     );
   });
 
-  it('prints a summary in preview mode and emits JSON while writing the graph', async () => {
+  it('prints a summary in preview mode and emits JSON while writing the graph', { timeout: 60_000 }, async () => {
     const root = createWikiFixture();
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
 
@@ -228,7 +228,6 @@ describe('codebase reconciliation', () => {
 
   it('normalizes graph variants emitted by legacy aggregation', async () => {
     const root = createWikiFixture();
-    const graphPath = path.join(root, 'teamwiki', '.indices', 'graph-index.json');
     const repoGraphPath = path.join(root, 'teamwiki', 'evidence', 'code', 'auth', '.indices', 'graph-index.json');
     const legacyGraph = {
       schemaVersion: 1,

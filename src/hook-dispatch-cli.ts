@@ -24,8 +24,9 @@ import { captureTail } from './utils/exec.js';
 import { createDispatcher, type Dispatcher } from './hook-dispatch.js';
 import { buildHandlerRegistry, filterHandlersForConfig } from './hook-handlers.js';
 import { resolveHookCwd } from './utils/hook-cwd.js';
+import { windowsPowerShell } from './utils/powershell.js';
 import { log, setStderrOnly } from './utils/logger.js';
-import { deriveSessionId } from './utils/session-id.js';
+import { deriveDispatchSessionId } from './utils/session-id.js';
 
 /**
  * Max time to wait for STDIN EOF before proceeding with whatever was received.
@@ -102,7 +103,10 @@ async function spawnPlainDetached(
       detached: true,
       windowsHide: true,
       stdio: ['pipe', 'ignore', 'ignore'],
-      ...(cwd ? { cwd } : {}),
+      // A cwd that no longer exists (a deleted worktree) fails the spawn, so the
+      // temp dir stands in, as for the WMI launch: the child resolves its scope
+      // from the payload anyway, and the temp dir belongs to no project.
+      ...(cwd ? { cwd: fs.existsSync(cwd) ? cwd : os.tmpdir() } : {}),
     });
     child.on('error', () => {});
     await new Promise<void>((resolve) => {
@@ -114,6 +118,60 @@ async function spawnPlainDetached(
   } catch {
     // Never let a spawn failure surface to the host — background work is best-effort.
   }
+}
+
+/**
+ * Identity fields worth salvaging when STDIN JSON cannot be parsed. On Windows
+ * the hidden VBS launcher decodes the UTF-8 payload through the ANSI codepage,
+ * so a payload containing multi-byte text can break the JSON structure at the
+ * first non-ASCII sequence — everything after it is lost, but the ASCII head
+ * (session id, tool name, paths) is intact and regex-extractable. Salvaging
+ * keeps a degraded dispatch linked to the right session and tool in the
+ * dashboard instead of collapsing into an anonymous event. Snake_case and
+ * camelCase variants are both listed because hosts differ here (ZCode sends
+ * hookEventName, Claude sends hook_event_name).
+ */
+const SALVAGEABLE_STDIN_FIELDS = [
+  'session_id',
+  'sessionId',
+  'transcript_path',
+  'transcriptPath',
+  'tool_name',
+  'toolName',
+  'tool_use_id',
+  'toolUseId',
+  'cwd',
+] as const;
+
+/** camelCase salvage hits are mirrored onto the snake_case names handlers read. */
+const CANONICAL_FIELD_ALIASES: Record<string, string> = {
+  sessionId: 'session_id',
+  transcriptPath: 'transcript_path',
+  toolName: 'tool_name',
+  toolUseId: 'tool_use_id',
+};
+
+/** Extract intact identity fields from an unparsable STDIN body (best-effort). */
+export function salvageStdinFields(raw: string): Record<string, string> {
+  const salvaged: Record<string, string> = {};
+  for (const field of SALVAGEABLE_STDIN_FIELDS) {
+    const m = raw.match(new RegExp(`"${field}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`));
+    if (!m) continue;
+    try {
+      salvaged[field] = JSON.parse(`"${m[1]}"`) as string;
+    } catch {
+      // A mangled escape inside this field's value — skip it; degraded
+      // payloads are best-effort by definition.
+    }
+    // Handlers read the canonical snake_case names (session_id, tool_name,
+    // ...) — alias camelCase hits so a salvage from a camelCase host (ZCode)
+    // still feeds deriveSessionId and the dashboard.
+    const alias = CANONICAL_FIELD_ALIASES[field];
+    if (alias && salvaged[field] !== undefined && salvaged[alias] === undefined) {
+      salvaged[alias] = salvaged[field];
+    }
+  }
+  return salvaged;
 }
 
 /**
@@ -234,30 +292,6 @@ async function runPowerShell(script: string): Promise<{ code: number | null; tai
 /** Output kept from a failed attempt, for its log line. */
 const TAIL_CHARS = 200;
 
-let resolvedPowerShell: string | undefined;
-
-/**
- * Windows PowerShell by absolute path. The hook inherits whatever environment
- * its host hands over, and that environment need not carry a usable PATH (or
- * even `SystemRoot`), so probe the usual roots — once per process — and only
- * fall back to a PATH lookup when none of them holds the binary.
- */
-function windowsPowerShell(): string {
-  if (resolvedPowerShell) return resolvedPowerShell;
-  const roots = [process.env.SystemRoot, 'C:\\Windows', process.env.windir].filter(
-    (r): r is string => !!r,
-  );
-  resolvedPowerShell = 'powershell.exe';
-  for (const root of roots) {
-    const candidate = path.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-    if (fs.existsSync(candidate)) {
-      resolvedPowerShell = candidate;
-      break;
-    }
-  }
-  return resolvedPowerShell;
-}
-
 /** Encode a value as a PowerShell single-quoted literal. */
 function psLiteral(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
@@ -291,18 +325,17 @@ export function parseStdin(raw: string, event: string): Record<string, unknown> 
     try {
       stdin = JSON.parse(raw);
     } catch {
-      // Degrade to {} instead of short-circuiting: handlers that depend on
-      // stdin fields (votes-sync, contribute-check) self-skip when
-      // transcript_path is absent, while background handlers that don't read
-      // stdin (version-check, etc.) still get to run. Include a bounded
-      // preview so concurrent STDIN corruption is diagnosable in debug.log.
-      const preview = raw.length > 160
-        ? `${raw.slice(0, 80)}...${raw.slice(-80)}`
-        : raw;
+      // Degrade instead of short-circuiting: handlers that depend on stdin
+      // fields (votes-sync, contribute-check) self-skip when transcript_path
+      // is absent, while background handlers that don't read stdin
+      // (version-check, etc.) still get to run. Hook payloads can contain
+      // prompts, credentials, and tool arguments, so diagnostics record only
+      // structural metadata and never any part of the raw body.
       log.debug(
         `hook-dispatch: failed to parse STDIN JSON for event=${event}` +
-          ` (len=${raw.length}, body=${JSON.stringify(preview)})`,
+          ` (len=${raw.length})`,
       );
+      stdin = salvageStdinFields(raw);
     }
   }
 
@@ -322,6 +355,7 @@ export function parseStdin(raw: string, event: string): Record<string, unknown> 
   if (!stdin.hook_event_name) {
     const EVENT_MAP: Record<string, string> = {
       'session-start': 'SessionStart',
+      'session-end': 'SessionEnd',
       'stop': 'Stop',
       'post-tool-use': 'PostToolUse',
       'prompt-submit': 'UserPromptSubmit',
@@ -349,6 +383,8 @@ async function runDispatch(
   return result.output;
 }
 
+export { deriveDispatchSessionId };
+
 /**
  * Main CLI handler for hook-dispatch.
  *
@@ -369,11 +405,14 @@ export async function hookDispatchCli(
     const raw = stdinFile ? readStdinFile(stdinFile) : await readStdin();
     const stdin = parseStdin(raw, event);
 
-    // Provider-config gate: HTTP-only teams must not receive git-provider-only
-    // hook prompts (contribute / mr-hint / votes). Prefer the project-scope
-    // config when the host tells us the working directory (#264), so
-    // filterHandlersForConfig can honour a project-level repo.kind.
-    const { loadLocalConfig, detectProjectConfig } = await import('./config.js');
+    // Config gates: a directory without teamai runs no team handlers (#748), and
+    // HTTP-only teams must not receive git-provider-only hook prompts
+    // (contribute / mr-hint / votes). The project-scope config of the host's
+    // working directory wins (#264), so filterHandlersForConfig can honour a
+    // project-level repo.kind; a host that sends no cwd (OpenClaw) runs the
+    // hook in its workspace, so the process cwd stands in. A cwd that is gone
+    // (a removed worktree) keeps the scope its session recorded (#810).
+    const { resolveHookConfig } = await import('./dashboard-collector.js');
     const cwd = resolveHookCwd(stdin);
     if (cwd) {
       try {
@@ -382,9 +421,9 @@ export async function hookDispatchCli(
         log.debug(`hook-dispatch: chdir to ${cwd} failed: ${(e as Error).message}`);
       }
     }
-    const localConfig = (cwd ? await detectProjectConfig(cwd) : null) ?? await loadLocalConfig();
+    const localConfig = await resolveHookConfig(stdin, tool);
     const handlers = filterHandlersForConfig(buildHandlerRegistry(), localConfig);
-    const dispatcher = createDispatcher({ handlers });
+    const dispatcher = createDispatcher({ handlers, localConfig });
 
     // Detached child: run the fire-and-forget handlers, then exit. No output is
     // wired back to the host (the parent already returned).
@@ -401,7 +440,7 @@ export async function hookDispatchCli(
       // this, hosts that omit session_id produce different PID-based IDs and
       // the foreground and post-pull paths can claim the same hint twice.
       if (typeof stdin.session_id !== 'string' || !stdin.session_id) {
-        stdin.session_id = deriveSessionId(stdin, { includeCwd: true });
+        stdin.session_id = deriveDispatchSessionId(stdin, tool);
       }
       settling = spawnBackground(event, tool, matcher, JSON.stringify(stdin), cwd);
     }

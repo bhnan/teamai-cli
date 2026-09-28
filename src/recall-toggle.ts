@@ -2,16 +2,16 @@ import path from 'node:path';
 import { autoDetectInit, saveLocalConfigForScope } from './config.js';
 import { log } from './utils/logger.js';
 import { readFileSafe, writeFile, remove, pathExists } from './utils/fs.js';
-import { ResourceHandler } from './resources/base.js';
+import { isToolInstalledForConfig } from './resources/base.js';
 import {
   ALL_SUPPORTED_TOOLS,
   agentFileExtensionForTool,
   type ToolName,
 } from './resources/agent-format.js';
 import { ruleFileExtensionForTool } from './resources/rule-format.js';
-import { RECALL_DEPENDENT_SKILLS } from './builtin-skills.js';
+import { LEGACY_RECALL_SKILL_NAMES, builtinSkillsTarget, pruneLegacyBuiltinSkills } from './builtin-skills.js';
 import {
-  resolveBaseDir,
+  resolveToolBaseDir,
   isRecallEnabled,
   isAgentExcluded,
   scopedToolPaths,
@@ -23,9 +23,8 @@ import {
 } from './types.js';
 
 async function removeRecallArtifacts(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
-  const baseDir = resolveBaseDir(localConfig);
-
   for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+    const baseDir = resolveToolBaseDir(tool, localConfig);
     // Remove recall rule file
     if (toolPath.rules) {
       // Cursor-compatible copies are `.mdc`; older layouts also left `.md` files.
@@ -37,6 +36,17 @@ async function removeRecallArtifacts(teamConfig: TeamaiConfig, localConfig: Loca
           log.debug(`Removed recall rule from ${tool}`);
         }
       }
+    }
+
+    // Remove the legacy recall skill an earlier release deployed. The served
+    // `share` workflow is gated at run time, but a member who upgrades and
+    // disables recall before pulling still has the old directory.
+    // Same resolver and gates as deployment: an uninstalled Codex must not have
+    // the shared .agents/skills root pruned on its behalf, and OpenClaw and
+    // Hermes are pruned where their skills actually live.
+    if (toolPath.skills && !isAgentExcluded(localConfig, tool)) {
+      const target = await builtinSkillsTarget(tool, toolPath.skills, localConfig);
+      if (target) await pruneLegacyBuiltinSkills(tool, target, LEGACY_RECALL_SKILL_NAMES);
     }
 
     // Remove recall agent file
@@ -51,17 +61,6 @@ async function removeRecallArtifacts(teamConfig: TeamaiConfig, localConfig: Loca
         if (await pathExists(agentFile)) {
           await remove(agentFile);
           log.debug(`Removed recall agent from ${tool}`);
-        }
-      }
-    }
-
-    // Remove recall-dependent built-in skills
-    if (toolPath.skills) {
-      for (const skillName of RECALL_DEPENDENT_SKILLS) {
-        const skillDir = path.join(baseDir, toolPath.skills, skillName);
-        if (await pathExists(skillDir)) {
-          await remove(skillDir);
-          log.debug(`Removed recall skill ${skillName} from ${tool}`);
         }
       }
     }
@@ -96,19 +95,19 @@ async function deployRecallArtifacts(teamConfig: TeamaiConfig, localConfig: Loca
 
   await deployBuiltinRules(teamConfig, localConfig, { skipRecall: false });
   await deployBuiltinAgents(teamConfig, localConfig, { skipRecall: false });
-  await deployBuiltinSkills(teamConfig, localConfig, { skipRecall: false });
+  await deployBuiltinSkills(teamConfig, localConfig);
 
   // Inject recall rules block into CLAUDE.md for Tier-1 tools
   const { injectClaudeMdSection } = await import('./utils/claudemd.js');
   const { compileRecallRulesBlock } = await import('./pull.js');
-  const baseDir = resolveBaseDir(localConfig);
   const recallBlock = compileRecallRulesBlock();
 
   for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
     if (isAgentExcluded(localConfig, tool)) continue;
     if (!toolPath.claudemd || !toolPath.agents) continue;
-    if (!await ResourceHandler.isToolInstalled(toolPath.agents, baseDir)) continue;
+    if (!await isToolInstalledForConfig(tool, toolPath.agents, localConfig)) continue;
 
+    const baseDir = resolveToolBaseDir(tool, localConfig);
     const claudeMdPath = path.join(baseDir, toolPath.claudemd);
     try {
       await injectClaudeMdSection(

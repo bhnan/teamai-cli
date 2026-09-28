@@ -4,7 +4,8 @@ import os from 'node:os';
 import fse from 'fs-extra';
 
 // Mock external dependencies
-vi.mock('../config.js', () => ({
+vi.mock('../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../config.js')>()),
   requireInit: vi.fn(),
   loadState: vi.fn().mockResolvedValue({ lastPull: null }),
   saveState: vi.fn(),
@@ -92,6 +93,9 @@ vi.mock('../roles.js', () => ({
       agents: [],
     };
   }),
+  // The real class: resource-namespaces distinguishes an absent manifest from a
+  // malformed one by its type, so the mock has to carry the same identity.
+  RolesManifestNotFoundError: class RolesManifestNotFoundError extends Error {},
 }));
 
 // Isolation: pull() takes a real ~/.teamai/.sync-lock. Parallel vitest workers
@@ -523,23 +527,40 @@ describe('pull role-aware sync and cleanup', () => {
     expect(await fse.pathExists(path.join(sk, 'scripts', '.git', 'HEAD'))).toBe(true);
   });
 
-  it('gracefully degrades when the roles manifest is malformed', async () => {
-    const { loadRolesManifest } = await import('../roles.js');
-    vi.mocked(loadRolesManifest).mockRejectedValueOnce(new Error('Invalid roles manifest'));
+  it('gracefully degrades when the roles manifest is absent', async () => {
+    const { loadRolesManifest, RolesManifestNotFoundError } = await import('../roles.js');
+    vi.mocked(loadRolesManifest).mockRejectedValueOnce(
+      new RolesManifestNotFoundError('/repo/manifest/roles.yaml'),
+    );
 
     await pull({});
 
     const { log } = await import('../utils/logger.js');
-    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('Could not load roles manifest'));
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('Roles manifest not found'));
   });
 
-  it('aborts pull when the same skill exists in multiple active namespaces', async () => {
+  it('fails the scope instead of delivering everything when the roles manifest is malformed', async () => {
+    // A manifest that exists but does not parse cannot degrade to "no filter":
+    // that hands out exactly the namespaces it was written to gate.
+    const { loadRolesManifest } = await import('../roles.js');
+    vi.mocked(loadRolesManifest).mockRejectedValueOnce(
+      new Error("Invalid roles manifest: roles.0.resources.skills.0: resource namespace must be a single path segment"),
+    );
+
+    await pull({});
+
+    // pull logs the manifest error and returns before any resource is written,
+    // which is what an invalid projects manifest already does.
+    const { log } = await import('../utils/logger.js');
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('Invalid roles manifest'));
+  });
+
+  it('reports a collision when the same skill exists in multiple active namespaces', async () => {
     await fse.ensureDir(path.join(repoPath, 'skills', 'common', 'shared-skill'));
     await fse.writeFile(path.join(repoPath, 'skills', 'common', 'shared-skill', 'SKILL.md'), '# Common');
     await fse.ensureDir(path.join(repoPath, 'skills', 'hai', 'shared-skill'));
     await fse.writeFile(path.join(repoPath, 'skills', 'hai', 'shared-skill', 'SKILL.md'), '# HAI');
 
-    const teamConfig = await vi.mocked(loadTeamConfig).mock.results.at(-1)?.value;
     const localConfig: LocalConfig = {
       repo: { localPath: repoPath, remote: 'https://git.woa.com/test/repo.git' },
       username: 'testuser',
@@ -549,12 +570,14 @@ describe('pull role-aware sync and cleanup', () => {
       resourceProfileVersion: 1,
       scope: 'user',
     };
-    const { scanRoleAwareSkills } = await import('../pull.js');
+    const { describeDeliveryConflict, scanRoleAwareSkills } = await import('../resources/desired.js');
 
-    await expect(scanRoleAwareSkills(
+    // pull stops skills for the run on this (#707); the other types still sync.
+    const result = await scanRoleAwareSkills(
       localConfig,
       { knowledge: ['common', 'hai'], skills: ['common', 'hai'], learnings: [], agents: [] },
-    )).rejects.toThrow(/Duplicate skill "shared-skill"/);
+    );
+    expect(result.kind === 'conflict' ? describeDeliveryConflict(result) : '').toMatch(/Duplicate skill "shared-skill"/);
   });
 
   it('cleans up stale skills after role change (full pull cycle)', async () => {

@@ -3,14 +3,104 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const { mockSpawn } = vi.hoisted(() => ({ mockSpawn: vi.fn() }));
+const { mockSpawn, mockDispatcher } = vi.hoisted(() => ({
+  mockSpawn: vi.fn(),
+  mockDispatcher: {
+    hasBackground: vi.fn(() => true),
+    dispatch: vi.fn(async () => ({ errors: [], output: null })),
+  },
+}));
+vi.mock('../hook-dispatch.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../hook-dispatch.js')>()),
+  createDispatcher: vi.fn(() => mockDispatcher),
+}));
 vi.mock('node:child_process', async (importOriginal) => ({
   ...(await importOriginal<typeof import('node:child_process')>()),
   spawn: mockSpawn,
 }));
 
-const { parseStdin, trySpawnDetachedViaWmi } = await import('../hook-dispatch-cli.js');
+const { parseStdin, trySpawnDetachedViaWmi, deriveDispatchSessionId, hookDispatchCli } =
+  await import('../hook-dispatch-cli.js');
 const { log } = await import('../utils/logger.js');
+
+describe('deriveDispatchSessionId', () => {
+  it('keeps a Copilot background fallback ID free of workspace paths', () => {
+    const cwd = path.join(os.tmpdir(), 'private-customer-project');
+    const originalClaudeSessionId = process.env.CLAUDE_SESSION_ID;
+    delete process.env.CLAUDE_SESSION_ID;
+    try {
+      const copilotId = deriveDispatchSessionId({ cwd }, 'copilot');
+      expect(copilotId).toMatch(/^pid-\d+$/);
+      expect(copilotId).not.toContain(cwd);
+
+      // Other providers retain the existing fallback used to distinguish projects.
+      expect(deriveDispatchSessionId({ cwd }, 'claude')).toContain(cwd);
+    } finally {
+      if (originalClaudeSessionId === undefined) delete process.env.CLAUDE_SESSION_ID;
+      else process.env.CLAUDE_SESSION_ID = originalClaudeSessionId;
+    }
+  });
+});
+
+describe('hookDispatchCli', () => {
+  it('starts the background pass from the temp dir when the payload cwd no longer exists', async () => {
+    // spawn() fails on a missing cwd, and that error is swallowed: no background
+    // handler (session-start pull, webhook, update check) would run at all.
+    const stdinFile = path.join(os.tmpdir(), `gone-cwd-hook-${process.pid}-${Date.now()}.json`);
+    const gone = path.join(os.tmpdir(), `teamai-deleted-worktree-${process.pid}-${Date.now()}`);
+    fs.writeFileSync(stdinFile, JSON.stringify({ hook_event_name: 'Stop', session_id: 's', cwd: gone }));
+    const originalCwd = process.cwd();
+    mockSpawn.mockClear();
+    mockSpawn.mockReturnValue({
+      on: vi.fn(),
+      stdin: { on: vi.fn(), end: vi.fn((_: string, done: () => void) => done()) },
+      unref: vi.fn(),
+    });
+
+    try {
+      await hookDispatchCli('stop', 'claude', '*', { stdinFile });
+      expect(mockSpawn).toHaveBeenCalledOnce();
+      // The same fallback the Windows WMI launch uses: a directory that exists
+      // and belongs to no project, so a handler still reading the process cwd
+      // (the session-start pull) cannot land in the launcher's project.
+      expect(mockSpawn.mock.calls[0][2]).toMatchObject({ cwd: os.tmpdir() });
+    } finally {
+      process.chdir(originalCwd);
+      fs.rmSync(stdinFile, { force: true });
+    }
+  });
+
+  it('passes a path-free fallback session ID to a Copilot detached handler', async () => {
+    const stdinFile = path.join(os.tmpdir(), `copilot-hook-${process.pid}-${Date.now()}.json`);
+    const cwd = process.cwd();
+    const previousClaudeId = process.env.CLAUDE_SESSION_ID;
+    delete process.env.CLAUDE_SESSION_ID;
+    fs.writeFileSync(stdinFile, JSON.stringify({
+      hook_event_name: 'SessionStart', cwd,
+    }));
+    let detachedPayload = '';
+    const child = {
+      on: vi.fn(),
+      stdin: { on: vi.fn(), end: vi.fn((raw: string, done: () => void) => {
+        detachedPayload = raw;
+        done();
+      }) },
+      unref: vi.fn(),
+    };
+    mockSpawn.mockReturnValue(child);
+
+    try {
+      await hookDispatchCli('session-start', 'copilot', '*', { stdinFile });
+      expect(mockSpawn).toHaveBeenCalled();
+      expect(JSON.parse(detachedPayload).session_id).toMatch(/^pid-\d+$/);
+      expect(JSON.parse(detachedPayload).session_id).not.toContain(cwd);
+    } finally {
+      fs.rmSync(stdinFile, { force: true });
+      if (previousClaudeId === undefined) delete process.env.CLAUDE_SESSION_ID;
+      else process.env.CLAUDE_SESSION_ID = previousClaudeId;
+    }
+  });
+});
 
 describe('parseStdin', () => {
   it('degrades malformed JSON to an empty object instead of null', () => {
@@ -21,6 +111,16 @@ describe('parseStdin', () => {
     expect(result).not.toBeNull();
     expect(result).toBeTypeOf('object');
     expect(result.hook_event_name).toBe('Stop');
+  });
+
+  it('never writes malformed hook body fragments to debug logs', () => {
+    const secret = 'ghp_sensitive_hook_fragment';
+    parseStdin(`{"prompt":"${secret}`, 'user-prompt-submit');
+
+    const debugOutput = vi.mocked(log.debug).mock.calls.flat().join('\n');
+    expect(debugOutput).toContain('failed to parse STDIN JSON');
+    expect(debugOutput).not.toContain(secret);
+    expect(debugOutput).not.toContain('body=');
   });
 
   it('returns an empty object (plus event name) for blank STDIN', () => {
@@ -37,6 +137,11 @@ describe('parseStdin', () => {
   it('maps lower-case event aliases to their canonical hook names', () => {
     const result = parseStdin('', 'session-start');
     expect(result.hook_event_name).toBe('SessionStart');
+  });
+
+  it('maps the Copilot lifecycle alias to SessionEnd', () => {
+    const result = parseStdin('', 'session-end');
+    expect(result.hook_event_name).toBe('SessionEnd');
   });
 
   it('degrades JSON `null` to {} instead of throwing', () => {
@@ -65,6 +170,32 @@ describe('parseStdin', () => {
     const result = parseStdin('[1,2]', 'stop');
     expect(Array.isArray(result)).toBe(false);
     expect(result).toEqual({ hook_event_name: 'Stop' });
+  });
+
+  it('salvages identity fields from a payload mangled at its multi-byte section', () => {
+    // Simulates the Windows VBS launcher's ANSI-codepage round trip: the UTF-8
+    // payload breaks at the first multi-byte sequence (quote swallowed, tail
+    // lost), but the ASCII head is intact. The degraded dispatch must still be
+    // linked to the right session and tool.
+    const mangled =
+      '{"cwd":"D:\\\\proj","hookEventName":"PostToolUse","sessionId":"sess_abc-123"' +
+      ',"toolName":"Bash","tool_response":{"content":"经验';
+    const result = parseStdin(mangled, 'post-tool-use');
+    expect(result.sessionId).toBe('sess_abc-123');
+    expect(result.toolName).toBe('Bash');
+    expect(result.cwd).toBe('D:\\proj');
+    expect(result.hook_event_name).toBe('PostToolUse');
+  });
+
+  it('skips salvage fields whose value itself was truncated mid-string', () => {
+    // The quote that closes transcript_path was swallowed by the codepage
+    // round trip, so no intact value exists — the field must be absent rather
+    // than garbage.
+    const mangled = '{"sessionId":"sess_ok","transcript_path":"C:\\\\logs\\u4e2d';
+    const result = parseStdin(mangled, 'stop');
+    expect(result.sessionId).toBe('sess_ok');
+    expect(result.transcript_path).toBeUndefined();
+    expect(result.hook_event_name).toBe('Stop');
   });
 });
 /** A child that reports the given outcome once its listeners are attached. */

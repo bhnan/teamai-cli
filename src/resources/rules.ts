@@ -1,9 +1,9 @@
 import path from 'node:path';
 import { isToolInstalledForConfig, ResourceHandler } from './base.js';
-import type { ResourceItem, ResourceItemStatus, TeamaiConfig, LocalConfig } from '../types.js';
+import type { ResourceItem, ResourceItemStatus, DeliveryTarget, TeamaiConfig, LocalConfig } from '../types.js';
 import { listFilesRecursive, pathExists, copyFile, ensureDir, remove, fileContentEqual, getFileMtime, listDirs, readFileSafe, writeFile } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
-import { TEAMAI_RULES_START, TEAMAI_RULES_END, resolveBaseDir, resolveToolBaseDir, isAgentExcluded, scopedToolPaths } from '../types.js';
+import { TEAMAI_RULES_START, TEAMAI_RULES_END, resolveBaseDir, resolveToolBaseDir, isAgentExcluded, scopedToolPaths, SELF_KNOWLEDGE_SCAN_KEY } from '../types.js';
 import { EXCLUDED_RULE_NAMES } from '../builtin-rules.js';
 import { teamRuleToCursorMdc, mergeCursorBodyIntoTeamMd, cursorMdcBodyEqualsTeamMd } from './cursor-mdc.js';
 import {
@@ -11,6 +11,11 @@ import {
   mergeCopilotBodyIntoTeamMd,
   teamRuleToCopilotInstructions,
 } from './copilot-instructions.js';
+import { assertWithinRoot } from '../utils/path-safety.js';
+import { loadStateForScope } from '../config.js';
+import { placedResourcePath } from '../push-namespaces.js';
+import { deliversEveryNamespace } from '../resource-namespaces.js';
+import { getFileContentAtRev, isPastVersionOf } from '../utils/git.js';
 import {
   ruleFileExtensionForTool,
   ruleStemFromFilename,
@@ -40,8 +45,20 @@ export class RulesHandler extends ResourceHandler {
     // Read tombstones to skip previously deleted resources
     const tombstones = await this.readTombstones(localConfig);
 
+    // A rule placed under rules/<ns>/ on an earlier push is still authored at
+    // the tool's rules root, so matching on the full path alone would read it
+    // as brand new and send a second copy to the shared root — where it would
+    // reach the whole team (issue #649). state.json records where this machine
+    // placed each root-level rule, and that record — not the basename — maps
+    // the local copy back to its team file. A namespaced team rule is pulled
+    // into a namespaced local directory, so a root-level local rule that only
+    // shares a basename with one, and has no record, is unrelated and stays new.
+    const placedRules = (await loadStateForScope(localConfig)).placedRules;
+
     // Collect the best candidate for each rule name across all tool directories
-    const candidates = new Map<string, { sourcePath: string; mtime: number; status: ResourceItemStatus }>();
+    const candidates = new Map<string, {
+      sourcePath: string; mtime: number; status: ResourceItemStatus; teamRelPath: string;
+    }>();
     // One read per team rule, shared across every tool dir that compares against it.
     const teamContentCache = new Map<string, string>();
     const readTeamRule = async (filePath: string): Promise<string> => {
@@ -56,6 +73,12 @@ export class RulesHandler extends ResourceHandler {
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       const rulesPath = toolPath.rules;
       if (!rulesPath) continue;
+      // Not written or cleaned by teamai, so not a source either: `removeItem`
+      // leaves an excluded tool's copy behind, and read here it would republish
+      // the rule just removed (#649 review). The single-repo scan source is not
+      // a tool, and `enabledAgents` — which single-repo init always writes —
+      // never lists it.
+      if (tool !== SELF_KNOWLEDGE_SCAN_KEY && isAgentExcluded(localConfig, tool)) continue;
       const rulesDir = path.join(resolveToolBaseDir(tool, localConfig), rulesPath);
       if (!await pathExists(rulesDir)) continue;
 
@@ -74,7 +97,17 @@ export class RulesHandler extends ResourceHandler {
 
         const localFilePath = path.join(rulesDir, file);
         // Team repo always stores `.md`, keyed by rule name.
-        const teamFileName = `${name}.md`;
+        let teamFileName = `${name}.md`;
+        // The record comes first. A shared-root rule that appears later with
+        // the same basename belongs to whoever added it, and mapping the
+        // author's copy onto it would push their content over that rule. A
+        // record whose team file is gone (rule removed, namespace renamed) no
+        // longer proves anything, so the rule is new again.
+        const placed = placedResourcePath(placedRules, 'rules', name);
+        const placedName = placed?.slice('rules/'.length);
+        if (placedName && teamRules.has(placedName)) teamFileName = placedName;
+
+        const teamRelPath = `rules/${teamFileName}`;
 
         if (teamRules.has(teamFileName)) {
           // File exists in team repo — check if content differs
@@ -92,27 +125,43 @@ export class RulesHandler extends ResourceHandler {
               ? copilotInstructionsBodyEqualsTeamMd(localRule, teamRule)
             : await fileContentEqual(localFilePath, teamFilePath);
           if (equal) continue; // This tool dir's copy is identical, skip
+          // Single-repo mode: nothing refreshes the active tree's
+          // `.teamai/rules` — pull deploys to tool dirs and the pre-push sync
+          // covers those — and a branch behind the default branch holds its
+          // older copies. A copy equal to an OLDER version of the team file is
+          // one nobody edited, and pushing it would revert whoever changed the
+          // rule since (#649 review, #823).
+          if (tool === SELF_KNOWLEDGE_SCAN_KEY
+            && await isPastVersionOf(localConfig.repo.localPath, localFilePath, teamRelPath)) {
+            log.warn(
+              `[rules] Skipped ${name}: ${path.relative(resolveToolBaseDir(tool, localConfig), localFilePath)} is an `
+              + `older version of ${teamRelPath}, which has changed on the team since. `
+              + 'Copy the current file over it (or delete it) before editing.',
+            );
+            continue;
+          }
 
           // Content differs — candidate for "modified"
           const mtime = await getFileMtime(localFilePath);
           const existing = candidates.get(name);
           if (!existing || mtime > existing.mtime) {
-            candidates.set(name, { sourcePath: localFilePath, mtime, status: 'modified' });
+            candidates.set(name, { sourcePath: localFilePath, mtime, status: 'modified', teamRelPath });
           }
         } else {
           // File does not exist in team repo — candidate for "new".
-          // Native rule directories can also contain personal rules created by
-          // the target tool. Unknown files there are user-owned and stay local.
-          if (isMdcTool || isCopilotTool) continue;
+          // Native rule directories can contain personal rules created by the
+          // target tool. Keep unknown files in the .mdc, Copilot-instructions,
+          // OMP, and Pi rule directories local.
+          if (isMdcTool || isCopilotTool || tool === 'omp' || tool === 'pi') continue;
           const existing = candidates.get(name);
           if (!existing) {
             const mtime = await getFileMtime(localFilePath);
-            candidates.set(name, { sourcePath: localFilePath, mtime, status: 'new' });
+            candidates.set(name, { sourcePath: localFilePath, mtime, status: 'new', teamRelPath });
           } else if (existing.status === 'new') {
             // Multiple tool dirs have the same new file — pick latest mtime
             const mtime = await getFileMtime(localFilePath);
             if (mtime > existing.mtime) {
-              candidates.set(name, { sourcePath: localFilePath, mtime, status: 'new' });
+              candidates.set(name, { sourcePath: localFilePath, mtime, status: 'new', teamRelPath });
             }
           }
         }
@@ -122,12 +171,17 @@ export class RulesHandler extends ResourceHandler {
     // Convert candidates map to items array
     const items: ResourceItem[] = [];
     for (const [name, candidate] of candidates) {
+      // `rules/<ns>/<file>.md` is namespaced; `rules/<file>.md` is shared. State
+      // it on the item so an open PR can reuse the destination, the way skills do.
+      const segments = candidate.teamRelPath.split('/');
+      const namespace = segments.length > 2 ? segments[1] : undefined;
       items.push({
         name,
         type: 'rules',
         sourcePath: candidate.sourcePath,
-        relativePath: `rules/${name}.md`,
+        relativePath: candidate.teamRelPath,
         status: candidate.status,
+        ...(namespace ? { namespace } : {}),
       });
     }
 
@@ -150,7 +204,13 @@ export class RulesHandler extends ResourceHandler {
   }
 
   async pushItem(item: ResourceItem, _teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
-    const dest = path.join(localConfig.repo.localPath, 'rules', `${item.name}.md`);
+    const rulesRoot = path.join(localConfig.repo.localPath, 'rules');
+    const dest = path.resolve(localConfig.repo.localPath, item.relativePath);
+    assertWithinRoot(
+      rulesRoot,
+      dest,
+      `Invalid rule destination outside team repo rules directory: ${item.relativePath}`,
+    );
     if (item.sourcePath !== dest) {
       if (item.sourcePath.endsWith('.mdc')) {
         // Source is a tool-native `.mdc`. Only its markdown body is pushed: the
@@ -177,9 +237,24 @@ export class RulesHandler extends ResourceHandler {
   }
 
   /**
-   * Pull a single rule file to all configured AI tool rules/ directories.
+   * Where `item` lands for each tool that receives rules. The filename is
+   * tool-dependent — `.md` verbatim, `.mdc` for Cursor-compatible tools,
+   * `.instructions.md` for Copilot — so a reader cannot derive it from the
+   * rule's name alone.
    */
-  async pullItem(item: ResourceItem, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
+  async deliveryTargets(
+    teamConfig: TeamaiConfig,
+    localConfig: LocalConfig,
+    item: ResourceItem,
+  ): Promise<DeliveryTarget[]> {
+    // The bytes as well as the path: Cursor and Copilot read frontmatter this
+    // derives from the team `.md`, so a copy whose `globs`, `alwaysApply` or
+    // `applyTo` no longer match the source is inert in exactly the way a
+    // missing file is. Only a comparison against the render can see that, and
+    // the render belongs here rather than in a second copy inside `doctor`.
+    const source = await readFileSafe(item.sourcePath);
+    const localName = await this.localNameFor(item.name, localConfig);
+    const targets: DeliveryTarget[] = [];
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (isAgentExcluded(localConfig, tool)) continue;
       if (!toolPath.rules) continue;
@@ -191,29 +266,65 @@ export class RulesHandler extends ResourceHandler {
       }
 
       const destDir = path.join(resolveToolBaseDir(tool, localConfig), toolPath.rules);
-      await ensureDir(destDir);
-      const dest = path.join(destDir, `${item.name}${ruleFileExtensionForTool(tool)}`);
+      const ext = ruleFileExtensionForTool(tool);
+      targets.push({
+        tool,
+        dest: path.join(destDir, `${localName}${ext}`),
+        content: source === null ? undefined : renderRuleForTool(tool, source),
+        ...(localName !== item.name
+          ? { supersedes: path.join(destDir, `${item.name}${ext}`) }
+          : {}),
+      });
+    }
+    return targets;
+  }
+
+  /**
+   * The name a delivered rule has in a tool's rules directory. It is the
+   * team name — `fe-know/my-rule` lands at `rules/fe-know/my-rule.*` — except
+   * for a rule THIS machine placed: push left the author's copy at the rules
+   * root under the bare name, and that copy is the one the scanner and the
+   * pre-push sync read, so delivery updates it rather than writing a second
+   * copy beside it that a tool loading rules recursively would apply as well
+   * (#649 review).
+   */
+  private async localNameFor(teamName: string, localConfig: LocalConfig): Promise<string> {
+    const bareName = path.basename(teamName);
+    if (bareName === teamName) return teamName;
+    const placed = placedResourcePath(
+      (await loadStateForScope(localConfig)).placedRules, 'rules', bareName,
+    );
+    if (placed !== `rules/${teamName}.md`) return teamName;
+    // In legacy mode a shared-root rule of the same name is delivered too, and
+    // owns the root path in every tool dir; delivering both there would leave
+    // whichever wrote last. The reconcile pass withdraws the record for this
+    // case, but delivery must not depend on having run after it. With roles or
+    // projects the placed rule replaces that root rule instead (#707).
+    if (await pathExists(path.join(localConfig.repo.localPath, 'rules', `${bareName}.md`))
+      && await deliversEveryNamespace(localConfig)) return teamName;
+    return bareName;
+  }
+
+  /**
+   * Pull a single rule file to all configured AI tool rules/ directories.
+   */
+  async pullItem(item: ResourceItem, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
+    for (const { tool, dest, content, supersedes } of await this.deliveryTargets(teamConfig, localConfig, item)) {
+      const destDir = path.dirname(dest);
       try {
-        if (usesCursorMdcRules(tool)) {
-          // Cursor-compatible tools need `.mdc` with derived frontmatter.
-          const raw = await readFileSafe(item.sourcePath);
-          if (raw === null) {
-            // Never write a stub always-on rule in place of an unreadable source.
-            throw new Error(`Cannot read rule source ${item.sourcePath}`);
-          }
-          await writeFile(dest, teamRuleToCursorMdc(raw));
-          // Drop the `.md` copy left by an older layout; these tools do not read it.
-          await remove(path.join(destDir, `${item.name}.md`));
-        } else if (usesCopilotInstructions(tool)) {
-          const raw = await readFileSafe(item.sourcePath);
-          if (raw === null) {
-            throw new Error(`Cannot read rule source ${item.sourcePath}`);
-          }
-          await writeFile(dest, teamRuleToCopilotInstructions(raw));
-          await remove(path.join(destDir, `${item.name}.md`));
-        } else {
-          await copyFile(item.sourcePath, dest);
+        if (content === undefined) {
+          // Never write a stub always-on rule in place of an unreadable source.
+          throw new Error(`Cannot read rule source ${item.sourcePath}`);
         }
+        await ensureDir(destDir);
+        await writeFile(dest, content);
+        // Drop the `.md` copy left by an older layout; a tool that reads a
+        // derived extension does not read it, and it would outlive the rule.
+        const legacyCopy = path.join(destDir, `${path.basename(dest, path.extname(dest))}.md`);
+        if (dest !== legacyCopy) await remove(legacyCopy);
+        // The namespaced copy an earlier pull wrote beside the author's root
+        // copy: the same rule twice, for a tool that loads rules recursively.
+        if (supersedes) await remove(supersedes);
         log.debug(`Synced rule ${item.name} → ${tool}`);
       } catch (e) {
         log.warn(`Failed to sync rule ${item.name} to ${tool}: ${(e as Error).message}`);
@@ -222,7 +333,27 @@ export class RulesHandler extends ResourceHandler {
   }
 
   /**
+   * `my-rule` when push placed it at `rules/fe-know/my-rule.md`: the author
+   * types the name their local copy has, which is the bare one.
+   */
+  async publishedNameFor(name: string, localConfig: LocalConfig): Promise<string | null> {
+    const placed = placedResourcePath(
+      (await loadStateForScope(localConfig)).placedRules, 'rules', name,
+    );
+    if (!placed) return null;
+    if (!await pathExists(path.join(localConfig.repo.localPath, placed))) return null;
+    return placed.slice('rules/'.length, -'.md'.length);
+  }
+
+  /**
    * Remove a rule from the team repo and all local AI tool rules/ directories.
+   *
+   * `name` may be the published one (`fe-know/my-rule`) or the bare one the
+   * author's own copy carries (`my-rule`) — `remove` resolves the first through
+   * `publishedNameFor`, so both reach the same team file. The local sweep below
+   * covers both spellings, because a rule placed in a namespace leaves the
+   * author's copy at the rules root while every other member receives it at
+   * `rules/<ns>/`.
    */
   async removeItem(name: string, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<string[]> {
     const removed: string[] = [];
@@ -234,7 +365,26 @@ export class RulesHandler extends ResourceHandler {
       removed.push(teamFile);
     }
 
-    // Record tombstone so the resource won't be re-pushed
+    // The author's own copy is at the rules root under the bare name, whatever
+    // namespace the team file ended up in. Leaving it behind re-publishes the
+    // rule on the next push — but only THIS machine's placement record makes
+    // that copy ours to delete. Without it, `remove rules fe/foo` would take an
+    // unrelated personal .claude/rules/foo.md with it (#649 review).
+    const localNames = new Set([name]);
+    const bareName = path.basename(name);
+    if (bareName !== name) {
+      const placed = placedResourcePath(
+        (await loadStateForScope(localConfig)).placedRules, 'rules', bareName,
+      );
+      if (placed === `rules/${name}.md`) localNames.add(bareName);
+    }
+
+    // Record a tombstone so the resource won't be re-pushed. Only the name
+    // given: every member reads the tombstone, and a bare `<name>` would sweep
+    // and suppress their own unrelated root rule of that name (#649 review).
+    // Members hold a namespaced rule under `<ns>/`, which the published name
+    // matches; the author's root copy is swept below, and a copy an excluded
+    // tool keeps is not a push source (`scanLocalForPush`).
     await this.addTombstone(name, localConfig);
 
     // Remove from each tool's rules directory. `.mdc` tools may have an older
@@ -247,12 +397,14 @@ export class RulesHandler extends ResourceHandler {
       if (isAgentExcluded(localConfig, tool)) continue;
       const baseDir = resolveToolBaseDir(tool, localConfig);
       const extensions = new Set<string>([ruleFileExtensionForTool(tool), '.md']);
-      for (const extension of extensions) {
-        const filePath = path.join(baseDir, toolPath.rules, `${name}${extension}`);
-        if (await pathExists(filePath)) {
-          await remove(filePath);
-          removed.push(filePath);
-          log.debug(`Removed rule ${name} from ${tool}`);
+      for (const localName of localNames) {
+        for (const extension of extensions) {
+          const filePath = path.join(baseDir, toolPath.rules, `${localName}${extension}`);
+          if (await pathExists(filePath)) {
+            await remove(filePath);
+            removed.push(filePath);
+            log.debug(`Removed rule ${localName} from ${tool}`);
+          }
         }
       }
     }
@@ -266,11 +418,18 @@ export class RulesHandler extends ResourceHandler {
   /**
    * Distribute rule files to each tool's rules/ directory, then update
    * CLAUDE.md with a lightweight reference list instead of inlining content.
+   *
+   * `replacedRoots` are root rules an active namespace rule replaces (#707).
+   * The stale sweep removes their copies from the directories teamai owns;
+   * in the ones it shares with the member's own rules, a copy is removed only
+   * while it is byte-equal to what pull wrote for that root rule, now or at the
+   * last pull. A copy kept there is named, since the tool loads it too.
    */
   async pullAllRules(
     teamConfig: TeamaiConfig,
     localConfig: LocalConfig,
     filteredRules?: ResourceItem[],
+    replacedRoots: readonly ResourceItem[] = [],
   ): Promise<void> {
     const rules = filteredRules ?? await this.scanTeamForPull(teamConfig, localConfig);
 
@@ -280,13 +439,8 @@ export class RulesHandler extends ResourceHandler {
     if (!isAgentExcluded(localConfig, 'hermes')) {
       const { getHermesHome } = await import('../hermes-home.js');
       if (await pathExists(getHermesHome())) {
-        const bodies: string[] = [];
-        for (const rule of rules) {
-          const body = await readFileSafe(rule.sourcePath);
-          if (body && body.trim() !== '') bodies.push(body.trim());
-        }
         const { upsertSoulRules } = await import('../hermes-config.js');
-        await upsertSoulRules(bodies.join('\n\n'));
+        await upsertSoulRules(await hermesRulesText(rules));
       }
     }
 
@@ -311,7 +465,40 @@ export class RulesHandler extends ResourceHandler {
 
     // 1.5. Clean up stale local rule files not present in team repo
     const teamRuleNames = new Set(rules.map((r) => r.name));
+    // A rule this machine published into a namespace keeps the author's copy at
+    // the rules ROOT under its bare name. The desired set never contains that
+    // name — it is `<ns>/<name>` there, or absent when the namespace is not
+    // active here — so the sweep below would delete the author's own file,
+    // local edits and all (#649 review). The record is what marks it as ours,
+    // and only while the team file it points at still exists. Before the PR
+    // merges there is no record yet — the placement is on the pending entry —
+    // and the copy is just as much ours then.
+    const state = await loadStateForScope(localConfig);
+    const { placedRules, pendingPushes } = state;
+    for (const name of Object.keys(placedRules ?? {})) {
+      const placed = placedResourcePath(placedRules, 'rules', name);
+      if (placed && await pathExists(path.join(localConfig.repo.localPath, placed))) {
+        teamRuleNames.add(name);
+      }
+    }
+    // Any pending entry that carries a root-authored rule at a namespaced path,
+    // not only one still marked `placed`: reconcile spends the mark on a
+    // placement it cannot prove, while the PR may still be open and the copy
+    // is still the author's work (#649 review).
+    for (const entry of pendingPushes ?? []) {
+      for (const item of entry.items) {
+        if (item.type === 'rules' && !item.name.includes('/') && item.relativePath.split('/').length === 3) {
+          teamRuleNames.add(item.name);
+        }
+      }
+    }
     const tombstones = await this.readTombstones(localConfig);
+    const replacedByName = new Map(replacedRoots.map((rule) => [rule.name, rule]));
+    // The revisions this checkout's copies can be at: the shared lastPullRev
+    // may be another checkout's, and HOME's copy an inherited pull's (#823).
+    const deliveredRevs = replacedRoots.length > 0
+      ? (await (await import('../pull.js')).resolveCheckoutBases(localConfig, state)).revs
+      : [];
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (!toolPath.rules) continue;
       // `pullItem` above skips excluded tools, so this pass must skip them too.
@@ -329,10 +516,28 @@ export class RulesHandler extends ResourceHandler {
         const ruleName = ruleStemFromFilename(localFile);
         if (ruleName === null) continue;
 
-        // JoyCode's rules directory is shared with user-authored rules. Absence
-        // from the current team set is not proof of TeamAI ownership (including
-        // legacy .md files). Only explicit team removals authorize cleanup.
-        if ((tool === 'joycode' || usesCopilotInstructions(tool)) && !tombstones.has(ruleName)) continue;
+        // JoyCode, OMP, Pi, and Copilot rule directories are shared with
+        // user-authored rules. Absence from the current team set is not proof
+        // of TeamAI ownership (including legacy .md files); only explicit team
+        // removals authorize cleanup, and a replaced root rule's copy that is
+        // still exactly what pull wrote. Cursor is deliberately absent — teamai
+        // owns .cursor/rules and sweeps it.
+        if ((tool === 'joycode' || tool === 'omp' || tool === 'pi' || usesCopilotInstructions(tool)) && !tombstones.has(ruleName)) {
+          const replaced = teamRuleNames.has(ruleName) ? undefined : replacedByName.get(ruleName);
+          if (replaced === undefined || localFile !== `${ruleName}${ext}`) continue;
+          const deployed = path.join(destDir, localFile);
+          if (await isDeliveredRender(tool, deployed, replaced, localConfig.repo.localPath, deliveredRevs)) {
+            await remove(deployed);
+            log.debug(`Removed ${localFile} from ${tool}: a namespace rule replaces it`);
+          } else {
+            log.warn(
+              `Kept ${deployed}: it differs from what teamai delivered for ${replaced.relativePath}, which a namespace `
+              + `rule replaces here, so ${tool} loads both. Delete it if you did not edit it; to keep your changes, `
+              + 'rename it to a name of your own.',
+            );
+          }
+          continue;
+        }
 
         // `.mdc` tools only read `.mdc`, so any `.md` here is inert leftover from the
         // layout that predates it — removed whether or not the rule is still
@@ -395,29 +600,47 @@ export class RulesHandler extends ResourceHandler {
     localConfig: LocalConfig,
     present: boolean,
   ): Promise<void> {
-    if (isAgentExcluded(localConfig, 'opencode')) return;
-    const scoped = scopedToolPaths(teamConfig, localConfig);
-    const paths = scoped['opencode'];
-    if (!paths?.rules) return;
+    const target = await this.opencodeInstructionsTarget(teamConfig, localConfig);
+    if (target === null) return;
+
+    const { reconcileOpencodeInstructions } = await import('./opencode-config.js');
+    try {
+      await reconcileOpencodeInstructions(target.configFile, target.glob, present);
+    } catch (e) {
+      log.warn(`Failed to update OpenCode instructions in ${target.configFile}: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * The opencode.json this scope activates rules through, and the one glob
+   * teamai owns inside it. Null when OpenCode receives no rules here:
+   * excluded, not installed, or configured without a rules or config path.
+   *
+   * Read-only, and public for the same reason `deliveryTargets` is: OpenCode
+   * does not auto-scan its rules directory, so a `.md` sitting there is inert
+   * until this glob references it. A check that derived the path a second time
+   * could look at a different file than the pull writes (#624).
+   */
+  async opencodeInstructionsTarget(
+    teamConfig: TeamaiConfig,
+    localConfig: LocalConfig,
+  ): Promise<{ configFile: string; glob: string } | null> {
+    if (isAgentExcluded(localConfig, 'opencode')) return null;
+    const paths = scopedToolPaths(teamConfig, localConfig)['opencode'];
+    if (!paths?.rules) return null;
 
     const baseDir = resolveBaseDir(localConfig);
     // Only touch opencode.json when OpenCode is actually installed for this scope.
-    if (!await ResourceHandler.isToolInstalled(paths.rules, baseDir)) return;
+    if (!await ResourceHandler.isToolInstalled(paths.rules, baseDir)) return null;
 
     // The config file mirrors the MCP scope fields: <root>/opencode.json in
     // project scope, ~/.config/opencode/opencode.json in user scope.
     const configRel = localConfig.scope === 'project' ? paths.mcpProject : paths.mcp;
-    if (!configRel) return;
-    const configFileAbs = path.join(baseDir, configRel);
-    const rulesDirAbs = path.join(baseDir, paths.rules);
+    if (!configRel) return null;
 
-    const { reconcileOpencodeInstructions, opencodeRulesGlob } = await import('./opencode-config.js');
-    const glob = opencodeRulesGlob(configFileAbs, rulesDirAbs);
-    try {
-      await reconcileOpencodeInstructions(configFileAbs, glob, present);
-    } catch (e) {
-      log.warn(`Failed to update OpenCode instructions in ${configFileAbs}: ${(e as Error).message}`);
-    }
+    const configFile = path.join(baseDir, configRel);
+    const { opencodeRulesGlob } = await import('./opencode-config.js');
+    return { configFile, glob: opencodeRulesGlob(configFile, path.join(baseDir, paths.rules)) };
   }
 
   /**
@@ -437,4 +660,60 @@ export class RulesHandler extends ResourceHandler {
       }
     }
   }
+}
+
+/**
+ * The bytes a team rule becomes for one tool. `.md` is copied verbatim;
+ * Cursor-compatible tools and Copilot read frontmatter derived from the same
+ * source, so their file is a render rather than a copy.
+ *
+ * This is the single spelling of that mapping: `pullItem` writes it and
+ * `doctor` compares the delivered file against it, so a stale render is a
+ * reported failure rather than a file that merely exists.
+ */
+function renderRuleForTool(tool: string, source: string): string {
+  if (usesCursorMdcRules(tool)) return teamRuleToCursorMdc(source);
+  if (usesCopilotInstructions(tool)) return teamRuleToCopilotInstructions(source);
+  return source;
+}
+
+/**
+ * Whether `deployed` holds exactly what pull renders for `tool` from the team
+ * rule, as it is now or as it was at one of `deliveredRevs`: a root rule
+ * edited in the same push that adds its namespace override leaves the older
+ * render behind, which nobody edited.
+ */
+async function isDeliveredRender(
+  tool: string,
+  deployed: string,
+  rule: ResourceItem,
+  repoPath: string,
+  deliveredRevs: readonly string[],
+): Promise<boolean> {
+  const current = await readFileSafe(deployed);
+  if (current === null) return false;
+  const team = await readFileSafe(rule.sourcePath);
+  if (team !== null && current === renderRuleForTool(tool, team)) return true;
+  for (const rev of deliveredRevs) {
+    const delivered = await getFileContentAtRev(repoPath, rev, `./${rule.relativePath}`);
+    if (delivered !== null && current === renderRuleForTool(tool, delivered.toString('utf-8'))) return true;
+  }
+  return false;
+}
+
+/**
+ * The text `upsertSoulRules` inlines into the teamai block of Hermes SOUL.md.
+ *
+ * Hermes reads standing instructions from one file rather than a rules
+ * directory, so its rules are delivered as this block's contents. `doctor`
+ * compares what is in the block with this, the same way it compares a rule
+ * file with its render.
+ */
+export async function hermesRulesText(rules: ResourceItem[]): Promise<string> {
+  const bodies: string[] = [];
+  for (const rule of rules) {
+    const body = await readFileSafe(rule.sourcePath);
+    if (body && body.trim() !== '') bodies.push(body.trim());
+  }
+  return bodies.join('\n\n');
 }

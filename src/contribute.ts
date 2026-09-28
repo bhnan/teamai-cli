@@ -5,12 +5,13 @@ import { assertNotReadOnly } from './read-only.js';
 import { pathExists } from './utils/fs.js';
 import { log, spinner } from './utils/logger.js';
 import { markContributed } from './contribute-check.js';
-import { pendingLearningsDir, savePendingLearning } from './utils/pending-learnings.js';
-import { publishLearning } from './utils/learnings-publish.js';
-import { learningsRoots } from './utils/learnings-roots.js';
-import { isSafeNamespaceSegment, resolveActiveLearningsNamespaces } from './projects.js';
+import { pendingLearningsDir, queueWriteRefusal, savePendingLearning } from './utils/pending-learnings.js';
+import { publishQueuedLearnings } from './utils/learnings-publish.js';
+import { indexableLearningsRoots } from './utils/learnings-roots.js';
+import { resolveActiveLearningsNamespaces } from './projects.js';
+import { isSafeNamespaceSegment } from './manifest-schema.js';
 import type { GlobalOptions, LocalConfig } from './types.js';
-import { getDataHome, getReportsDir, isSelfMode } from './types.js';
+import { getProjectSearchIndexPath, isSelfMode } from './types.js';
 
 /**
  * Decide which learnings subdirectory a contribution lands in — resolved from
@@ -26,7 +27,7 @@ import { getDataHome, getReportsDir, isSelfMode } from './types.js';
  *   target one explicitly by contributing from that project's directory. This
  *   favors the safe default (visible to all) over silently guessing a namespace.
  */
-async function resolveLearningsSubdir(localConfig: LocalConfig): Promise<string> {
+export async function resolveLearningsSubdir(localConfig: LocalConfig): Promise<string> {
   const namespaces = await resolveActiveLearningsNamespaces(
     localConfig.repo.localPath,
     localConfig.projects ?? [],
@@ -45,35 +46,43 @@ async function resolveLearningsSubdir(localConfig: LocalConfig): Promise<string>
  * Rebuild this scope's local search index so the freshly-written contribution
  * (and anything pulled just before it) is immediately recallable — otherwise
  * `recall` only picks it up after the next `teamai pull` rebuilds the index (#85).
+ *
+ * The queue is indexed FIRST, ahead of the published roots: a contribution is
+ * recallable the moment it is written, whether or not it has reached origin, and
+ * a queued edit of a published learning is the copy recall serves.
  */
-async function rebuildIndexAfterContribute(localConfig: LocalConfig): Promise<void> {
+export async function rebuildIndexAfterContribute(localConfig: LocalConfig): Promise<void> {
   const repoPath = localConfig.repo.localPath;
   const docsRepoDir = path.join(repoPath, 'docs');
   const rulesRepoDir = path.join(repoPath, 'rules');
-  const skillsRepoDir = path.join(repoPath, 'skills');
-  const votesDir = path.join(getReportsDir(localConfig), 'votes');
+  // Not another repository's reports checkout (#808).
+  const { indexableVotesDir } = await import('./utils/reports-branch.js');
+  const votesDir = await indexableVotesDir(localConfig);
 
   const activeLearningsNamespaces = await resolveActiveLearningsNamespaces(
     repoPath,
     localConfig.projects ?? [],
   );
 
-  const teamaiHome = getDataHome(localConfig);
-  const indexPath = path.join(teamaiHome, 'search-index.json');
-  const { buildIndex } = await import('./utils/search-index.js');
+  const indexPath = getProjectSearchIndexPath(localConfig);
+  const { buildIndex, dropOtherCheckoutIndexes } = await import('./utils/search-index.js');
+  const { deliveredIndexSources } = await import('./resources/desired.js');
+  await dropOtherCheckoutIndexes(localConfig);
   await buildIndex({
-    // The durable copy of a contribution that could not be published is a
-    // learnings root too. Without it, a member whose worktree cannot be created
-    // at all keeps the note but cannot recall it until it publishes — and
-    // before learnings moved to their own branch, it was always findable.
-    learningsDirs: [pendingLearningsDir(localConfig), ...learningsRoots(localConfig).read],
+    // Without another repository's learnings checkout, if one sits where this
+    // project's would (#808).
+    learningsDirs: [
+      pendingLearningsDir(localConfig),
+      ...await indexableLearningsRoots(localConfig),
+    ],
     // Manifest-resolved namespaces — MUST match what pull indexes by, or a
     // contribute-time rebuild drops the project's other learnings from recall.
     learningsNamespaces: activeLearningsNamespaces,
     docsDir: (await pathExists(docsRepoDir)) ? docsRepoDir : undefined,
     rulesDir: (await pathExists(rulesRepoDir)) ? rulesRepoDir : undefined,
-    skillsDir: (await pathExists(skillsRepoDir)) ? skillsRepoDir : undefined,
-    votesDir: (await pathExists(votesDir)) ? votesDir : undefined,
+    // The docs and skills pull delivers here, not the whole trees (#707).
+    ...await deliveredIndexSources(localConfig),
+    votesDir: votesDir && (await pathExists(votesDir)) ? votesDir : undefined,
     indexPath,
   });
 }
@@ -85,12 +94,26 @@ async function rebuildIndexAfterContribute(localConfig: LocalConfig): Promise<vo
 //      ├─ requireInit() → localConfig + username
 //      ├─ readFile(path) → validate non-empty
 //      ├─ generateFilename(title) → <title-slug>-<date>-<random>.md
-//      ├─ publishLearning() → the one place that knows the destination
-//      ├─ rebuildIndexAfterContribute() → recallable from the branch worktree
-//      │   ├── confirmed on origin → markContributed()
-//      │   └── not confirmed → keep a durable copy, retried by the next pull
+//      ├─ savePendingLearning() → the durable queue, outside anything git rewrites
+//      ├─ rebuildIndexAfterContribute() → recallable now, online or not
+//      ├─ publishQueuedLearnings() → the one place that knows the destination
+//      │   ├── confirmed on origin → drop the queue entry, markContributed()
+//      │   └── not confirmed → keep it queued, retried by the next pull
 //      └─ done
 //
+
+/**
+ * Where a learning saved for an install that changed before it was published
+ * is, for the member: still queued, or set aside with the previous install's
+ * queue by the `init` that switched it, which names the directory.
+ */
+export const KEPT_FOR_ITS_INSTALL =
+  'It stays on this machine: in the queue, or where `teamai init` set that install\'s queue aside.';
+
+/** What happens to a learning a checkout refusal kept from publishing: every pull meets the refusal too. */
+export const KEPT_UNTIL_CHECKOUT_SETTLED =
+  'It stays queued and recallable here, but no `teamai pull` can publish it until that checkout is dealt with: ' +
+  'do what the refusal says, then run `teamai pull`.';
 
 /**
  * Generate a safe filename for a contribution document.
@@ -100,7 +123,7 @@ async function rebuildIndexAfterContribute(localConfig: LocalConfig): Promise<vo
  * The title is slugified (lowercase, hyphens, max 50 chars).
  * A 6-char random suffix avoids collisions.
  */
-function generateFilename(title?: string): string {
+export function generateFilename(title?: string): string {
   const slug = (title ?? 'session-notes')
     .toLowerCase()
     .replace(/[^a-z0-9\u4e00-\u9fff]+/g, '-') // Allow CJK characters
@@ -115,9 +138,11 @@ function generateFilename(title?: string): string {
 /**
  * Handle `teamai contribute --file <path> [--title <title>]`.
  *
- * The contribution goes to the `teamai-learnings` branch, with no pull request
- * and no commit on the default branch. What cannot be published right now is
- * kept outside the clone and retried by the next `teamai pull`.
+ * The contribution is written to the durable queue first and published from
+ * there. Nothing about it depends on the network, on push rights, or on a git
+ * operation succeeding right now: what cannot be published stays queued and the
+ * next `teamai pull` publishes it, once any checkout refusal that stopped it is
+ * dealt with.
  */
 export async function contribute(
   options: GlobalOptions & { file?: string; title?: string; sessionId?: string; scope?: string },
@@ -141,19 +166,22 @@ export async function contribute(
     return;
   }
 
-  // Init check — select scope based on --scope flag or auto-detect
+  // Init check — select scope based on --scope flag or auto-detect. The flag
+  // reaches the loaders: a bare load migrates the legacy role config in place,
+  // which would write under --dry-run (#850).
+  const loadOpts = { dryRun: options.dryRun };
   let localConfig: LocalConfig;
   if (options.scope === 'project') {
-    const cfg = await loadLocalConfigForScope('project', process.cwd());
+    const cfg = await loadLocalConfigForScope('project', process.cwd(), loadOpts);
     if (!cfg) { log.error('No project-level teamai config in this directory'); return; }
     localConfig = cfg;
   } else if (options.scope === 'user') {
-    const { localConfig: userCfg } = await requireInit();
+    const { localConfig: userCfg } = await requireInit(loadOpts);
     localConfig = userCfg;
   } else {
     // Auto-detect (unchanged default behavior)
-    const projectConfig = await detectProjectConfig();
-    localConfig = projectConfig ?? (await requireInit()).localConfig;
+    const projectConfig = await detectProjectConfig(undefined, undefined, loadOpts);
+    localConfig = projectConfig ?? (await requireInit(loadOpts)).localConfig;
   }
   assertNotReadOnly(localConfig, 'teamai contribute');
   const username = localConfig.username;
@@ -179,47 +207,64 @@ export async function contribute(
     await migrateSelfModeGitignore(localConfig);
   }
 
-  const result = await publishLearning(localConfig, username, relPath, content);
-
-  // Rebuild the index either way: the learning is in the branch worktree, which
-  // is a read root, whether or not the push that follows it reached origin.
-  const published = result.status === 'published' || result.status === 'already-present';
-
-  // Not on origin: keep a durable copy outside anything git rewrites, so the
-  // next pull can deliver it. It has to exist before the index is rebuilt, or
-  // a contribution whose worktree could not be created at all would be kept
-  // and still be unfindable.
-  let saved = false;
-  if (!published) {
-    try {
-      await savePendingLearning(localConfig, relPath, content);
-      saved = true;
-    } catch (e) {
-      spin.fail(`Contribution failed: ${(e as Error).message}`);
-      log.info('You can retry with: teamai contribute --file <path>');
+  try {
+    const queued = await savePendingLearning(localConfig, relPath, content);
+    if (queued.status !== 'saved') {
+      spin.fail(queueWriteRefusal(queued));
+      process.exitCode = 1;
       return;
     }
+  } catch (e) {
+    spin.fail(`Contribution failed: ${(e as Error).message}`);
+    log.info('You can retry with: teamai contribute --file <path>');
+    return;
   }
 
+  // Index before publishing: recall finds the contribution even when the push
+  // below cannot run at all.
   try {
     await rebuildIndexAfterContribute(localConfig);
   } catch (e) {
     log.debug(`contribute: index rebuild skipped: ${(e as Error).message}`);
   }
 
+  const report = await publishQueuedLearnings(localConfig, username);
+
+  // Publishing dropped the just-published files from the pending queue, but the
+  // index built above still points recall at those now-deleted pending paths —
+  // the agent is handed a File that no longer exists (#705). Rebuild once more so
+  // every published entry resolves to its durable worktree copy instead. Only
+  // when something actually reached origin; a still-queued contribution keeps its
+  // pending path, which is exactly where it is still readable.
+  if (report.published.length > 0) {
+    try {
+      await rebuildIndexAfterContribute(localConfig);
+    } catch (e) {
+      log.debug(`contribute: post-publish index rebuild skipped: ${(e as Error).message}`);
+    }
+  }
+
+  // The session counts as contributed once the note is durably queued, not once
+  // it reaches origin: the queue always retries, and re-contributing the same
+  // session would add a second copy of the same knowledge rather than fix
+  // anything. `pull` and `doctor` are what tell the user it is still queued.
   const sessionId = options.sessionId || process.env.CLAUDE_SESSION_ID || '';
   if (sessionId) {
     await markContributed(sessionId);
   }
 
-  if (published) {
+  if (report.published.includes(relPath)) {
     spin.succeed(`Contributed: learnings/${relPath}`);
     log.info('Your session knowledge has been shared with the team.');
     return;
   }
-
-  if (saved) {
-    const reason = result.status === 'failed' ? result.reason : 'another teamai write is in progress';
-    spin.warn(`Saved locally (${reason}). Will retry on the next pull.`);
+  if (report.installChanged) {
+    spin.warn(`Saved locally, not published: ${report.installChanged}. ${KEPT_FOR_ITS_INSTALL}`);
+    return;
   }
+
+  spin.warn(
+    `Saved locally (${report.lastError ?? 'not published yet'}). `
+    + (report.refused ? KEPT_UNTIL_CHECKOUT_SETTLED : 'It stays recallable here and the next `teamai pull` publishes it.'),
+  );
 }

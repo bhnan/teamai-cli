@@ -6,7 +6,8 @@
  * evidence pages, router/hot/index navigation, and gaps detection.
  */
 
-import { mkdir, writeFile, readFile } from 'node:fs/promises';
+import { statSync } from 'node:fs';
+import { mkdir, writeFile, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 
 import chalk from 'chalk';
@@ -36,6 +37,8 @@ import {
   mergeInterfaceInventories,
 } from './wiki-engine/code-knowledge/code-incremental.js';
 import { writeIfChanged } from './utils/fs.js';
+import { resolveAnchors } from './utils/git.js';
+import { repoName } from './utils/repo-attribution.js';
 import type { GraphIndex } from './wiki-engine/core/graph-index.schema.js';
 import { routerTemplate, indexTemplate, HOT_TEMPLATE } from './wiki-engine/adapters/templates.js';
 import type { DomainGroup, IndexStats } from './wiki-engine/adapters/templates.js';
@@ -86,7 +89,6 @@ function detectKnowledgeGaps(
 ): KnowledgeGap[] {
   const gaps: KnowledgeGap[] = [];
   const scannedFiles = new Set(files.map((f) => f.relativePath));
-  const nodeSlugs = new Set(graph.nodes.map((n) => n.slug));
   const connectedNodes = new Set<string>();
   for (const edge of graph.edges) {
     connectedNodes.add(edge.from);
@@ -533,9 +535,25 @@ function buildOverview(
   return lines.join('\n');
 }
 
+/**
+ * The wiki slug of `dir` when no `--project` is given (#809): a checkout's
+ * root, the main one or a linked worktree, takes its repo's name (repoName:
+ * the main checkout's real name, or a bare repo's), so every checkout of a repo
+ * writes the repo's evidence, whatever path it was opened by (#823); any other
+ * directory keeps its own name.
+ */
+export async function defaultProjectSlug(dir: string): Promise<string> {
+  if (!statSync(dir, { throwIfNoEntry: false })?.isDirectory()) return path.basename(dir);
+  const anchors = await resolveAnchors(dir);
+  if (anchors && await realpath(dir) === anchors.workspaceRoot) {
+    return repoName(anchors.projectAnchor);
+  }
+  return path.basename(dir);
+}
+
 export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<void> {
   const root = path.resolve(opts.path || '.');
-  const project = opts.project || path.basename(root);
+  const project = opts.project || await defaultProjectSlug(root);
   const maxFiles = opts.maxFiles || 200;
   const outputBase = opts.outputRoot ? path.resolve(opts.outputRoot) : root;
 
@@ -624,7 +642,7 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
 
 
   // AST track (web-tree-sitter WASM): resolve precise import/call edges for
-  // TS/JS/Python/Go. Runs alongside the regex heuristic track; AST facts win
+  // TS/JS/Python/Go/Swift. Runs alongside the regex heuristic track; AST facts win
   // on merge. Falls back to heuristic-only when the WASM runtime is unavailable
   // (e.g. TEAMAI_SKIP_AST=1) or throws, recording an AST_UNAVAILABLE gap.
   const astGaps: KnowledgeGap[] = [];

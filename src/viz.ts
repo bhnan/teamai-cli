@@ -11,7 +11,7 @@ import os from 'node:os';
 
 import { loadIndex, buildIndex } from './utils/search-index.js';
 import { loadUserVotes } from './votes.js';
-import { detectProjectConfig, loadLocalConfig } from './config.js';
+import { BROKEN_CONFIG_ADVICE, findUnreadableProjectConfig, resolveConfigForDir } from './config.js';
 import {
   getTeamaiHomeDir,
   getUserVotesDir,
@@ -19,8 +19,7 @@ import {
   getUserLearningsDir,
   getKnowledgeDir,
   getReportsDir,
-  getDataHome,
-  getTeamaiHome,
+  getProjectSearchIndexPath,
 } from './types.js';
 import type { SearchIndexEntry } from './types.js';
 import { findPromotionCandidates, type PromotionCandidate } from './maintenance/promote.js';
@@ -33,6 +32,8 @@ export type { PromotionCandidate, PruneCandidate, StaleEntry };
 // ─── Public option / data types ──────────────────────────────────────────────
 
 export interface VizOptions {
+  /** Explicit installed dashboard scope; null selects unconfigured user scope. */
+  config?: import('./types.js').LocalConfig | null;
   /** Path to a team repo root directory to aggregate instead of local ~/.teamai. */
   repo?: string;
 }
@@ -121,6 +122,17 @@ interface VizPaths {
   learningsDir: string;
   /** Every learnings root to read, highest precedence first. */
   learningsDirs: readonly string[];
+  /**
+   * The roots a temporary index is built from: learningsDirs plus the
+   * contribution queue, as recall's index. Promotion and pruning keep to
+   * learningsDirs: a queued learning has not reached the team yet.
+   */
+  indexLearningsDirs: readonly string[];
+  /**
+   * The active projects' learnings namespaces an index built here reads, as
+   * recall's and pull's do; why none, when manifest/projects.yaml cannot be read.
+   */
+  learningsNamespaces: { ok: true; namespaces: string[] } | { ok: false; reason: string };
   statsDir: string;
   indexPath: string | undefined;
   source: VizSource;
@@ -131,9 +143,10 @@ interface VizPaths {
 /**
  * Resolve the data root and derivative directories for the viz pipeline.
  *
- * Precedence: explicit `--repo` flag → project-scope config → user config → ~/.teamai fallback.
+ * Precedence: explicit `--repo` flag → the cwd's scope (resolveConfigForDir: project, else user)
+ * → ~/.teamai fallback. An unreadable project config throws rather than fall back.
  * `config.repo.kind` is 'git' | 'http' | 'self'. In self mode, votes/stats live in the reports
- * worktree (ensureReportsWorktree), while learnings remain in the local ~/.teamai tree.
+ * worktree (readableReportsWorktree), while learnings remain in the local ~/.teamai tree.
  */
 export async function resolveVizRoot(opts: VizOptions): Promise<VizPaths> {
   // Explicit --repo: everything lives under the given repo; no shared index
@@ -148,33 +161,56 @@ export async function resolveVizRoot(opts: VizOptions): Promise<VizPaths> {
       learningsDir: path.join(root, 'learnings'),
       // learnings-root ok: same explicit --repo path
       learningsDirs: [path.join(root, 'learnings')],
+      // learnings-root ok: same explicit --repo path
+      indexLearningsDirs: [path.join(root, 'learnings')],
+      learningsNamespaces: { ok: true, namespaces: [] },
       statsDir: path.join(root, 'stats'),
       indexPath: undefined,
       source: { scope: 'team', label: 'Team repo · aggregated across the team' },
     };
   }
 
-  const config = await detectProjectConfig() ?? await loadLocalConfig();
+  const config = opts.config !== undefined ? opts.config : await resolveConfigForDir();
+  if (config === null && opts.config === undefined) {
+    // A broken project config is no scope: the local fallback would show the
+    // user scope's votes and learnings as this project's (#787).
+    const unreadable = await findUnreadableProjectConfig();
+    if (unreadable) {
+      const { firstLine } = await import('./skill-content.js');
+      throw new Error(`${firstLine(unreadable)}. ${BROKEN_CONFIG_ADVICE}`);
+    }
+  }
 
   if (config?.repo?.localPath) {
     const { usesBranchWorktree } = await import('./types.js');
     if (usesBranchWorktree(config)) {
-      const { ensureReportsWorktree } = await import('./utils/reports-branch.js');
+      const { readableReportsWorktree } = await import('./utils/reports-branch.js');
       // Read-only: never publish a missing reports branch.
-      await ensureReportsWorktree(config, { pushIfCreated: false });
+      await readableReportsWorktree(config);
     }
     const knowledgeRoot = getKnowledgeDir(config);
     const reportsRoot = getReportsDir(config);
     const useProjectScope = config.scope === 'project' && Boolean(config.projectRoot);
-    // Project branch routes through getDataHome (P1-2 partition-aware); the
-    // else branch preserves the original fallback to ~/.teamai for historical
-    // configs that are project-scoped but lack projectRoot (getDataHome would
-    // otherwise throw via getTeamaiHome and fail the dashboard report).
-    const teamaiHome = useProjectScope ? getDataHome(config) : getTeamaiHome('user');
-    const { learningsRoots } = await import('./utils/learnings-roots.js');
+    // Project branch routes through getProjectSearchIndexPath (partition-aware,
+    // per checkout in self mode); the else branch preserves the original
+    // fallback to ~/.teamai for historical configs that are project-scoped but
+    // lack projectRoot (getDataHome would otherwise throw via getTeamaiHome and
+    // fail the dashboard report).
+    const indexPath = useProjectScope ? getProjectSearchIndexPath(config) : getUserSearchIndexPath();
+    const { learningsRoots, indexableLearningsRoots } = await import('./utils/learnings-roots.js');
     const roots = learningsRoots(config);
     const learningsDir = useProjectScope ? roots.write : getUserLearningsDir();
-    const learningsDirs = useProjectScope ? roots.read : [getUserLearningsDir(), ...roots.read];
+    // Not another repository's learnings checkout (#808): the temporary index
+    // and the promotion/prune candidates are built from these.
+    const learningsDirs = useProjectScope
+      ? await indexableLearningsRoots(config)
+      : [getUserLearningsDir(), ...await indexableLearningsRoots(config)];
+    const { pendingLearningsDir } = await import('./utils/pending-learnings.js');
+    const indexLearningsDirs = [pendingLearningsDir(config), ...learningsDirs];
+    const { resolveActiveLearningsNamespaces } = await import('./projects.js');
+    const learningsNamespaces: VizPaths['learningsNamespaces'] = await resolveActiveLearningsNamespaces(config.repo.localPath, config.projects ?? [])
+      .then((namespaces) => ({ ok: true as const, namespaces }))
+      .catch((e: unknown) => ({ ok: false as const, reason: e instanceof Error ? e.message : String(e) }));
     const source: VizSource = config.repo.kind === 'self'
       ? { scope: 'local', label: 'Personal repo · your recalls only' }
       : { scope: 'team', label: 'Team repo · aggregated across the team' };
@@ -184,8 +220,10 @@ export async function resolveVizRoot(opts: VizOptions): Promise<VizPaths> {
       votesDir: path.join(reportsRoot, 'votes'),
       learningsDir,
       learningsDirs,
+      indexLearningsDirs,
+      learningsNamespaces,
       statsDir: path.join(reportsRoot, 'stats'),
-      indexPath: path.join(teamaiHome, 'search-index.json'),
+      indexPath,
       source,
     };
   }
@@ -198,6 +236,8 @@ export async function resolveVizRoot(opts: VizOptions): Promise<VizPaths> {
     votesDir: getUserVotesDir(),
     learningsDir: getUserLearningsDir(),
     learningsDirs: [getUserLearningsDir()],
+    indexLearningsDirs: [getUserLearningsDir()],
+    learningsNamespaces: { ok: true, namespaces: [] },
     statsDir: path.join(teamaiHome, 'stats'),
     indexPath: getUserSearchIndexPath(),
     source: { scope: 'local', label: 'Local ~/.teamai · your recalls only' },
@@ -269,9 +309,16 @@ async function loadEntries(paths: VizPaths): Promise<SearchIndexEntry[]> {
     // leaving this run reading a stale corpus from a different repo.
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'teamai-viz-'));
     const tmpIndexPath = path.join(tmpDir, 'index.json');
+    const namespaces = paths.learningsNamespaces;
+    if (!namespaces.ok) {
+      // The shared root only: every namespace would show other projects' learnings.
+      console.warn(`Warning: the report shows the shared learnings only: ${namespaces.reason}. `
+        + 'Your projects\' learnings are left out until manifest/projects.yaml is fixed; `teamai doctor` shows the problem.');
+    }
     try {
       await buildIndex({
-        learningsDirs: paths.learningsDirs,
+        learningsDirs: paths.indexLearningsDirs,
+        learningsNamespaces: namespaces.ok ? namespaces.namespaces : [],
         docsDir: path.join(paths.knowledgeRoot, 'docs'),
         rulesDir: path.join(paths.knowledgeRoot, 'rules'),
         skillsDir: path.join(paths.knowledgeRoot, 'skills'),
@@ -454,5 +501,24 @@ export async function getVizSummary(opts: VizOptions = {}): Promise<VizSummary> 
     overallCoveragePct: data.overallCoveragePct,
     coverage: (data.coverage ?? []).map((stat) => ({ type: stat.type, coveragePct: stat.coveragePct })),
     source: data.source,
+  };
+}
+
+/** Read-only dashboard payload; report HTML is escaped by the existing renderer. */
+export async function getDashboardContext(opts: VizOptions = {}) {
+  const data = await buildVizData(await resolveVizRoot(opts));
+  const { renderDashboardReport } = await import('./viz-render.js');
+  return {
+    generatedAt: data.generatedAt,
+    source: data.source,
+    totalEntries: data.totalEntries,
+    overallCoveragePct: data.overallCoveragePct,
+    silentCount: data.silent.length,
+    maintenanceCounts: {
+      promote: data.maintenance.promote.length,
+      prune: data.maintenance.prune.length,
+      stale: data.maintenance.stale.length,
+    },
+    ...renderDashboardReport(data),
   };
 }

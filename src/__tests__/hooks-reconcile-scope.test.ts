@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import path from 'node:path';
 import os from 'node:os';
+import { spawnSync } from 'node:child_process';
 import fse from 'fs-extra';
 
 vi.mock('../utils/logger.js', () => ({
-  log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+  log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), persist: vi.fn() },
 }));
 
 import { reconcileTeamHooksForConfig } from '../hooks.js';
@@ -82,8 +83,8 @@ hooks:
     command: npm run lint
     timeout: 20
 `);
-    const defs = await reconcileTeamHooksForConfig(teamConfig, localConfig());
-    expect(defs).toHaveLength(1);
+    const reconciled = await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    expect(reconciled.ok && reconciled.defs).toHaveLength(1);
 
     const claude = await claudeSettings();
     expect(claude.hooks.Stop).toHaveLength(2); // built-in + team
@@ -226,6 +227,139 @@ hooks:
     expect(cursor.hooks.stop.some((h) => h.command.includes('guard-tf.sh'))).toBe(true);
   });
 
+  // #707: an invalid file used to reconcile to an empty team set, removing
+  // every installed team hook. It now keeps them for the run.
+  it('keeps the installed team hooks when hooks.yaml stops parsing', async () => {
+    await writeYaml(`
+hooks:
+  - id: lint
+    description: lint
+    event: Stop
+    command: npm run lint
+`);
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    const before = await claudeSettings();
+
+    await writeYaml('hooks: [unclosed\n');
+    const applied = await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    expect(applied).toEqual({ ok: false, builtins: 'defaults-where-none' });
+    expect(await claudeSettings()).toEqual(before);
+    expect((await manifest()).claude.map((r) => r.id)).toEqual(['lint']);
+  });
+
+  // #822: `hook:` for `hooks:` parsed as "no hooks" and removed every installed
+  // team hook, with no warning.
+  it('keeps the installed team hooks when hooks.yaml has no top-level hooks: key, and names the file and key', async () => {
+    const lint = '\n  - id: lint\n    description: lint\n    event: Stop\n    command: npm run lint\n';
+    await writeYaml(`hooks:${lint}`);
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    const before = await claudeSettings();
+    const { log } = await import('../utils/logger.js');
+    vi.mocked(log.warn).mockClear();
+
+    await writeYaml(`hook:${lint}`);
+    const applied = await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    expect(applied).toEqual({ ok: false, builtins: 'defaults-where-none' });
+    expect(await claudeSettings()).toEqual(before);
+    expect((await manifest()).claude.map((r) => r.id)).toEqual(['lint']);
+    const warnings = vi.mocked(log.warn).mock.calls.map(([m]) => String(m));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('hooks/hooks.yaml');
+    expect(warnings[0]).toContain('`hook`');
+    expect(warnings[0]).toContain('`hooks:`');
+  });
+
+  it('still applies the hooks of a hooks.yaml that carries an extra top-level key', async () => {
+    await writeYaml('version: 1\nhooks:\n  - id: lint\n    description: lint\n    event: Stop\n    command: npm run lint\n');
+
+    const applied = await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    expect(applied.ok).toBe(true);
+    expect((await manifest()).claude.map((r) => r.id)).toEqual(['lint']);
+  });
+
+  it('still reads a hooks.yaml that declares only builtin: overrides', async () => {
+    await writeYaml('builtin:\n  overrides:\n    Hook dispatch stop: { timeout: 99 }\n');
+
+    const applied = await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    expect(applied.ok).toBe(true);
+    expect((await codexSettings()).hooks.Stop[0].hooks[0].timeout).toBe(99);
+  });
+
+  // #707: a first install whose team hooks do not resolve still gets the
+  // built-in hooks, above all the session-start pull that heals the member.
+  it('installs the built-in hooks with the root overrides on a first install whose namespaces clash', async () => {
+    await fse.outputFile(path.join(repo, 'manifest', 'projects.yaml'),
+      'version: 1\nprojects:\n  - id: checkout\n    resources: { hooks: [checkout, billing] }\n');
+    await writeYaml('hooks: []\nbuiltin:\n  overrides:\n    Hook dispatch stop: { timeout: 99 }\n');
+    const clash = 'hooks:\n  - id: lint\n    description: lint\n    event: Stop\n    command: npm run lint\n';
+    await fse.outputFile(path.join(repo, 'hooks', 'checkout', 'hooks.yaml'), clash);
+    await fse.outputFile(path.join(repo, 'hooks', 'billing', 'hooks.yaml'), clash);
+
+    const applied = await reconcileTeamHooksForConfig(teamConfig, { ...localConfig(), projects: ['checkout'] });
+
+    expect(applied).toEqual({ ok: false, builtins: 'with-overrides' });
+    const claude = await claudeSettings();
+    expect(claude.hooks.SessionStart).toHaveLength(1);
+    expect(claude.hooks.SessionStart[0].hooks[0].command).toContain('hook-dispatch');
+    expect(claude.hooks.Stop.some((h) => h.hooks[0].command.includes('npm run lint'))).toBe(false);
+    expect((await codexSettings()).hooks.Stop[0].hooks[0].timeout).toBe(99);
+    expect(await fse.pathExists(path.join(home, '.teamai', 'managed-hooks.json'))).toBe(false);
+  });
+
+  it('keeps the installed team hooks and still refreshes the built-ins when a namespace file breaks', async () => {
+    await fse.outputFile(path.join(repo, 'manifest', 'projects.yaml'),
+      'version: 1\nprojects:\n  - id: checkout\n    resources: { hooks: [checkout] }\n');
+    await writeYaml('hooks:\n  - id: lint\n    description: lint\n    event: Stop\n    command: npm run lint\n');
+    const member = { ...localConfig(), projects: ['checkout'] };
+    await reconcileTeamHooksForConfig(teamConfig, member);
+    // A built-in entry that went missing (hand-edited, or shipped by an upgrade).
+    const settings = await claudeSettings();
+    delete settings.hooks.SessionStart;
+    await fse.writeJson(path.join(home, '.claude', 'settings.json'), settings);
+
+    await fse.outputFile(path.join(repo, 'hooks', 'checkout', 'hooks.yaml'), 'hooks: [unclosed\n');
+    const applied = await reconcileTeamHooksForConfig(teamConfig, member);
+
+    expect(applied).toEqual({ ok: false, builtins: 'with-overrides' });
+    const claude = await claudeSettings();
+    expect(claude.hooks.SessionStart).toHaveLength(1);
+    expect(claude.hooks.Stop.some((h) => h.hooks[0].command.includes('npm run lint'))).toBe(true);
+    expect((await cursorSettings()).hooks.stop.some((h) => h.command.includes('npm run lint'))).toBe(true);
+    expect((await manifest()).claude.map((r) => r.id)).toEqual(['lint']);
+  });
+
+  it('installs the built-in hooks with their defaults on a first install whose hooks.yaml does not parse', async () => {
+    await writeYaml('hooks: [unclosed\n');
+
+    const applied = await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    expect(applied).toEqual({ ok: false, builtins: 'defaults-where-none' });
+    expect((await claudeSettings()).hooks.SessionStart).toHaveLength(1);
+    expect((await cursorSettings()).hooks.sessionStart).toHaveLength(1);
+    expect((await codexSettings()).hooks.SessionStart).toHaveLength(1);
+  });
+
+  it('delivers an active namespace hook in place of the root hook with the same id, and back', async () => {
+    await fse.outputFile(path.join(repo, 'manifest', 'projects.yaml'),
+      'version: 1\nprojects:\n  - id: checkout\n    resources: { hooks: [checkout] }\n  - id: billing\n    resources: {}\n');
+    await writeYaml('hooks:\n  - id: lint\n    description: lint\n    event: Stop\n    command: npm run lint\n');
+    await fse.outputFile(path.join(repo, 'hooks', 'checkout', 'hooks.yaml'),
+      'hooks:\n  - id: lint\n    description: lint\n    event: Stop\n    command: npm run lint:checkout\n');
+    const stopCommands = async (): Promise<string[]> => (await claudeSettings()).hooks.Stop.map((h) => h.hooks[0]?.command ?? '');
+
+    await reconcileTeamHooksForConfig(teamConfig, { ...localConfig(), projects: ['checkout'] });
+    expect((await stopCommands()).some((c) => c.includes('npm run lint:checkout'))).toBe(true);
+    expect((await stopCommands()).some((c) => c.includes('npm run lint') && !c.includes('lint:checkout'))).toBe(false);
+
+    await reconcileTeamHooksForConfig(teamConfig, { ...localConfig(), projects: ['billing'] });
+    expect((await stopCommands()).some((c) => c.includes('npm run lint:checkout'))).toBe(false);
+    expect((await stopCommands()).some((c) => c.includes('npm run lint'))).toBe(true);
+  });
+
   it('removeAll clears built-in + team hooks', async () => {
     await writeYaml(`
 hooks:
@@ -266,8 +400,8 @@ builtin:
   });
 
   it('works with no hooks.yaml (built-in self-heal only)', async () => {
-    const defs = await reconcileTeamHooksForConfig(teamConfig, localConfig());
-    expect(defs).toEqual([]);
+    const reconciled = await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    expect(reconciled).toEqual({ ok: true, defs: [] });
     const claude = await claudeSettings();
     expect(claude.hooks.SessionStart).toHaveLength(1);
     // No manifest written when there are no team hooks.
@@ -368,4 +502,144 @@ describe('reconcileTeamHooksForConfig — legacy projectRoot sweep', () => {
     const claude = await claudeSettings();
     expect(claude.hooks.SessionStart).toHaveLength(1);
   });
+});
+
+// ── Project gate rendering per host shell ────────────────────
+//
+// A tool whose Windows hook runner is cmd.exe cannot execute a POSIX
+// `if [ "$PWD" ... ]` gate: cmd aborts on that syntax, so the whole team hook —
+// gate and payload alike — never runs. Pin the cmd rendering for those tools and
+// the POSIX rendering for everything else.
+describe('project gate rendering per host shell', () => {
+  const codebuddyOnly = {
+    toolPaths: { codebuddy: { settings: '.codebuddy/settings.json' } },
+  } as unknown as TeamaiConfig;
+
+  async function teamStopCommands(file: string): Promise<string[]> {
+    const settings = await fse.readJson(path.join(home, file));
+    return (settings.hooks.Stop ?? [])
+      .filter((e: { description?: string }) => e.description?.startsWith('[teamai:hook:'))
+      .map((e: { hooks: Array<{ command: string }> }) => e.hooks[0].command);
+  }
+
+  const telemetryYaml = (tool: string): string => `
+hooks:
+  - id: telemetry
+    description: inject telemetry
+    event: Stop
+    matcher: "*"
+    command: python3 .docs/script/inject-telemetry.py
+    tools: [${tool}]
+`;
+
+  it('renders a cmd.exe gate for a tool whose Windows hook runner is cmd.exe', async () => {
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    try {
+      await writeYaml(telemetryYaml('codebuddy'));
+      await fse.ensureDir(path.join(home, '.codebuddy'));
+      await reconcileTeamHooksForConfig(codebuddyOnly, localConfig());
+
+      const [command] = await teamStopCommands('.codebuddy/settings.json');
+      // `cd` prints the cwd into the pipe — never `%CD%` interpolated into a
+      // parsed command — and the root is caret-escaped inside `^"…^"` quotes.
+      expect(command.startsWith('cd| findstr /i /b /l /c:^"')).toBe(true);
+      expect(command).toContain(' >nul || cd| findstr /i /e /l /c:^"');
+      // Outside the project the gate must exit 0 (a non-zero status would make
+      // CodeBuddy treat UserPromptSubmit as allowed:false and block the prompt),
+      // while the payload's own status is passed through inside it.
+      expect(command.endsWith('^" >nul & if not errorlevel 1 (python3 .docs/script/inject-telemetry.py) else exit /b 0')).toBe(true);
+      expect(command).not.toContain('echo %CD%');
+      expect(command).not.toContain('&& (python3');
+      expect(command).not.toContain('$PWD');
+    } finally {
+      platformSpy.mockRestore();
+    }
+  });
+
+  it('keeps the POSIX gate for a tool whose runner is not cmd.exe', async () => {
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    try {
+      await writeYaml(telemetryYaml('claude'));
+      await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+      const [command] = await teamStopCommands('.claude/settings.json');
+      expect(command.startsWith('if [ "$PWD" = ')).toBe(true);
+      expect(command.endsWith('); fi')).toBe(true);
+    } finally {
+      platformSpy.mockRestore();
+    }
+  });
+});
+
+// ── The rendered cmd gate, executed by a real cmd.exe ────────
+//
+// The assertions above pin only the shape of the gate. These run it in real
+// directories whose names carry the characters cmd.exe re-parses — `&`, which
+// otherwise executes the rest of the directory name, plus `^`, `%` and a space
+// — because a gate that merely looks right can still run part of a path as a
+// command or silently stop matching. Windows-only: cmd.exe is the point.
+describe('project gate — real cmd.exe execution (win32)', () => {
+  const codebuddyOnly = {
+    toolPaths: { codebuddy: { settings: '.codebuddy/settings.json' } },
+  } as unknown as TeamaiConfig;
+
+  /** Render the gate for `root`, then run it from `cwd` through cmd.exe. */
+  async function renderGate(root: string, sandboxHome: string): Promise<string> {
+    await writeYaml(`
+hooks:
+  - id: gate
+    description: gate probe
+    event: Stop
+    command: echo TEAMAI_GATE_PAYLOAD
+    tools: [codebuddy]
+`);
+    await fse.ensureDir(path.join(sandboxHome, '.codebuddy'));
+    await reconcileTeamHooksForConfig(codebuddyOnly, { ...localConfig(), projectRoot: root } as LocalConfig);
+    const settings = await fse.readJson(path.join(sandboxHome, '.codebuddy', 'settings.json'));
+    const commands = (settings.hooks.Stop ?? [])
+      .filter((e: { description?: string }) => e.description?.startsWith('[teamai:hook:'))
+      .map((e: { hooks: Array<{ command: string }> }) => e.hooks[0].command);
+    expect(commands).toHaveLength(1);
+    return commands[0];
+  }
+
+  /** Run a rendered hook command the way CodeBuddy's hook runner does. */
+  function runCommand(command: string, cwd: string): { status: number | null; stdout: string } {
+    const result = spawnSync(command, { cwd, shell: true, encoding: 'utf8' });
+    return { status: result.status, stdout: result.stdout ?? '' };
+  }
+
+  it.skipIf(process.platform !== 'win32')(
+    'fires only inside the project and never executes part of the path',
+    async () => {
+      for (const name of ['plain', 'sp&x', 'a^b', 'a%b', 'a%TEMP%b', 'sp ace', 'x&echo CANARY&y']) {
+        const root = path.join(project, name);
+        const sub = path.join(root, 'sub');
+        const sibling = path.join(project, `${name}-sibling`);
+        await fse.ensureDir(sub);
+        await fse.ensureDir(sibling);
+        // A fresh HOME per project keeps the shared settings file free of the
+        // previous iteration's project-scoped entries.
+        const sandboxHome = path.join(project, 'home', name);
+        vi.stubEnv('HOME', sandboxHome);
+        const command = await renderGate(root, sandboxHome);
+
+        for (const cwd of [root, sub]) {
+          const { status, stdout } = runCommand(command, cwd);
+          expect(stdout, `${name} inside ${cwd}`).toContain('TEAMAI_GATE_PAYLOAD');
+          expect(status, `${name} inside ${cwd}`).toBe(0);
+        }
+        for (const cwd of [project, sibling]) {
+          const { status, stdout } = runCommand(command, cwd);
+          expect(stdout, `${name} outside ${cwd}`).not.toContain('TEAMAI_GATE_PAYLOAD');
+          // A mismatch must stay an exit-0 no-op: CodeBuddy reads a non-zero
+          // hook status as allowed:false and would block every prompt typed
+          // outside the project.
+          expect(status, `${name} outside ${cwd}`).toBe(0);
+        }
+        // `&` in the directory name must never split the gate into commands.
+        expect(runCommand(command, root).stdout, `${name} injection canary`).not.toMatch(/^\s*CANARY\s*$/m);
+      }
+    },
+  );
 });

@@ -217,6 +217,25 @@ scope: 'user',
     expect(names).not.toContain('ignored-skill');
   });
 
+  it('never offers the directories earlier releases deployed as new skills to push', async () => {
+    // A member who runs `teamai push --all` after upgrading but before their
+    // next pull still has the legacy trees on disk; they are the CLI's, not theirs.
+    for (const legacy of ['team-wiki-codebase', 'teamai-share-learnings', 'teamai']) {
+      const dir = path.join(homeDir, '.claude/skills', legacy);
+      await fse.ensureDir(dir);
+      await fse.writeFile(path.join(dir, 'SKILL.md'), '# packaged by an earlier release');
+    }
+    const mine = path.join(homeDir, '.claude/skills', 'teamai-workflow');
+    await fse.ensureDir(mine);
+    await fse.writeFile(path.join(mine, 'SKILL.md'), '# mine');
+
+    const names = (await handler.scanLocalForPush(teamConfig, localConfig)).map((i) => i.name);
+    expect(names).not.toContain('team-wiki-codebase');
+    expect(names).not.toContain('teamai-share-learnings');
+    expect(names).not.toContain('teamai');
+    expect(names).toContain('teamai-workflow');
+  });
+
   it('should detect both new and modified skills together', async () => {
     // Modified
     const teamSkillDir = path.join(localConfig.repo.localPath, 'skills', 'existing');
@@ -334,6 +353,37 @@ scope: 'user',
     expect(items.find((item) => item.name === 'role-skill')?.status).toBe('modified');
   });
 
+  it('keeps the role-id fallback when a valid roles.yaml no longer lists the role', async () => {
+    localConfig.primaryRole = 'hai';
+    localConfig.additionalRoles = [];
+    await fse.outputFile(
+      path.join(localConfig.repo.localPath, 'manifest', 'roles.yaml'),
+      'version: 1\nroles:\n  - id: pm\n    resources:\n      knowledge: []\n      skills: [pm]\n',
+    );
+    await fse.outputFile(path.join(localConfig.repo.localPath, 'skills', 'hai', 'role-skill', 'SKILL.md'), '# v1');
+    await fse.outputFile(path.join(homeDir, '.claude/skills', 'role-skill', 'SKILL.md'), '# v2');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    expect(items.find((item) => item.name === 'role-skill')?.status).toBe('modified');
+  });
+
+  it('stops the scan when roles.yaml exists but does not parse, instead of guessing', async () => {
+    localConfig.primaryRole = 'hai';
+    localConfig.additionalRoles = [];
+    await fse.outputFile(path.join(localConfig.repo.localPath, 'manifest', 'roles.yaml'), 'version: 1\nroles: [\n');
+
+    await expect(handler.scanLocalForPush(teamConfig, localConfig)).rejects.toThrow(/Invalid roles manifest YAML/);
+  });
+
+  it('refuses a role id that cannot be a namespace when roles.yaml is absent, instead of joining it onto the repo', async () => {
+    localConfig.primaryRole = '../../outside';
+    localConfig.additionalRoles = [];
+
+    await expect(handler.scanLocalForPush(teamConfig, localConfig)).rejects.toThrow(
+      /Invalid role id used as a skills namespace "\.\.\/\.\.\/outside"/,
+    );
+  });
+
   it('blocks skills that exist in non-allowed namespaces', async () => {
     localConfig.primaryRole = 'hai';
     localConfig.additionalRoles = [];
@@ -392,6 +442,71 @@ scope: 'user',
     expect(item!.status).toBe('modified');
     // Root-level flat skills have no namespace
     expect(item!.namespace).toBeUndefined();
+  });
+
+  it('writes an edited overridden skill back to its role namespace and leaves the root untouched', async () => {
+    // The active hai/review replaces the root review for this member (#707),
+    // so the local copy is hai's.
+    localConfig.primaryRole = 'hai';
+    localConfig.additionalRoles = [];
+    const repoSkills = path.join(localConfig.repo.localPath, 'skills');
+    await fse.outputFile(path.join(repoSkills, 'review', 'SKILL.md'), '# Root review');
+    await fse.outputFile(path.join(repoSkills, 'review', 'root-only.md'), 'root file');
+    await fse.outputFile(path.join(repoSkills, 'hai', 'review', 'SKILL.md'), '# hai review');
+    await fse.outputFile(path.join(homeDir, '.claude/skills', 'review', 'SKILL.md'), '# hai review, edited');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    const item = items.find((i) => i.name === 'review');
+    expect(item?.status).toBe('modified');
+    expect(item?.namespace).toBe('hai');
+    expect(item?.relativePath).toBe('skills/hai/review');
+
+    for (const pushed of items) await handler.pushItem(pushed, teamConfig, localConfig);
+    expect(await fse.readFile(path.join(repoSkills, 'hai', 'review', 'SKILL.md'), 'utf8')).toContain('# hai review, edited');
+    expect(await fse.readFile(path.join(repoSkills, 'review', 'SKILL.md'), 'utf8')).toBe('# Root review');
+    expect(await fse.pathExists(path.join(repoSkills, 'review', 'root-only.md'))).toBe(true);
+  });
+
+  // Pull does not deliver a directory without SKILL.md (#707), so push must
+  // not take it for the member's copy: that would publish the root skill into
+  // it, and make it a namespace skill that replaces the root one.
+  it('does not map a skill to a role namespace directory that has no SKILL.md', async () => {
+    localConfig.primaryRole = 'hai';
+    localConfig.additionalRoles = [];
+    const repoSkills = path.join(localConfig.repo.localPath, 'skills');
+    await fse.outputFile(path.join(repoSkills, 'review', 'SKILL.md'), '# Root review');
+    await fse.outputFile(path.join(repoSkills, 'hai', 'review', 'notes.md'), 'draft notes');
+    await fse.outputFile(path.join(homeDir, '.claude/skills', 'review', 'SKILL.md'), '# Root review');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+
+    const item = items.find((i) => i.name === 'review');
+    expect(item?.status).not.toBe('modified');
+    expect(item?.relativePath).not.toBe('skills/hai/review');
+  });
+
+  it('scans project skill namespaces as well as role ones', async () => {
+    const repoPath = localConfig.repo.localPath;
+    await fse.outputFile(path.join(repoPath, 'manifest', 'projects.yaml'), [
+      'version: 1',
+      'projects:',
+      '  - id: shop',
+      '    resources:',
+      '      skills: [checkout]',
+      '  - id: finance',
+      '    resources:',
+      '      skills: [billing]',
+    ].join('\n'));
+    localConfig.projects = ['shop'];
+    // `billing` sorts first; only the active project's copy is this member's.
+    await fse.outputFile(path.join(repoPath, 'skills', 'billing', 'pay', 'SKILL.md'), '# billing pay');
+    await fse.outputFile(path.join(repoPath, 'skills', 'checkout', 'pay', 'SKILL.md'), '# checkout pay');
+    await fse.outputFile(path.join(homeDir, '.claude/skills', 'pay', 'SKILL.md'), '# checkout pay, edited');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    const item = items.find((i) => i.name === 'pay');
+    expect(item?.status).toBe('modified');
+    expect(item?.relativePath).toBe('skills/checkout/pay');
   });
 
   it('detects modified skill in namespaced team repo when no primaryRole is set', async () => {
@@ -611,6 +726,30 @@ scope: 'user',
     const contribPath = path.join(destDir, 'CONTRIBUTORS');
     const content = await fse.readFile(contribPath, 'utf-8');
     expect(content).toBe('alice\ntestuser\n');
+  });
+
+  it('should mirror deleted local skill files without removing CONTRIBUTORS', async () => {
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'my-skill');
+    await fse.ensureDir(path.join(localSkillDir, 'references'));
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# My Skill');
+    await fse.writeFile(path.join(localSkillDir, 'references', 'new.md'), 'new');
+
+    const destDir = path.join(localConfig.repo.localPath, 'skills', 'my-skill');
+    await fse.ensureDir(path.join(destDir, 'references'));
+    await fse.writeFile(path.join(destDir, 'SKILL.md'), '# My Skill');
+    await fse.writeFile(path.join(destDir, 'references', 'old.md'), 'old');
+    await fse.writeFile(path.join(destDir, 'CONTRIBUTORS'), 'alice\n');
+
+    await handler.pushItem({
+      name: 'my-skill',
+      type: 'skills',
+      sourcePath: localSkillDir,
+      relativePath: 'skills/my-skill',
+    }, teamConfig, localConfig);
+
+    expect(await fse.pathExists(path.join(destDir, 'references', 'old.md'))).toBe(false);
+    expect(await fse.readFile(path.join(destDir, 'references', 'new.md'), 'utf-8')).toBe('new');
+    expect(await fse.readFile(path.join(destDir, 'CONTRIBUTORS'), 'utf-8')).toBe('alice\ntestuser\n');
   });
 
   it('should preserve existing contributors when user already listed', async () => {

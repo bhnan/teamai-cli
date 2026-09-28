@@ -7,7 +7,7 @@ import { ResourceHandler, isToolInstalledForConfig } from './resources/base.js';
 import { ruleFileExtensionForTool, usesCopilotInstructions, usesCursorMdcRules } from './resources/rule-format.js';
 import { teamRuleToCursorMdc } from './resources/cursor-mdc.js';
 import { teamRuleToCopilotInstructions } from './resources/copilot-instructions.js';
-import { resolveDocsLocalDir } from './resources/docs.js';
+import { resolveDocsDestination } from './resources/docs.js';
 import { listDirs, listFilesRecursive, pathExists, readFileSafe } from './utils/fs.js';
 import { pullRepo } from './utils/git.js';
 import { log } from './utils/logger.js';
@@ -394,7 +394,7 @@ export async function get(options: GetOptions): Promise<void> {
     }
 
     case 'docs': {
-      const localDocsDir = resolveDocsLocalDir(ctx.teamConfig, ctx.localConfig);
+      const localDocsDir = resolveDocsDestination(ctx.teamConfig, ctx.localConfig);
       const repoDocs = path.join(ctx.repo, 'docs');
       if (all) {
         if (!(await pathExists(repoDocs))) return fail('No docs in team repo');

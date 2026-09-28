@@ -3,15 +3,12 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { createRequire } from 'node:module';
 
 // ─── Helpers ─────────────────────────────────────────────
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..', '..');
 const CLI = path.join(ROOT, 'dist', 'index.js');
-
-const require = createRequire(import.meta.url);
 
 interface RunResult {
   code: number | null;
@@ -133,7 +130,7 @@ describe('tags CLI', () => {
 
   it('teamai tags list (no init) should show error', async () => {
     // Run in a temp dir with no teamai init
-    const { output, code } = await runCLI(['tags', 'list']);
+    const { output } = await runCLI(['tags', 'list']);
     // Either shows tags or shows "not initialized" error — both valid
     expect(output.length).toBeGreaterThan(0);
   });
@@ -702,10 +699,13 @@ describe('remote commands', () => {
 // of the suite depends on.
 //
 // GitHub-only: TGit's `gf` CLI authenticates via ~/.netrc, which we lose
-// when we isolate $HOME to a temp dir. `gf auth login` then triggers an
-// interactive (inheritStdio) login that no amount of stdin piping can
-// satisfy → permanent hang. GitHub provider auths via GITHUB_TOKEN env,
-// so it works fine under HOME isolation.
+// when we isolate $HOME to a temp dir, and `gf auth whoami` reads only that
+// store. The TGIT_TOKEN below cannot stand in for it: the PAT is REST-only,
+// and git.woa.com's git endpoint rejects it too. Since #711 the CLI
+// refuses to start `gf auth login` without a terminal instead of hanging on
+// it, so a TGit run here would fail fast rather than block; it still cannot
+// pass. GitHub provider auths via GITHUB_TOKEN env, so it works fine under
+// HOME isolation.
 
 const PROVIDER_IS_GITHUB =
   (process.env.TEAMAI_TEST_PROVIDER ?? 'tgit').toLowerCase() === 'github';

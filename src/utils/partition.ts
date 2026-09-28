@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import YAML from 'yaml';
 import { getUserHome } from './home.js';
 import { readFileSafe, writeFileAtomic, expandHome } from './fs.js';
+import { managedMcpWorkspaceId } from '../types.js';
 
 /**
  * Per-project data partition identity (issue #374 P1).
@@ -211,11 +212,20 @@ export function projectDataHome(anchor: string): string {
  * now-gone path and every later `pull` would silently skip the sync. The
  * rewrite is idempotent, so it also finishes an adoption that crashed between
  * the rename and the config rewrite.
+ *
+ * Under `dryRun` it renames and rewrites nothing, so a preview reads the
+ * partition where it is.
  */
-export async function resolvePartitionDir(anchor: string): Promise<string> {
+export async function resolvePartitionDir(anchor: string, options: { dryRun?: boolean } = {}): Promise<string> {
   const canonical = projectDataHome(anchor);
   const legacyDir = path.join(projectsRootDir(), legacyProjectSlug(anchor));
   if (legacyDir === canonical) return canonical; // whole-path prefix == basename (root-level anchor)
+  if (options.dryRun) {
+    // A preview adopts nothing: report the directory that holds the data now,
+    // the legacy one wherever adoption would move it.
+    const canonicalEntries = await fs.promises.readdir(canonical).catch(() => null);
+    return (await dirExists(legacyDir)) && !canonicalEntries?.length ? legacyDir : canonical;
+  }
   const dir = await adoptLegacyPartition(canonical, legacyDir);
   if (dir === canonical) await rebaseLocalPathAfterAdoption(canonical, legacyDir);
   return dir;
@@ -330,4 +340,29 @@ export async function readAnchorFile(partitionDir: string): Promise<string | nul
   } catch {
     return null;
   }
+}
+
+/**
+ * Remove `<dataHome>/workspaces/<id>/` for every checkout that no longer
+ * exists: its search index, managed-MCP record and resource cache belong to a
+ * removed worktree (#808). `worktrees` are the repo's live checkouts, realpath'd
+ * as detection keys them (listWorktrees); an empty list proves nothing, so it
+ * removes nothing. Only directories named like a workspace id are touched.
+ * Returns the removed directories.
+ */
+export async function pruneWorkspaceDirs(dataHome: string, worktrees: readonly string[]): Promise<string[]> {
+  if (worktrees.length === 0) return [];
+  const live = new Set(worktrees.map(managedMcpWorkspaceId));
+  const workspaces = path.join(dataHome, 'workspaces');
+  let entries: fs.Dirent[];
+  try {
+    entries = await fs.promises.readdir(workspaces, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const stale = entries
+    .filter((entry) => entry.isDirectory() && /^[0-9a-f]{12}$/.test(entry.name) && !live.has(entry.name))
+    .map((entry) => path.join(workspaces, entry.name));
+  await Promise.all(stale.map((dir) => fs.promises.rm(dir, { recursive: true, force: true })));
+  return stale;
 }

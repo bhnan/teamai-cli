@@ -121,7 +121,6 @@ export async function importFromRepoList(
                 explicitDomain: entry.domain,
                 dryRun,
                 output,
-                interactive: false,
                 incremental,
                 skipAutoPush: true,
                 skipEnrich,
@@ -199,7 +198,7 @@ export async function importFromRepoList(
                 '[teamai] Batch import: graph',
                 ['.'],
                 { repo: tc.repo, provider: tc.provider, reviewers: tc.reviewers },
-                { repo: lc.repo, username: lc.username },
+                { repo: lc.repo, username: lc.username, provider: lc.provider },
             );
             if (prUrl) {
                 log.success(`MR created: ${prUrl}`);

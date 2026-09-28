@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -17,15 +18,17 @@ vi.mock('../utils/logger.js', () => ({
 
 let tmpDir: string;
 let origHome: string | undefined;
-let origPpid: number;
+let origCopilotHome: string | undefined;
 
-const TEST_SESSION_ID = 'test-session';
+// The hint markers are machine-wide files in os.tmpdir() keyed by session id,
+// so a fixed id let overlapping runs of this file delete each other's (#823).
+const TEST_SESSION_ID = `test-session-${randomUUID()}`;
 
 beforeEach(async () => {
   tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-la-test-'));
   origHome = process.env.HOME;
+  origCopilotHome = process.env.COPILOT_HOME;
   process.env.HOME = tmpDir;
-  origPpid = process.ppid;
   // Bind prompt is on by default — start each test from that baseline.
   delete process.env.TEAMAI_BIND_PROMPT_ENABLED;
   // Clean hint markers (both old ppid-based and new sessionId-based)
@@ -35,6 +38,8 @@ beforeEach(async () => {
 
 afterEach(async () => {
   process.env.HOME = origHome;
+  if (origCopilotHome === undefined) delete process.env.COPILOT_HOME;
+  else process.env.COPILOT_HOME = origCopilotHome;
   delete process.env.TEAMAI_BIND_PROMPT_ENABLED;
   await fse.remove(path.join(os.tmpdir(), `teamai-bind-hint-${TEST_SESSION_ID}`));
   await fse.remove(path.join(os.tmpdir(), `teamai-bind-session-${TEST_SESSION_ID}`));
@@ -100,6 +105,40 @@ describe('local-agent: buildReportPayload disk scan', () => {
     expect(userSkills.find((s) => s.slug === 'local-skill')?.source).toBe('local');
     expect(userSkills.find((s) => s.slug === 'known-skill')?.version).toBe('1.0.0');
     expect(payload.user_level.rules.map((r) => r.slug)).toEqual(['my-rule']);
+  });
+
+  it('scans user-level resources from COPILOT_HOME for copilot, not from HOME/.github', async () => {
+    await setupConfig();
+    const manifestDir = path.join(tmpDir, '.teamai', 'local-agent');
+    await fse.writeJson(path.join(manifestDir, 'manifest.json'), {
+      scopes: { instance: { skills: { 'known-skill': { slug: 'known-skill', installed_at: 'x' } }, rules: {}, claudemd: {} } },
+    });
+
+    // Copilot relocates its whole user customization root when COPILOT_HOME is
+    // set, and its user scope is `skills`/`instructions` under that root — not
+    // the project-scope `.github/...` layout.
+    const copilotHome = path.join(tmpDir, 'copilot-home');
+    process.env.COPILOT_HOME = copilotHome;
+
+    const skillDir = path.join(copilotHome, 'skills', 'known-skill');
+    await fse.ensureDir(skillDir);
+    await fse.writeFile(
+      path.join(skillDir, 'SKILL.md'),
+      ['---', 'name: known-skill', 'version: 1.0.0', '---', '', '# skill'].join('\n'),
+    );
+    const rulesDir = path.join(copilotHome, 'instructions');
+    await fse.ensureDir(rulesDir);
+    await fse.writeFile(path.join(rulesDir, 'my-rule.instructions.md'), '# rule');
+
+    const { buildReportPayload, loadLocalAgentConfig } = await import('../local-agent.js');
+    const config = await loadLocalAgentConfig();
+    const payload = await buildReportPayload(config!, { tool: 'copilot' }) as {
+      user_level: { skills?: Array<{ slug: string; source: string }>; rules?: Array<{ slug: string }> };
+    };
+
+    expect(payload.user_level.skills?.map((s) => s.slug)).toEqual(['known-skill']);
+    expect(payload.user_level.skills?.[0]?.source).toBe('enterprise');
+    expect(payload.user_level.rules?.map((r) => r.slug)).toEqual(['my-rule']);
   });
 });
 
@@ -312,7 +351,7 @@ describe('local-agent: emitBindingHint via reportAndSyncLocalAgent', () => {
       await reportAndSyncLocalAgent({
         cwd: projectDir,
         tool: 'codebuddy',
-        event: { type: 'prompt_submit', timestamp: new Date().toISOString(), sessionId: 'test-session', tool: 'codebuddy' },
+        event: { type: 'prompt_submit', timestamp: new Date().toISOString(), sessionId: TEST_SESSION_ID, tool: 'codebuddy' },
       });
     } finally {
       process.stdout.write = origWrite;
@@ -401,7 +440,7 @@ describe('local-agent: emitBindingHint via reportAndSyncLocalAgent', () => {
       await reportAndSyncLocalAgent({
         cwd: projectDir,
         tool: 'codebuddy',
-        event: { type: 'prompt_submit', timestamp: new Date().toISOString(), sessionId: 'test-session', tool: 'codebuddy' },
+        event: { type: 'prompt_submit', timestamp: new Date().toISOString(), sessionId: TEST_SESSION_ID, tool: 'codebuddy' },
       });
     } finally {
       process.stdout.write = origWrite;
@@ -439,7 +478,7 @@ describe('local-agent: emitBindingHint via reportAndSyncLocalAgent', () => {
       await reportAndSyncLocalAgent({
         cwd: projectDir,
         tool: 'codebuddy',
-        event: { type: 'prompt_submit', timestamp: new Date().toISOString(), sessionId: 'test-session', tool: 'codebuddy' },
+        event: { type: 'prompt_submit', timestamp: new Date().toISOString(), sessionId: TEST_SESSION_ID, tool: 'codebuddy' },
       });
     } finally {
       process.stdout.write = origWrite;
@@ -475,7 +514,7 @@ describe('local-agent: emitBindingHint via reportAndSyncLocalAgent', () => {
       await reportAndSyncLocalAgent({
         cwd: projectDir,
         tool: 'codebuddy',
-        event: { type: 'prompt_submit', timestamp: new Date().toISOString(), sessionId: 'test-session', tool: 'codebuddy' },
+        event: { type: 'prompt_submit', timestamp: new Date().toISOString(), sessionId: TEST_SESSION_ID, tool: 'codebuddy' },
       });
     } finally {
       process.stdout.write = origWrite;
@@ -675,7 +714,7 @@ describe('local-agent: worktree binding inheritance', () => {
       await reportAndSyncLocalAgent({
         cwd: worktreeDir,
         tool: 'codebuddy',
-        event: { type: 'prompt_submit', timestamp: new Date().toISOString(), sessionId: 'test-session', tool: 'codebuddy' },
+        event: { type: 'prompt_submit', timestamp: new Date().toISOString(), sessionId: TEST_SESSION_ID, tool: 'codebuddy' },
       });
     } finally {
       process.stdout.write = origWrite;
@@ -1414,7 +1453,7 @@ describe('local-agent: CloudStudio sandbox suppression', () => {
       result = await reportAndSyncLocalAgent({
         cwd: projectDir,
         tool: 'codebuddy',
-        event: { type: 'prompt_submit', timestamp: new Date().toISOString(), sessionId: 'test-session', tool: 'codebuddy' },
+        event: { type: 'prompt_submit', timestamp: new Date().toISOString(), sessionId: TEST_SESSION_ID, tool: 'codebuddy' },
       });
     } finally {
       process.stdout.write = origWrite;
@@ -1643,6 +1682,37 @@ describe('local-agent: cmds[] migration', () => {
     expect(manifest.scopes.user.rules?.['doc-a']).toBeUndefined();
   });
 
+  it('syncs and removes prompts under custom COPILOT_HOME without replacing user content', async () => {
+    const copilotHome = path.join(tmpDir, 'copilot-home');
+    const instructionPath = path.join(copilotHome, 'copilot-instructions.md');
+    const userInstructions = '# Personal Copilot instructions\n';
+    process.env.COPILOT_HOME = copilotHome;
+    await fse.ensureDir(copilotHome);
+    await fse.writeFile(instructionPath, userInstructions);
+
+    const installed = await runResponse({
+      cmds: [{
+        id: 32, type: 'install_prompt_rule', handle_type: 'prompt', slug: 'copilot-doc',
+        version: '1.0.0', download_url: 'http://127.0.0.1:42100/copilot-doc.md', scope: 'user',
+      }],
+    }, undefined, 'copilot');
+
+    expect(installed.find((ack) => ack.id === 32)?.status).toBe('success');
+    const injected = await fse.readFile(instructionPath, 'utf8');
+    expect(injected).toContain(userInstructions.trim());
+    expect(injected).toContain('# content');
+
+    const removed = await runResponse({
+      cmds: [{
+        id: 33, type: 'uninstall_prompt_rule', handle_type: 'prompt', slug: 'copilot-doc',
+        scope: 'user',
+      }],
+    }, undefined, 'copilot');
+
+    expect(removed.find((ack) => ack.id === 33)?.status).toBe('success');
+    expect(await fse.readFile(instructionPath, 'utf8')).toBe(userInstructions);
+  });
+
   it('handle_type=rule routes to rule', async () => {
     const acks = await runResponse({
       cmds: [{
@@ -1705,6 +1775,23 @@ describe('local-agent: cmds[] migration', () => {
     expect(mine).toHaveLength(1);
     expect(mine[0].hooks[0].command).toBe('echo b');
     expect(mine[0].hooks[0].timeout).toBe(45);
+  });
+
+  it('passes the configured timeout through to a Pi agent hook extension', async () => {
+    const acks = await runResponse({
+      cmds: [{
+        id: 45, type: 'install_hook_rule', handle_type: 'hook', slug: 'pi-slow',
+        event: 'SessionStart', cmd: 'echo slow', timeout: 45, scope: 'user',
+      }],
+    }, undefined, 'pi');
+    expect(acks.find((a) => a.id === 45)?.status).toBe('success');
+    const extension = await fse.readFile(
+      path.join(tmpDir, '.pi', 'agent', 'extensions', 'teamai-agent-pi-slow.ts'),
+      'utf8',
+    );
+    expect(extension).toContain('}, 45000);');
+    const manifest = await fse.readJson(path.join(tmpDir, '.teamai', 'local-agent', 'agent-hooks.json'));
+    expect(manifest['pi-slow']).toMatchObject({ tool: 'pi', timeout: 45 });
   });
 
   it('install_hook_rule writes a codex hook (no description, command-matched)', async () => {

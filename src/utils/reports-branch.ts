@@ -12,10 +12,12 @@ import fse from 'fs-extra';
 import { createGit, getDefaultBranch, hasCommits } from './git.js';
 import { pathExists } from './fs.js';
 import {
+  ForeignCheckoutError,
   createBranchWorktree,
   isPublished,
   type BranchWrite,
   type EnsureWorktreeOptions,
+  type RefreshResult,
 } from './branch-worktree.js';
 import {
   REPORTS_BRANCH,
@@ -45,12 +47,61 @@ export function ensureReportsWorktree(
   return reportsBranch.ensure(localConfig, options);
 }
 
-/** Best-effort refresh of the reports worktree from origin. Never throws. */
+/**
+ * The team's votes dir on the reports checkout, or undefined when the checkout
+ * there belongs to another repository (a git/self mode switch, #808): its votes
+ * are that team's, so nothing may rank or downvote from them. No checkout yet
+ * is fine (a caller finds no file). Probes the checkout, like
+ * indexableLearningsRoots, so only for index builds and explicit commands.
+ */
+export async function indexableVotesDir(localConfig: LocalConfig): Promise<string | undefined> {
+  try {
+    await reportsBranch.checkOwner(localConfig);
+  } catch (e) {
+    if (e instanceof ForeignCheckoutError) return undefined;
+    throw e;
+  }
+  return path.join(reportsBranch.dir(localConfig), 'votes');
+}
+
+/**
+ * Best-effort refresh of the reports worktree from origin; busy when the lock
+ * cannot be taken, and then nothing is checked; failed when the checkout could
+ * not be set up. Throws only CheckoutRefusedError (#808).
+ */
 export function refreshReportsWorktree(
   localConfig: LocalConfig,
   options: EnsureReportsWorktreeOptions = {},
-): Promise<void> {
+): Promise<RefreshResult> {
   return reportsBranch.refresh(localConfig, options);
+}
+
+/**
+ * The reports checkout a reader lists from: refreshed and, if missing,
+ * created, without publishing a missing branch. While a write holds the lock,
+ * the local copy as it is: that write may be creating the checkout, so a
+ * reader must not add or remove it (#808). Throws ForeignCheckoutError when
+ * that copy is another repository's.
+ */
+export async function readableReportsWorktree(localConfig: LocalConfig): Promise<string> {
+  let refreshed = await reportsBranch.refresh(localConfig, { pushIfCreated: false });
+  // Failed: try once more, under the lock like every creation, and throw the
+  // cause if it fails again. An `ensure` here would create the checkout without
+  // the lock, while a writer that took it meanwhile creates it too (#823 item 15).
+  if (refreshed.status === 'failed') refreshed = await reportsBranch.refresh(localConfig, { pushIfCreated: false });
+  switch (refreshed.status) {
+    case 'done':
+      return reportsBranch.dir(localConfig);
+    case 'busy':
+      await reportsBranch.checkOwner(localConfig);
+      return reportsBranch.dir(localConfig);
+    case 'failed':
+      throw new Error(refreshed.reason);
+    default: {
+      const unhandled: never = refreshed;
+      throw new Error(`Unhandled refresh result: ${JSON.stringify(unhandled)}`);
+    }
+  }
 }
 
 /**

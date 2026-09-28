@@ -29,9 +29,14 @@ export function createGit(basePath?: string): SimpleGit {
  *
  * `--no-verify` is scoped to this git process. It does not write
  * `core.hooksPath` and does not change the user's ordinary `git commit`.
+ *
+ * With `paths`, commits those paths alone, taken literally, and leaves anything
+ * else staged in the checkout out of the commit and still staged. Without, it
+ * commits the whole index.
  */
-export function commitSkippingHooks(git: SimpleGit, message: string) {
-  return git.commit(message, { '--no-verify': null });
+export function commitSkippingHooks(git: SimpleGit, message: string, paths?: readonly string[]) {
+  if (paths === undefined) return git.commit(message, { '--no-verify': null });
+  return git.raw(['--literal-pathspecs', 'commit', '--no-verify', '-m', message, '--', ...paths]);
 }
 
 /**
@@ -262,10 +267,10 @@ export async function pullRepo(localPath: string): Promise<string> {
     // path appears once in status.files; subtract the untracked (not_added) ones.
     const dirtyCount = status.files.length - status.not_added.length;
     if (ahead > 0 || dirtyCount > 0) {
-      log.warn(
-        `Team repo diverged from origin/${branch}; realigning discards `
-        + `${ahead} local commit(s) and ${dirtyCount} uncommitted change(s).`,
-      );
+      const notice = `Team repo diverged from origin/${branch}; realigning discards `
+        + `${ahead} local commit(s) and ${dirtyCount} uncommitted change(s).`;
+      log.warn(notice);
+      log.persist(notice);
     }
     await git.reset(['--hard', `origin/${branch}`]);
     return 'reset to origin (diverged)';
@@ -419,7 +424,7 @@ export async function autoPushViaMR(
   message: string,
   files: string[],
   teamConfig: { repo: string; provider?: string; reviewers?: string[] },
-  localConfig: { repo: { remote: string; localPath: string }; username: string },
+  localConfig: { repo: { remote: string; localPath: string }; username: string; provider?: string },
 ): Promise<string | null> {
   try {
     const branchName = generateBranchName(localConfig.username);
@@ -450,6 +455,7 @@ export async function autoPushViaMR(
  */
 export function isMetadataOnlyDiff(diff: string): boolean {
   if (!diff.trim()) return true;
+  if (/^(?:new file mode|deleted file mode|old mode|new mode|rename from|rename to|copy from|copy to|Binary files)\b/m.test(diff)) return false;
 
   const METADATA_PATTERNS = [
     /^\s*"?lastUpdated"?\s*[:=]/i,
@@ -739,8 +745,25 @@ export interface ProjectAnchors {
  *    `/private/tmp`) does not make the same checkout look like two different ones.
  *    Case-insensitive-filesystem normalization is intentionally NOT done here; it
  *    is only needed for the P1 slug hash and belongs with that change.
+ *  - A directory's anchors are remembered for the life of the process, so the
+ *    hook that resolves them for the config and again for the event runs git
+ *    once (#809). A checkout does not change which repository it belongs to, and
+ *    a long-lived process (the dashboard server) keeps answering for a worktree
+ *    removed after it was first asked, which is what attribution wants. `null`
+ *    is not remembered: a directory can become a repository later.
  */
+const anchorsByDir = new Map<string, ProjectAnchors>();
+
 export async function resolveAnchors(cwd?: string): Promise<ProjectAnchors | null> {
+  const dir = path.resolve(cwd ?? process.cwd());
+  const known = anchorsByDir.get(dir);
+  if (known) return known;
+  const anchors = await readAnchors(cwd);
+  if (anchors) anchorsByDir.set(dir, anchors);
+  return anchors;
+}
+
+async function readAnchors(cwd?: string): Promise<ProjectAnchors | null> {
   const git = createGit(cwd);
   let toplevel: string;
   let mainWorktree: string;
@@ -840,6 +863,113 @@ export async function resetToCleanMaster(git: SimpleGit, localPath?: string): Pr
     log.debug(`Switching from stale branch '${branch}' back to ${defaultBranch}`);
     await switchToDefaultBranch(git, defaultBranch);
   }
+}
+
+/** The git blob id of a working-tree file, as `git hash-object` reports it; null if unreadable. */
+export async function hashObject(repoPath: string, filePath: string): Promise<string | null> {
+  try {
+    return (await createGit(repoPath).raw(['hash-object', '--', filePath])).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether `blob` became or stopped being the content of `filePath` in a commit
+ * reachable from `tip` (HEAD by default) after `since` (the whole history when
+ * absent). Squash- and rebase-merges rewrite commits but keep the blob, so this
+ * is what tells "our push landed here" from "somebody else created this path"
+ * when the branch itself is no longer around to ask. Null when git cannot say.
+ */
+export async function blobInHistory(
+  repoPath: string,
+  blob: string,
+  filePath: string,
+  since?: string,
+  tip = 'HEAD',
+): Promise<boolean | null> {
+  try {
+    const range = since ? `${since}..${tip}` : tip;
+    const out = await createGit(repoPath).raw(['log', range, `--find-object=${blob}`, '--format=%H', '--', filePath]);
+    return out.trim().length > 0;
+  } catch (e) {
+    log.debug(`git log --find-object failed for ${filePath}: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+/**
+ * Whether a commit reachable from `tip` (HEAD by default) after `since` deleted
+ * `filePath`. A path that exists now may still have been deleted and recreated
+ * in that range, by someone else. Null when git cannot say.
+ */
+export async function pathDeletedSince(
+  repoPath: string,
+  since: string,
+  filePath: string,
+  tip = 'HEAD',
+): Promise<boolean | null> {
+  return pathChangedSince(repoPath, since, filePath, tip, 'D');
+}
+
+/** Whether a commit reachable from `tip` after `since` added `filePath`. Null when git cannot say. */
+export async function pathAddedSince(
+  repoPath: string,
+  since: string,
+  filePath: string,
+  tip = 'HEAD',
+): Promise<boolean | null> {
+  return pathChangedSince(repoPath, since, filePath, tip, 'A');
+}
+
+async function pathChangedSince(
+  repoPath: string,
+  since: string,
+  filePath: string,
+  tip: string,
+  filter: 'A' | 'D',
+): Promise<boolean | null> {
+  try {
+    const out = await createGit(repoPath).raw(['log', `${since}..${tip}`, `--diff-filter=${filter}`, '--format=%H', '--', filePath]);
+    return out.trim().length > 0;
+  } catch (e) {
+    log.debug(`git log --diff-filter=${filter} failed for ${filePath}: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+/**
+ * The content `filePath` had in the latest commit that added it, or null. For
+ * a resource created after the last pull there is no `lastPullRev` version to
+ * compare with, and this is the version the member's copy started from.
+ */
+export async function getFileContentWhenAdded(repoPath: string, filePath: string): Promise<Buffer | null> {
+  try {
+    const sha = (await createGit(repoPath).raw(['log', 'HEAD', '--diff-filter=A', '--format=%H', '-1', '--', filePath])).trim();
+    return sha ? await getFileContentAtRev(repoPath, sha, `./${filePath}`) : null;
+  } catch (e) {
+    log.debug(`git log --diff-filter=A failed for ${filePath}: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+/** Full commit id of `rev` (HEAD by default), or null when it names none. */
+export async function getHeadCommit(localPath: string, rev = 'HEAD'): Promise<string | null> {
+  try {
+    return (await createGit(localPath).raw(['rev-parse', '--verify', `${rev}^{commit}`])).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether `absFile`'s content was, at some point on the current branch, the
+ * content of `relPath`. A local copy that matches an OLDER team version and
+ * not the current one is a stale copy nobody edited, not a local change.
+ */
+export async function isPastVersionOf(repoPath: string, absFile: string, relPath: string): Promise<boolean> {
+  const blob = await hashObject(repoPath, absFile);
+  return blob !== null && await blobInHistory(repoPath, blob, relPath) === true;
 }
 
 /**

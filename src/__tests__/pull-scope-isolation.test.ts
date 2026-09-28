@@ -6,7 +6,8 @@ import fse from 'fs-extra';
 // Issue #73 keeps project scope isolated by default. These tests also cover the
 // explicit safe-resource inheritance path without composing control-plane data.
 
-vi.mock('../config.js', () => ({
+vi.mock('../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../config.js')>()),
   requireInit: vi.fn(),
   loadState: vi.fn().mockResolvedValue({ lastPull: null, lastPullRev: null }),
   saveState: vi.fn(),
@@ -49,7 +50,7 @@ vi.mock('../source.js', () => ({
 
 vi.mock('../hooks.js', () => ({
   injectHooksToAllTools: vi.fn().mockResolvedValue(undefined),
-  reconcileTeamHooksForConfig: vi.fn().mockResolvedValue([]),
+  reconcileTeamHooksForConfig: vi.fn().mockResolvedValue({ ok: true, defs: [] }),
 }));
 
 vi.mock('../mcp-reconcile.js', () => ({
@@ -63,6 +64,7 @@ vi.mock('../team-push.js', () => ({
 vi.mock('../usage-tracker.js', () => ({
   readUsageEvents: vi.fn().mockResolvedValue([]),
   truncateUsageAfterReport: vi.fn().mockResolvedValue(undefined),
+  capUsageEvents: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../roles.js', () => ({
@@ -95,7 +97,7 @@ import { log } from '../utils/logger.js';
 import { reconcileTeamHooksForConfig } from '../hooks.js';
 import { reconcileMcpForConfig } from '../mcp-reconcile.js';
 import { reportUsageToTeam } from '../team-push.js';
-import { readUsageEvents, truncateUsageAfterReport } from '../usage-tracker.js';
+import { capUsageEvents, readUsageEvents, truncateUsageAfterReport } from '../usage-tracker.js';
 import { releaseLock } from '../update.js';
 import { SYNC_LOCK_FILENAME, type TeamaiConfig, type LocalConfig } from '../types.js';
 
@@ -202,9 +204,30 @@ describe('pull scope isolation (issue #73)', () => {
     await pull({ silent: true });
     if (success) {
       expect(truncateUsageAfterReport).toHaveBeenCalledTimes(1);
-      expect(truncateUsageAfterReport).toHaveBeenCalledWith(1);
+      expect(truncateUsageAfterReport).toHaveBeenCalledWith(1, projectConfig);
     }
     else expect(truncateUsageAfterReport).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('caps the usage file only after the report has truncated it (#788): %s', async (success) => {
+    vi.mocked(detectProjectConfig).mockResolvedValue(projectConfig);
+    vi.mocked(readUsageEvents).mockResolvedValue([{ skill: 'review', timestamp: new Date().toISOString(), tool: 'claude' }]);
+    vi.mocked(reportUsageToTeam).mockResolvedValueOnce(success);
+    await pull({ silent: true });
+    expect(capUsageEvents).toHaveBeenCalledTimes(1);
+    expect(capUsageEvents).toHaveBeenCalledWith(projectConfig);
+    const capOrder = vi.mocked(capUsageEvents).mock.invocationCallOrder[0];
+    expect(vi.mocked(reportUsageToTeam).mock.invocationCallOrder[0]).toBeLessThan(capOrder);
+    if (success) expect(vi.mocked(truncateUsageAfterReport).mock.invocationCallOrder[0]).toBeLessThan(capOrder);
+  });
+
+  it('caps the usage file of a scope with usageReport: false (#788)', async () => {
+    vi.mocked(detectProjectConfig).mockResolvedValue(null);
+    vi.mocked(loadLocalConfigForScope).mockResolvedValue(userConfig);
+    vi.mocked(loadTeamConfig).mockResolvedValue({ ...teamConfig, usageReport: false });
+    await pull({ silent: true });
+    expect(reportUsageToTeam).not.toHaveBeenCalled();
+    expect(capUsageEvents).toHaveBeenCalledWith(userConfig);
   });
 
   it.each([true, false])('keeps late completion alive without starting a second report: %s', async (success) => {
@@ -236,7 +259,7 @@ describe('pull scope isolation (issue #73)', () => {
     await vi.advanceTimersByTimeAsync(0);
     if (success) {
       expect(truncateUsageAfterReport).toHaveBeenCalledTimes(1);
-      expect(truncateUsageAfterReport).toHaveBeenCalledWith(1);
+      expect(truncateUsageAfterReport).toHaveBeenCalledWith(1, projectConfig);
     }
     else expect(truncateUsageAfterReport).not.toHaveBeenCalled();
     await pull({ silent: true });
@@ -338,6 +361,19 @@ describe('pull scope isolation (issue #73)', () => {
     );
   });
 
+  it('user mode: forwards force option to MCP reconcile', async () => {
+    vi.mocked(detectProjectConfig).mockResolvedValue(null);
+    vi.mocked(loadLocalConfigForScope).mockResolvedValue(userConfig);
+
+    await pull({ silent: true, force: true });
+
+    expect(reconcileMcpForConfig).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ force: true }),
+    );
+  });
+
   it('user mode self-repo: reportUsageToTeam receives selfConfig so business repo is never reset', async () => {
     const businessRoot = path.join(tmpDir, 'business-repo');
     const selfRepoPath = path.join(businessRoot, '.teamai');
@@ -383,5 +419,8 @@ describe('pull scope isolation (issue #73)', () => {
     // HTTP-kind repo: kind !== 'http' guard filters out both report targets,
     // so targets is empty and the business repo's team-repo dir is never reset.
     expect(reportUsageToTeam).not.toHaveBeenCalled();
+    // Its local file is the only source `teamai stats` has, so it is capped
+    // rather than consumed (#788).
+    expect(capUsageEvents).toHaveBeenCalledWith(httpProjectConfig);
   });
 });

@@ -15,15 +15,21 @@ vi.mock('../utils/logger.js', () => ({
 
 let tmpDir: string;
 let origHome: string | undefined;
+let origCopilotHome: string | undefined;
+
+const COPILOT_SERVER = 'copilot-enterprise';
 
 beforeEach(async () => {
   tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-mcp-test-'));
   origHome = process.env.HOME;
+  origCopilotHome = process.env.COPILOT_HOME;
   process.env.HOME = tmpDir;
 });
 
 afterEach(async () => {
   process.env.HOME = origHome;
+  if (origCopilotHome === undefined) delete process.env.COPILOT_HOME;
+  else process.env.COPILOT_HOME = origCopilotHome;
   await fse.remove(tmpDir);
   vi.restoreAllMocks();
 });
@@ -66,6 +72,120 @@ async function runResponse(
 
 describe('local-agent: MCP install/uninstall commands', () => {
 
+  it('uses COPILOT_HOME for user-scope install and uninstall', async () => {
+    const copilotHome = path.join(tmpDir, 'custom-copilot-home');
+    const configFile = path.join(copilotHome, 'mcp-config.json');
+    process.env.COPILOT_HOME = copilotHome;
+
+    let acks = await runResponse({
+      cmds: [{
+        id: 8990,
+        type: 'install_mcp',
+        scope: 'user',
+        slug: COPILOT_SERVER,
+        version: '1.0.0',
+        mcp_config: {
+          transport: 'http',
+          url: 'https://copilot.example.com/mcp',
+        },
+      }],
+    }, 'copilot');
+
+    expect(acks[0].status).toBe('success');
+    expect(await fse.pathExists(path.join(tmpDir, 'mcp-config.json'))).toBe(false);
+    let document = await fse.readJson(configFile);
+    expect(document.mcpServers[COPILOT_SERVER]).toEqual({
+      type: 'http',
+      tools: ['*'],
+      url: 'https://copilot.example.com/mcp',
+    });
+
+    acks = await runResponse({
+      cmds: [{
+        id: 8991,
+        type: 'uninstall_mcp',
+        scope: 'user',
+        slug: COPILOT_SERVER,
+        version: '1.0.0',
+      }],
+    }, 'copilot');
+
+    expect(acks[0].status).toBe('success');
+    document = await fse.readJson(configFile);
+    expect(document.mcpServers[COPILOT_SERVER]).toBeUndefined();
+  });
+
+  it('preserves a bare Copilot project map through install and uninstall', async () => {
+    const workspacePath = path.join(tmpDir, 'copilot-project');
+    const configFile = path.join(workspacePath, '.github', 'mcp.json');
+    const userServer = { type: 'http', url: 'https://user.example.com/mcp' };
+    await fse.ensureDir(path.dirname(configFile));
+    await fse.writeJson(configFile, { 'user-server': userServer });
+
+    let acks = await runResponse({
+      cmds: [{
+        id: 8992,
+        type: 'install_mcp',
+        scope: 'workspace',
+        workspace_path: workspacePath,
+        slug: COPILOT_SERVER,
+        version: '1.0.0',
+        mcp_config: {
+          transport: 'http',
+          url: 'https://copilot.example.com/mcp',
+        },
+      }],
+    }, 'copilot');
+
+    expect(acks[0].status).toBe('success');
+    let document = await fse.readJson(configFile);
+    expect(document['user-server']).toEqual(userServer);
+    expect(document[COPILOT_SERVER]).toEqual(expect.objectContaining({ type: 'http' }));
+    expect(document.mcpServers).toBeUndefined();
+
+    acks = await runResponse({
+      cmds: [{
+        id: 8993,
+        type: 'uninstall_mcp',
+        scope: 'workspace',
+        workspace_path: workspacePath,
+        slug: COPILOT_SERVER,
+        version: '1.0.0',
+      }],
+    }, 'copilot');
+
+    expect(acks[0].status).toBe('success');
+    document = await fse.readJson(configFile);
+    expect(document).toEqual({ 'user-server': userServer });
+  });
+
+  it('rejects an unmanaged collision in a bare Copilot project map', async () => {
+    const workspacePath = path.join(tmpDir, 'copilot-collision-project');
+    const configFile = path.join(workspacePath, '.github', 'mcp.json');
+    const existingServer = { type: 'http', url: 'https://user.example.com/mcp' };
+    await fse.ensureDir(path.dirname(configFile));
+    await fse.writeJson(configFile, { [COPILOT_SERVER]: existingServer });
+
+    const acks = await runResponse({
+      cmds: [{
+        id: 8994,
+        type: 'install_mcp',
+        scope: 'workspace',
+        workspace_path: workspacePath,
+        slug: COPILOT_SERVER,
+        version: '1.0.0',
+        mcp_config: {
+          transport: 'http',
+          url: 'https://enterprise.example.com/mcp',
+        },
+      }],
+    }, 'copilot');
+
+    expect(acks[0].status).toBe('failed');
+    expect(acks[0].error).toContain('not managed by teamai');
+    expect(await fse.readJson(configFile)).toEqual({ [COPILOT_SERVER]: existingServer });
+  });
+
   // ─── install_mcp: HTTP transport (user scope) ─────────────────────
   it('install_mcp writes server to tool MCP config and acks success', async () => {
     const acks = await runResponse({
@@ -104,6 +224,42 @@ describe('local-agent: MCP install/uninstall commands', () => {
     expect(manifest.codebuddy).toEqual(
       expect.arrayContaining([expect.objectContaining({ name: 'clawpro' })]),
     );
+  });
+
+  // A member who relocated Claude Code's root records it in the local config;
+  // the user-scope MCP file then lives inside that root (~/.claude-work/
+  // .claude.json), where a `teamai pull` would also write it.
+  it('install_mcp follows a relocated Claude Code root', async () => {
+    const relocated = path.join(tmpDir, '.claude-work');
+    await fse.ensureDir(path.join(relocated, 'skills'));
+    await fse.outputFile(path.join(tmpDir, '.teamai', 'config.yaml'), [
+      'repo:',
+      `  localPath: ${path.join(tmpDir, '.teamai', 'team-repo')}`,
+      '  remote: https://git.example.com/team/repo.git',
+      'username: tester',
+      'scope: user',
+      'toolRoots:',
+      `  claude: ${relocated}`,
+      '',
+    ].join('\n'));
+
+    const acks = await runResponse({
+      cmds: [{
+        id: 9002,
+        type: 'install_mcp',
+        scope: 'user',
+        slug: 'clawpro',
+        version: '1.0.0',
+        mcp_config: { transport: 'http', url: 'https://clawpro.example.com/mcp' },
+      }],
+    }, 'claude');
+
+    expect(acks[0].status).toBe('success');
+    const mcpConfig = await fse.readJson(path.join(relocated, '.claude.json'));
+    expect(mcpConfig.mcpServers.clawpro).toEqual(expect.objectContaining({ type: 'http' }));
+    // The default location is where a Claude Code with CLAUDE_CONFIG_DIR set
+    // never looks, so nothing may be written there.
+    expect(await fse.pathExists(path.join(tmpDir, '.claude.json'))).toBe(false);
   });
 
   // ─── install_mcp: stdio transport ─────────────────────────────────
