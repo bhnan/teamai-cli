@@ -100,6 +100,7 @@ teamai status      # Show local vs team differences
 teamai doctor      # Diagnose configuration and hook problems
 teamai list        # List resources (skills|rules|docs|env|agents|hooks|mcp)
 teamai recall <q>  # Search what the team has already learned
+teamai recall --wiki-page .wiki/<pid>/<name>wiki/.../<page>.md  # Verify a wiki page's cited originals before quoting them (implies --json; only status "verified" sources may be cited)
 ```
 
 Every other command, every flag, and the flags `--help` hides live in the
