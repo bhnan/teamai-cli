@@ -12,9 +12,9 @@ Status: draft（等待需求方对 intent/spec 的开放问题确认；确认后
 - [x] 从该 tag 建 worktree 与特性分支（未直接改主工作目录）
 - [x] 复核基线现状：`sharing` 无 wiki 段；`src/recall.ts` 的 `.wiki/` 仅输出
       `File:`/`Sources:` 纯文本；`.wiki/` 不在召回索引内
-- [ ] **待确认**：新基线是否带上 fork 线的 003/004 语义与 `get` 命令
-      （`v0.26.0-beta.5` 无 `src/get-cmd.ts`；fork 的 7 个提交仍留在
-      `feat/get-command` 与 `v0.23.0-bhnan.0` 上）
+- [x] **已确认**：新基线**不带** fork 线的 003/004 语义与 `get` 命令
+      （需求方决策，spec §9）——本需求在裸 `v0.26.0-beta.5` 上独立落地，
+      自持「`docs/<pid>/` 团队仓命名空间」这一只读约定
 - [ ] 装依赖并确认工具链：`npm ci`（worktree 无 `node_modules`）+
       `npx tsc --noEmit` 基线绿灯
 - [ ] 确认基线全量单测基线（记录既有失败数，作为零回归对照）
@@ -57,12 +57,15 @@ Status: draft（等待需求方对 intent/spec 的开放问题确认；确认后
 
 ### P2-3 接入输出
 
-- [ ] `src/recall.ts`：在 `formatResults` 的 `Sources:` 段落输出 spec §5 的
-      逐条状态（`path`/`status`/`resolved`/`sha256`/`reason`）
-- [ ] 未配置 `sharing.wiki` 时**完全不激活**（输出与基线逐字节一致）
-- [ ] **待确认（spec 9.1）**：Agent 如何拿到 Wiki 位置/页面——决定是否需要
-      扩展现有命令输出（不新增命令）
-- [ ] **待确认（spec 9.3）**：是否需要 `--json`
+- [ ] `src/recall.ts`：`recall` 增加 `--json`（spec §9.2）；人类可读输出同步
+      给出同构状态
+- [ ] `--json` 为严格 JSON：既有结果字段不变，新增 `sources[]` 的
+      `path`/`status`/`resolved`/`sha256`/`reason`
+- [ ] 未配置 `sharing.wiki` 时**完全不激活**（文本输出与基线逐字节一致，
+      JSON 不出现未经校验的 `verified`）
+- [ ] **已确认（spec §9.1）**：CLI **不输出 Wiki 位置**——位置由 Agent 按
+      `.wiki/<pid>/<name>wiki/` 规范自行定位；CLI 只在有页面锚点时工作
+- [ ] `src/index.ts`：为现有 `recall` 命令加 `--json` 选项（不新增子命令）
 
 ### P2-4 测试
 
@@ -72,7 +75,9 @@ Status: draft（等待需求方对 intent/spec 的开放问题确认；确认后
 - [ ] 单测：边界表（无 `sha256`、非法 sha256 格式、符号链接、`..` 逃逸、
       URL/目录锚点、目标为目录、多候选同名）
 - [ ] 单测：未配置 wiki 时 `formatResults` 输出与基线一致（快照）
-- [ ] E2E（真实 CLI，夹具团队仓）：按 spec §8 的 1–4 条跑通
+- [ ] 单测：`--json` 结构与封闭枚举（含不可引用必带 `reason`）
+- [ ] E2E（真实 CLI，夹具团队仓）：按 spec §8 的 1–4 条跑通，含
+      `recall --json` 的真实输出
 
 ### P2-5 文档与 skill 同步
 
@@ -103,6 +108,11 @@ Status: draft（等待需求方对 intent/spec 的开放问题确认；确认后
 
 ## 未决（阻塞 Build 的开放问题）
 
-1. 检索入口形态：位置如何交给 Agent（spec 9.1）
-2. 新基线是否带上 fork 的 003/004 语义与 `get` 命令（spec 9.2、P0）
-3. 是否需要 `--json` 机器可读通道（spec 9.3）
+2026-09-28 已全部由需求方确认，结论落在 spec §9：
+
+1. ~~检索入口形态~~ → CLI **不输出** Wiki 位置，位置由 Agent 按目录规范定位
+2. ~~新基线是否带上 fork 的 003/004 语义与 `get` 命令~~ → **不带**
+3. ~~是否需要 `--json`~~ → **需要**
+
+仅剩一处实现时按奥卡姆收敛的取舍：`sources[].allow` 是否保留（倾向删除，
+见 spec §9.3）。

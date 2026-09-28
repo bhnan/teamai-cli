@@ -1,6 +1,6 @@
 # Spec — 团队仓 Wiki 的检索与原文引用（006）
 
-Status: draft（随 plan 一并获批后实施）
+Status: draft（开放问题已由需求方确认，见 §9；实现待 plan 获批）
 
 基线：`v0.26.0-beta.5`。承接 [intent.md](./intent.md) 的问题陈述与约束；
 本文只描述行为、规则、接口与边界，不描述具体代码结构（见 plan.md）。
@@ -111,7 +111,10 @@ sharing:
 
 ## 5. 输出形态（CLI 负责并给结论）
 
-调用方（Agent）需要机器可判定的结论，而不是自己去猜路径。因此每个锚点输出：
+调用方（Agent）需要机器可判定的结论，而不是自己去猜路径。**主通道是
+`recall --json`**（§9.2）；人类可读输出同步给出同样的状态。
+
+`--json` 中每个锚点一个对象，字段如下（人类可读输出为同构的 YAML 样式）：
 
 ```
 Sources:
@@ -163,16 +166,57 @@ Sources:
 4. 未配置 `sharing.wiki` 时，`recall` 输出与基线逐字节一致（快照对比）。
 5. 单测覆盖四条判定 × 全部状态枚举；E2E 在真实夹具仓库上跑通第 1、2 条。
 
-## 9. 开放问题（需需求方确认后才进入 Build）
+## 9. 需求方确认（2026-09-28）
 
-1. **检索入口**：`.wiki/` 页面当前不在召回索引内，因此「按 Wiki 页面检索」
-   在 CLI 侧没有触发点。已确认「不新增 CLI 命令」「按目录规范推导位置」，
-   但推导出的**位置如何交给 Agent**（Agent 自己按约定读克隆目录 vs CLI 输出
-   该路径）尚未确认——两种都符合已确认约束，但决定本需求是否需要扩展现有
-   命令的输出。
-2. **新基线是否带上 fork 的 003/004 语义与 `get` 命令**：本 spec 的默认映射
-   依赖「`docs/<pid>/` 项目命名空间」这一**团队仓目录约定**（003/004 已确立，
-   且本机团队仓克隆已是该布局）。若新基线不引入 fork 的 `get` 命令，本需求
-   仍可自持该约定（只读解析，不依赖同步机制）——需确认这一取舍。
-3. **校验结果是否需要机器可读通道**：第 5 节的 YAML 样式输出对人类与 Agent
-   都可读，但既非严格 JSON 也非既有格式。是否要求 `--json`？
+原有三个开放问题已由需求方确认，作为本 spec 的决策基线：
+
+| # | 问题 | 确认结论 |
+|---|---|---|
+| 1 | 新基线是否带上 fork 的 003/004 语义与 `get` 命令 | **不带**。本需求在裸 `v0.26.0-beta.5` 上独立落地；只读解析团队仓克隆的 `.wiki/` 与 `docs/<pid>/`，不依赖 fork 的同步机制 |
+| 2 | 推导出的 Wiki 位置如何交给 Agent | **CLI 不输出 Wiki 位置**，只在文档/skill 里写清目录规范；Agent 按规范自行定位页面 |
+| 3 | 是否需要机器可读通道 | **需要**。`recall` 增加 `--json` |
+
+### 9.1 Wiki 位置的规范（由文档承载，非 CLI 输出）
+
+```
+<teamRepoClone>/.wiki/<projectId>/<name>wiki/
+```
+
+- `<teamRepoClone>` = 本地配置 `repo.localPath`（运行时解析，配置里不写绝对路径）
+- `<projectId>` = 当前目录激活的项目（`projects` 恰好一个时的唯一项）
+- `<name>wiki` = 集合 id，即调用方指名的「某个 wiki」
+
+CLI 不提供位置查询命令；位置不可推导时（无激活项目、同名多集合）由 §6 的
+边界行为在**解析阶段**如实报告，不在检索阶段猜测。
+
+### 9.2 `--json` 通道（替代 §5 的纯文本形态）
+
+`recall --json` 输出严格 JSON：既有结果字段不变，另为每个结果的锚点给出
+机器可判定对象（字段名与 §5 的键一致）：
+
+```json
+{
+  "results": [
+    {
+      "title": "…", "type": "docs", "scope": "project", "score": 21.2,
+      "file": "/…/team-repo/.wiki/teamai-cli/docs-wiki/topics/usage-guide.md",
+      "sources": [
+        { "path": "docs/usage-guide.md", "status": "verified",
+          "resolved": "/…/team-repo/docs/teamai-cli/usage-guide.md",
+          "sha256": "9437297…" },
+        { "path": "docs/usage-guide.zh-CN.md", "status": "content_changed",
+          "reason": "sha256 mismatch (expected a915b6d…, actual 0f3c1ab…)" }
+      ]
+    }
+  ]
+}
+```
+
+- `status` 的封闭枚举与 §4/§5 完全一致；不可引用时必须带 `reason`。
+- 未配置 `sharing.wiki` 时，`--json` 只输出既有字段，`sources` 为纯文本时代
+  的形态或省略——**不得**出现未经校验的 `verified`。
+
+### 9.3 仍然保留的取舍（实现时按奥卡姆收敛）
+
+- `sources[].allow`（§3.1）：目前没有真实的放宽/收窄需求，倾向**不实现**，
+  允许范围硬编码为 `docs/<pid>/`；若后续确有需要再加。
