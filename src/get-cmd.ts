@@ -8,32 +8,25 @@ import { isToolInstalledForConfig } from './resources/base.js';
 import { ruleFileExtensionForTool, usesCopilotInstructions, usesCursorMdcRules } from './resources/rule-format.js';
 import { teamRuleToCursorMdc } from './resources/cursor-mdc.js';
 import { teamRuleToCopilotInstructions } from './resources/copilot-instructions.js';
-import { resolveDocsDestination } from './resources/docs.js';
 import { listDirs, listFilesRecursive, pathExists, readFileSafe } from './utils/fs.js';
 import { pullRepo } from './utils/git.js';
 import { log } from './utils/logger.js';
-import { getUserHome } from './utils/home.js';
 import { askSelection, isInteractive } from './utils/prompt.js';
 
-const TYPES = ['skills', 'rules', 'docs', 'wiki'] as const;
-type GetType = (typeof TYPES)[number];
-
 /** The shared boundary `get` operates on (007): skills and rules only. */
-const SHARED_TYPES: readonly GetType[] = ['skills', 'rules'];
+const SHARED_TYPES = ['skills', 'rules'] as const;
+type GetType = (typeof SHARED_TYPES)[number];
 
 export interface GetOptions extends GlobalOptions {
   type?: string;
   name?: string;
   tool?: string;
   agent?: string;
-  all?: boolean;
-  diff?: boolean;
-  prune?: boolean;
   force?: boolean;
   refresh?: boolean;
 }
 
-interface Ctx {
+export interface Ctx {
   repo: string;
   localConfig: LocalConfig;
   teamConfig: TeamaiConfig;
@@ -49,100 +42,65 @@ export function isValidName(name: string): boolean {
   return !name.split('/').some((s) => s === '.' || s.length === 0);
 }
 
-/** Resolve `skills/<name>` or `skills/<ns>/<name>`; null when absent; throws on ambiguity. */
-export async function resolveSkillSource(repoSkills: string, name: string): Promise<string | null> {
+/**
+ * Resolve a SHARED skill at the shared root (`skills/<name>/SKILL.md`, 007).
+ * Namespace copies (`skills/<ns>/<name>`) are not shared sources; when the
+ * name only exists under namespaces they are reported so the caller can point
+ * the user at `pull` instead of guessing.
+ */
+export async function resolveSharedSkillSource(
+  repoSkills: string,
+  name: string,
+): Promise<{ source: string | null; namespacedOnly: string[] }> {
   const flat = path.join(repoSkills, name, 'SKILL.md');
-  if (await pathExists(flat)) return path.join(repoSkills, name);
-  const cands: string[] = [];
+  if (await pathExists(flat)) return { source: path.join(repoSkills, name), namespacedOnly: [] };
+  const namespacedOnly: string[] = [];
   for (const d of await listDirs(repoSkills)) {
-    const cand = path.join(repoSkills, d, name, 'SKILL.md');
-    if (await pathExists(cand)) cands.push(path.join(repoSkills, d, name));
+    if (await pathExists(path.join(repoSkills, d, name, 'SKILL.md'))) namespacedOnly.push(`${d}/${name}`);
   }
-  if (cands.length === 1) return cands[0];
-  if (cands.length > 1) {
-    throw new Error(
-      `'${name}' exists in multiple namespaces:\n  ${cands
-        .map((c) => `${path.basename(path.dirname(c))}/${path.basename(c)}`)
-        .join('\n  ')}`,
-    );
-  }
-  return null;
+  return { source: null, namespacedOnly: namespacedOnly.sort() };
 }
 
-/** Resolve a rule by exact relative path, `name`/`name.md`, or unique basename (any depth). */
-export async function resolveRuleSource(repoRules: string, name: string): Promise<string | null> {
+/**
+ * Resolve a SHARED rule at the rules root (`rules/<name>.md`, 007). Namespace
+ * copies (`rules/<ns>/<name>.md`) are not shared sources and are reported as
+ * `namespacedOnly` so the caller can point at `pull`.
+ */
+export async function resolveSharedRuleSource(
+  repoRules: string,
+  name: string,
+): Promise<{ source: string | null; namespacedOnly: string[] }> {
+  if (name.includes('/')) {
+    // A segmented path targets a namespace tree; shared rules live flat at the
+    // root, so report the copy without ever treating it as a shared source.
+    const rel = name.endsWith('.md') ? name : `${name}.md`;
+    return { source: null, namespacedOnly: (await pathExists(path.join(repoRules, rel))) ? [rel] : [] };
+  }
   const base = name.replace(/\.md$/, '');
-  const exact = path.join(repoRules, name);
-  if (await pathExists(exact)) return exact;
   const exactMd = path.join(repoRules, `${base}.md`);
-  if (await pathExists(exactMd)) return exactMd;
-  const cands: string[] = [];
+  if (await pathExists(exactMd)) return { source: exactMd, namespacedOnly: [] };
+  const namespacedOnly: string[] = [];
   for (const rel of await listFilesRecursive(repoRules)) {
     if (!rel.endsWith('.md')) continue;
-    const fileBase = path.basename(rel).replace(/\.md$/, '');
-    if (fileBase === base || rel === name) cands.push(path.join(repoRules, rel));
+    const parts = rel.split('/');
+    if (parts.length === 2 && parts[1]!.replace(/\.md$/, '') === base) namespacedOnly.push(rel);
   }
-  if (cands.length === 1) return cands[0];
-  if (cands.length > 1) {
-    throw new Error(`'${name}' matched multiple rule files:\n  ${cands.join('\n  ')}`);
-  }
-  return null;
+  return { source: null, namespacedOnly: namespacedOnly.sort() };
 }
 
-/** Resolve a doc by relative path; `.md` suffix optional (target keeps the real name). */
-export async function resolveDocsSource(repoDocs: string, name: string): Promise<string | null> {
-  const exact = path.join(repoDocs, name);
-  if (await pathExists(exact)) return exact;
-  const withMd = path.join(repoDocs, `${name}.md`);
-  if (await pathExists(withMd)) return withMd;
-  return null;
-}
-
-/** Discover pullable entries per type (what `get list` prints). */
+/** Discover shared entries per type (what `get list` prints): shared root only. */
 export async function listTypeEntries(repo: string, type: GetType): Promise<string[]> {
-  const dirFor: Record<GetType, string> = { skills: 'skills', rules: 'rules', docs: 'docs', wiki: '.wiki' };
-  const root = path.join(repo, dirFor[type]);
+  const root = path.join(repo, type);
   if (!(await pathExists(root))) return [];
   if (type === 'skills') {
     const out: string[] = [];
     for (const d of await listDirs(root)) {
-      if (await pathExists(path.join(root, d, 'SKILL.md'))) {
-        out.push(d);
-        continue;
-      }
-      for (const sub of await listDirs(path.join(root, d))) {
-        if (await pathExists(path.join(root, d, sub, 'SKILL.md'))) out.push(`${d}/${sub}`);
-      }
+      if (await pathExists(path.join(root, d, 'SKILL.md'))) out.push(d);
     }
     return out.sort();
   }
   const files = await listFilesRecursive(root);
-  return files.filter((f) => (type === 'docs' ? !hasDotSegment(f) : f.endsWith('.md') && !hasDotSegment(f))).sort();
-}
-
-/** Compare the team repo wiki against the local wiki (read-only). */
-export async function computeWikiDiff(
-  srcWiki: string,
-  dstWiki: string,
-): Promise<{ onlyInSrc: string[]; onlyInDst: string[]; changed: string[] }> {
-  const srcFiles = (await pathExists(srcWiki))
-    ? (await listFilesRecursive(srcWiki)).filter((f) => f.endsWith('.md') && !hasDotSegment(f)).sort()
-    : [];
-  const dstFiles = (await pathExists(dstWiki))
-    ? (await listFilesRecursive(dstWiki)).filter((f) => f.endsWith('.md') && !hasDotSegment(f)).sort()
-    : [];
-  const dstSet = new Set(dstFiles);
-  const srcSet = new Set(srcFiles);
-  const onlyInSrc = srcFiles.filter((f) => !dstSet.has(f));
-  const onlyInDst = dstFiles.filter((f) => !srcSet.has(f));
-  const changed: string[] = [];
-  for (const f of srcFiles) {
-    if (!dstSet.has(f)) continue;
-    const a = await readFileSafe(path.join(srcWiki, f));
-    const b = await readFileSafe(path.join(dstWiki, f));
-    if (a !== b) changed.push(f);
-  }
-  return { onlyInSrc, onlyInDst, changed };
+  return files.filter((f) => f.endsWith('.md') && !f.includes('/')).sort();
 }
 
 // ─── Shared-get tracking (007) ───────────────────────────
@@ -200,6 +158,26 @@ function sharedInstallKey(type: 'skills' | 'rules', agent: string, name: string)
  */
 function userScopeView(localConfig: LocalConfig): LocalConfig {
   return { ...localConfig, scope: 'user' };
+}
+
+/**
+ * The config whose state holds shared install records: the USER-scope state
+ * (~/.teamai), never a project partition. The record describes a machine-global
+ * target, so it must read identically no matter which directory `get` runs
+ * from; a record written into one project's partition would be invisible to the
+ * next run from another directory and the same install would read as
+ * `unmanaged`. When no user config exists (project-only machine), a synthetic
+ * user view still lands on ~/.teamai via getDataHome.
+ */
+async function userStateConfig(ctx: Ctx): Promise<LocalConfig> {
+  if (ctx.scope === 'user') return ctx.localConfig;
+  try {
+    const userConfig = await loadLocalConfigForScope('user');
+    if (userConfig) return userConfig;
+  } catch {
+    // fall through to the synthetic user view below
+  }
+  return { ...ctx.localConfig, scope: 'user', dataHome: undefined };
 }
 
 /**
@@ -278,7 +256,7 @@ async function recordSharedInstall(
     deployedSha: string;
   },
 ): Promise<void> {
-  const state = await loadStateForScope(ctx.localConfig);
+  const state = await loadStateForScope(await userStateConfig(ctx));
   const entry: SharedInstallRecord = {
     type: record.type,
     name: record.name,
@@ -289,7 +267,7 @@ async function recordSharedInstall(
     lastSyncedAt: new Date().toISOString(),
   };
   state.sharedInstalls = { ...state.sharedInstalls, [sharedInstallKey(record.type, record.agent, record.name)]: entry };
-  await saveStateForScope(state, ctx.localConfig);
+  await saveStateForScope(state, await userStateConfig(ctx));
 }
 
 async function loadSharedInstall(
@@ -298,7 +276,7 @@ async function loadSharedInstall(
   agent: string,
   name: string,
 ): Promise<SharedInstallRecord | undefined> {
-  const state = await loadStateForScope(ctx.localConfig);
+  const state = await loadStateForScope(await userStateConfig(ctx));
   return state.sharedInstalls?.[sharedInstallKey(type, agent, name)];
 }
 
@@ -317,9 +295,6 @@ function usage(hint?: string): void {
       '  teamai get list [skills|rules]',
       '  teamai get skills <name> [--agent <tool>] [--refresh] [--force]',
       '  teamai get rules  <name> [--agent <tool>] [--refresh] [--force]',
-      'Deprecated (legacy mirror, kept for compatibility):',
-      '  teamai get docs <name>|--all [--prune]   # mirror team docs into the local docs dir',
-      '  teamai get wiki [page] [--diff|--prune]  # mirror team wiki',
       'Shared get installs into the chosen agent\'s user-global directory and never writes project files.',
       'Options: --refresh fast-forwards the local clone first (default: offline)',
     ].join('\n'),
@@ -327,27 +302,29 @@ function usage(hint?: string): void {
   process.exitCode = 1;
 }
 
-function hasDotSegment(relativePath: string): boolean {
-  return relativePath.split('/').some((segment) => segment.startsWith('.'));
+/** Why the legacy docs/wiki mirror modes are gone and what replaces them. */
+function legacyMirrorRemoved(type: string): string {
+  return `\`get ${type}\` has been removed. It used to mirror team ${type} into the local `
+    + '(project) directory; project docs/wiki are now one-way published by `teamai push` '
+    + '(docs/<projectId>/, .wiki/<projectId>/) and read from the team repo clone, and pull '
+    + 'never deploys or cleans them.';
 }
 
-function deprecationWarning(type: 'docs' | 'wiki'): void {
-  log.warn(
-    `[deprecated] \`get ${type}\` is a legacy mirror kept for compatibility. Project ${type} are now one-way `
-      + 'published by `teamai push` and read from the team repo clone; this command may be removed in a future release.',
-  );
+function namespacedOnlyError(kind: 'Skill' | 'Rule', name: string, copies: string[]): string {
+  return `${kind} "${name}" exists only outside the shared area (under ${copies.join(', ')}). `
+    + 'Namespace resources are not shared: they arrive via `teamai pull` where the namespace is active.';
 }
 
 async function printType(ctx: Ctx, type: GetType): Promise<void> {
   const entries = await listTypeEntries(ctx.repo, type);
   if (entries.length === 0) {
-    log.info(`  (no ${type} in team repo)`);
+    log.info(`  (no shared ${type} in team repo)`);
     return;
   }
   for (const e of entries) log.info(`  ${e}`);
 }
 
-async function detectContext(): Promise<Ctx | null> {
+export async function detectContext(): Promise<Ctx | null> {
   let projectConfig: LocalConfig | null = null;
   try {
     projectConfig = await detectProjectConfig();
@@ -391,46 +368,33 @@ export async function get(options: GetOptions): Promise<void> {
   const rawType = options.type;
   // The explicit agent flag wins; the legacy positional tool argument is an alias.
   const toolOption = options.agent ?? options.tool;
+  if (rawType === 'docs' || rawType === 'wiki') {
+    fail(legacyMirrorRemoved(rawType));
+    return;
+  }
   if (!rawType || rawType === 'list') {
     const ctx = await detectContext();
     if (!ctx) return;
     const filter = rawType === 'list' ? (options.name as GetType | undefined) : undefined;
-    if (filter && !(TYPES as readonly string[]).includes(filter)) {
-      usage();
+    if (filter && filter !== 'skills' && filter !== 'rules') {
+      usage(`\`get list\` covers the shared area only (${SHARED_TYPES.join('|')}).`);
       return;
     }
-    if (!filter) {
-      log.info('[get] scope: shared, types: skills,rules (docs/wiki: pass the type explicitly)');
-    }
-    // Default listing keeps to the shared boundary; docs/wiki stay reachable
-    // for legacy users, with their deprecation said out loud.
+    if (!filter) log.info('[get] scope: shared, types: skills,rules');
     const types: GetType[] = filter ? [filter] : [...SHARED_TYPES];
     for (const t of types) {
-      if (t === 'docs' || t === 'wiki') deprecationWarning(t);
       log.info(`[${t}]`);
       await printType(ctx, t);
     }
     return;
   }
-  if (!(TYPES as readonly string[]).includes(rawType)) {
+  if (!(SHARED_TYPES as readonly string[]).includes(rawType)) {
     usage();
     return;
   }
   const type = rawType as GetType;
   const name = options.name;
-  const all = options.all === true;
-  const diff = options.diff === true;
-  const prune = options.prune === true;
   const force = options.force === true;
-
-  // Option/type combination validation (fail fast before touching anything).
-  if (diff && type !== 'wiki') return usage('`--diff` applies to wiki only');
-  if (all && type !== 'docs') return usage('`--all` applies to docs only');
-  if (prune && type !== 'wiki' && type !== 'docs') return usage('`--prune` applies to mirror modes only');
-  if (type === 'wiki' && diff && prune) return usage('`--diff` is read-only; `--prune` not applicable');
-  if (all && name) return usage('`--all` mirrors the whole directory; drop the name');
-  if (diff && name) return usage('`--diff` previews the whole wiki; drop the name');
-  if ((type === 'docs' || type === 'wiki') && toolOption) return usage('`--agent` applies to skills/rules only');
   if (name && !isValidName(name)) return fail(`Invalid path: ${name}`);
 
   const ctx = await detectContext();
@@ -446,248 +410,136 @@ export async function get(options: GetOptions): Promise<void> {
     }
   }
 
-  switch (type) {
-    case 'skills': {
-      if (!name) {
-        await printType(ctx, 'skills');
-        return;
-      }
-      let src: string | null;
-      try {
-        src = await resolveSkillSource(path.join(ctx.repo, 'skills'), name);
-      } catch (e) {
-        fail((e as Error).message);
-        return;
-      }
-      if (!src) {
-        fail(`Skill not found in team repo: ${name}. Available:`);
-        await printType(ctx, 'skills');
-        return;
-      }
-      const agent = await resolveTargetAgent(ctx, 'skills', toolOption);
-      if (!agent) return;
-      // Resource identity is the repo-relative path (`ns/name`), so a flat and a
-      // namespaced skill of the same leaf name never share a record.
-      const identity = path.relative(path.join(ctx.repo, 'skills'), src).split(path.sep).join('/');
-      const userView = userScopeView(ctx.localConfig);
-      const toolPath = scopedToolPaths(ctx.teamConfig, userView)[agent]!;
-      const target = path.join(resolveToolBaseDir(agent, userView), toolPath.skills!, name);
-      log.info(
-        `[get] scope: shared, type=skills, resource=${identity}, agent=${agent}, source=${src}, target=${target}`,
-      );
-
-      const sourceSha = await dirDigest(src);
-      const targetSha = await dirDigest(target);
-      const record = await loadSharedInstall(ctx, 'skills', agent, identity);
-      const plan = planSharedGet({
-        hasRecord: record !== undefined,
-        sourceSha,
-        targetSha,
-        baselineSourceSha: record?.sourceSha256,
-        baselineDeployedSha: record?.deployedSha256,
-      });
-      if (plan.action === 'unchanged') {
-        log.success(`✓ ${identity} is up to date for ${agent} (${target})`);
-        return;
-      }
-      if (plan.action === 'conflict' && !force) {
-        fail(describeConflict(plan, target));
-        return;
-      }
-      if (plan.action === 'conflict') {
-        log.warn(`--force: overwriting the conflicted target ${target}`);
-      }
-      await fse.remove(target);
-      await fse.ensureDir(path.dirname(target));
-      await fse.copy(src, target);
-      const deployedSha = await dirDigest(target);
-      if (sourceSha === null || deployedSha === null) {
-        return fail(`Cannot verify the installed copy at ${target}`);
-      }
-      await recordSharedInstall(ctx, {
-        type: 'skills',
-        name: identity,
-        agent,
-        sourceRelPath: `skills/${identity}`,
-        sourceSha,
-        deployedSha,
-      });
-      log.success(`✓ ${identity} → ${target} (${plan.action === 'install' ? 'installed' : 'updated'})`);
-      log.info('Tracked by `teamai get`; a later get reports conflicts instead of overwriting local edits.');
+  if (type === 'skills') {
+    if (!name) {
+      await printType(ctx, 'skills');
       return;
     }
-
-    case 'rules': {
-      if (!name) {
-        await printType(ctx, 'rules');
-        return;
-      }
-      let src: string | null;
-      try {
-        src = await resolveRuleSource(path.join(ctx.repo, 'rules'), name);
-      } catch (e) {
-        fail((e as Error).message);
-        return;
-      }
-      if (!src) {
-        fail(`Rule not found in team repo: ${name}. Available:`);
-        await printType(ctx, 'rules');
-        return;
-      }
-      const agent = await resolveTargetAgent(ctx, 'rules', toolOption);
-      if (!agent) return;
-      const rel = path.relative(path.join(ctx.repo, 'rules'), src);
-      const stem = rel.replace(/\.md$/, '').split(path.sep).join('/');
-      const userView = userScopeView(ctx.localConfig);
-      const toolPath = scopedToolPaths(ctx.teamConfig, userView)[agent]!;
-      const destDir = path.join(resolveToolBaseDir(agent, userView), toolPath.rules!);
-      const dest = path.join(destDir, `${stem}${ruleFileExtensionForTool(agent)}`);
-      log.info(`[get] scope: shared, type=rules, resource=${stem}, agent=${agent}, source=${src}, target=${dest}`);
-
-      const raw = await readFileSafe(src);
-      if (raw === null) return fail(`Cannot read rule source: ${src}`);
-      let deployedContent: string;
-      if (usesCursorMdcRules(agent)) deployedContent = teamRuleToCursorMdc(raw);
-      else if (usesCopilotInstructions(agent)) deployedContent = teamRuleToCopilotInstructions(raw);
-      else deployedContent = raw;
-      const sourceSha = crypto.createHash('sha256').update(raw, 'utf-8').digest('hex');
-      const targetSha = (await pathExists(dest)) ? await fileDigest(dest) : null;
-      const record = await loadSharedInstall(ctx, 'rules', agent, stem);
-      // The baseline deployed digest tracks the RENDERED bytes this machine
-      // wrote, so a local edit is detected per agent format, not per source.
-      const plan = planSharedGet({
-        hasRecord: record !== undefined,
-        sourceSha,
-        targetSha,
-        baselineSourceSha: record?.sourceSha256,
-        baselineDeployedSha: record?.deployedSha256,
-      });
-      if (plan.action === 'unchanged') {
-        log.success(`✓ ${stem} is up to date for ${agent} (${dest})`);
-        return;
-      }
-      if (plan.action === 'conflict' && !force) {
-        fail(describeConflict(plan, dest));
-        return;
-      }
-      if (plan.action === 'conflict') {
-        log.warn(`--force: overwriting the conflicted target ${dest}`);
-      }
-      await fse.ensureDir(destDir);
-      await fse.writeFile(dest, deployedContent, 'utf-8');
-      // Mirror official RulesHandler: drop legacy `.md` copies that these tools ignore.
-      if (usesCursorMdcRules(agent) || usesCopilotInstructions(agent)) {
-        await fse.remove(path.join(destDir, `${stem}.md`));
-      }
-      const deployedSha = await fileDigest(dest);
-      await recordSharedInstall(ctx, {
-        type: 'rules',
-        name: stem,
-        agent,
-        sourceRelPath: `rules/${rel}`.split(path.sep).join('/'),
-        sourceSha,
-        deployedSha,
-      });
-      log.success(`✓ ${stem} → ${dest} (${plan.action === 'install' ? 'installed' : 'updated'})`);
-      log.info('Tracked by `teamai get`; a later get reports conflicts instead of overwriting local edits.');
+    const { source: src, namespacedOnly } = await resolveSharedSkillSource(path.join(ctx.repo, 'skills'), name);
+    if (!src) {
+      if (namespacedOnly.length > 0) return fail(namespacedOnlyError('Skill', name, namespacedOnly));
+      fail(`Skill not found in the shared area: ${name}. Available:`);
+      await printType(ctx, 'skills');
       return;
     }
+    const agent = await resolveTargetAgent(ctx, 'skills', toolOption);
+    if (!agent) return;
+    const userView = userScopeView(ctx.localConfig);
+    const toolPath = scopedToolPaths(ctx.teamConfig, userView)[agent]!;
+    const target = path.join(resolveToolBaseDir(agent, userView), toolPath.skills!, name);
+    log.info(
+      `[get] scope: shared, type=skills, resource=${name}, agent=${agent}, source=${src}, target=${target}`,
+    );
 
-    case 'docs': {
-      deprecationWarning('docs');
-      const localDocsDir = resolveDocsDestination(ctx.teamConfig, ctx.localConfig);
-      const repoDocs = path.join(ctx.repo, 'docs');
-      if (all) {
-        if (!(await pathExists(repoDocs))) return fail('No docs in team repo');
-        await fse.ensureDir(localDocsDir);
-        await fse.copy(repoDocs, localDocsDir, {
-          overwrite: true,
-          filter: (srcPath: string) => !path.basename(srcPath).startsWith('.'),
-        });
-        if (prune) {
-          for (const rel of await listFilesRecursive(localDocsDir)) {
-            if (hasDotSegment(rel)) continue;
-            if (!(await pathExists(path.join(repoDocs, rel)))) {
-              await fse.remove(path.join(localDocsDir, rel));
-              log.info(`  − removed extra: ${rel}`);
-            }
-          }
-        }
-        log.info(`✓ docs mirrored → ${localDocsDir}`);
-        return;
-      }
-      if (!name) {
-        await printType(ctx, 'docs');
-        return;
-      }
-      const src = await resolveDocsSource(repoDocs, name);
-      if (!src) {
-        fail(`Doc not found in team repo: ${name}. Available:`);
-        await printType(ctx, 'docs');
-        return;
-      }
-      const rel = path.relative(repoDocs, src);
-      const dest = path.join(localDocsDir, rel);
-      if (await pathExists(dest)) {
-        if (!force) return fail(`Already exists: ${dest} (use --force to overwrite)`);
-      }
-      await fse.ensureDir(path.dirname(dest));
-      await fse.copy(src, dest);
-      log.info(`✓ ${rel} → ${dest}`);
+    const sourceSha = await dirDigest(src);
+    const targetSha = await dirDigest(target);
+    const record = await loadSharedInstall(ctx, 'skills', agent, name);
+    const plan = planSharedGet({
+      hasRecord: record !== undefined,
+      sourceSha,
+      targetSha,
+      baselineSourceSha: record?.sourceSha256,
+      baselineDeployedSha: record?.deployedSha256,
+    });
+    if (plan.action === 'unchanged') {
+      log.success(`✓ ${name} is up to date for ${agent} (${target})`);
       return;
     }
-
-    case 'wiki': {
-      deprecationWarning('wiki');
-      const repoWiki = path.join(ctx.repo, '.wiki');
-      const localWiki =
-        ctx.scope === 'project' && ctx.localConfig.projectRoot
-          ? path.join(ctx.localConfig.projectRoot, '.wiki')
-          : path.join(getUserHome(), '.wiki');
-      if (diff) {
-        const d = await computeWikiDiff(repoWiki, localWiki);
-        let any = false;
-        for (const f of d.onlyInSrc) { log.info(`  + ${f} (team repo only)`); any = true; }
-        for (const f of d.onlyInDst) { log.info(`  − ${f} (local only)`); any = true; }
-        for (const f of d.changed) { log.info(`  ~ ${f} (differ)`); any = true; }
-        if (!any) log.info('wiki is in sync');
-        return;
-      }
-      if (name) {
-        const src = await resolveDocsSource(repoWiki, name);
-        if (!src) {
-          fail(`Wiki page not found in team repo: ${name}. Available:`);
-          await printType(ctx, 'wiki');
-          return;
-        }
-        const rel = path.relative(repoWiki, src);
-        const dest = path.join(localWiki, rel);
-        if (await pathExists(dest)) {
-          if (!force) return fail(`Already exists: ${dest} (use --force to overwrite)`);
-        }
-        await fse.ensureDir(path.dirname(dest));
-        await fse.copy(src, dest);
-        log.info(`✓ ${rel} → ${dest}`);
-        return;
-      }
-      if (!(await pathExists(repoWiki))) return fail('No .wiki in team repo');
-      await fse.ensureDir(localWiki);
-      const copyRoot = repoWiki;
-      await fse.copy(repoWiki, localWiki, {
-        overwrite: true,
-        filter: (srcPath: string) => srcPath === copyRoot || !path.basename(srcPath).startsWith('.'),
-      });
-      if (prune) {
-        for (const rel of await listFilesRecursive(localWiki)) {
-          if (hasDotSegment(rel) || !rel.endsWith('.md')) continue;
-          if (!(await pathExists(path.join(repoWiki, rel)))) {
-            await fse.remove(path.join(localWiki, rel));
-            log.info(`  − removed extra: ${rel}`);
-          }
-        }
-      }
-      log.info(`✓ wiki mirrored → ${localWiki}`);
+    if (plan.action === 'conflict' && !force) {
+      fail(describeConflict(plan, target));
       return;
     }
+    if (plan.action === 'conflict') {
+      log.warn(`--force: overwriting the conflicted target ${target}`);
+    }
+    await fse.remove(target);
+    await fse.ensureDir(path.dirname(target));
+    await fse.copy(src, target);
+    const deployedSha = await dirDigest(target);
+    if (sourceSha === null || deployedSha === null) {
+      return fail(`Cannot verify the installed copy at ${target}`);
+    }
+    await recordSharedInstall(ctx, {
+      type: 'skills',
+      name,
+      agent,
+      sourceRelPath: `skills/${name}`,
+      sourceSha,
+      deployedSha,
+    });
+    log.success(`✓ ${name} → ${target} (${plan.action === 'install' ? 'installed' : 'updated'})`);
+    log.info('Tracked by `teamai get`; a later get reports conflicts instead of overwriting local edits.');
+    return;
   }
+
+  // type === 'rules'
+  if (!name) {
+    await printType(ctx, 'rules');
+    return;
+  }
+  const { source: src, namespacedOnly } = await resolveSharedRuleSource(path.join(ctx.repo, 'rules'), name);
+  if (!src) {
+    if (namespacedOnly.length > 0) return fail(namespacedOnlyError('Rule', name, namespacedOnly));
+    fail(`Rule not found in the shared area: ${name}. Available:`);
+    await printType(ctx, 'rules');
+    return;
+  }
+  const agent = await resolveTargetAgent(ctx, 'rules', toolOption);
+  if (!agent) return;
+  const stem = path.basename(src).replace(/\.md$/, '');
+  const userView = userScopeView(ctx.localConfig);
+  const toolPath = scopedToolPaths(ctx.teamConfig, userView)[agent]!;
+  const destDir = path.join(resolveToolBaseDir(agent, userView), toolPath.rules!);
+  const dest = path.join(destDir, `${stem}${ruleFileExtensionForTool(agent)}`);
+  log.info(`[get] scope: shared, type=rules, resource=${stem}, agent=${agent}, source=${src}, target=${dest}`);
+
+  const raw = await readFileSafe(src);
+  if (raw === null) return fail(`Cannot read rule source: ${src}`);
+  let deployedContent: string;
+  if (usesCursorMdcRules(agent)) deployedContent = teamRuleToCursorMdc(raw);
+  else if (usesCopilotInstructions(agent)) deployedContent = teamRuleToCopilotInstructions(raw);
+  else deployedContent = raw;
+  const sourceSha = crypto.createHash('sha256').update(raw, 'utf-8').digest('hex');
+  const targetSha = (await pathExists(dest)) ? await fileDigest(dest) : null;
+  const record = await loadSharedInstall(ctx, 'rules', agent, stem);
+  // The baseline deployed digest tracks the RENDERED bytes this machine
+  // wrote, so a local edit is detected per agent format, not per source.
+  const plan = planSharedGet({
+    hasRecord: record !== undefined,
+    sourceSha,
+    targetSha,
+    baselineSourceSha: record?.sourceSha256,
+    baselineDeployedSha: record?.deployedSha256,
+  });
+  if (plan.action === 'unchanged') {
+    log.success(`✓ ${stem} is up to date for ${agent} (${dest})`);
+    return;
+  }
+  if (plan.action === 'conflict' && !force) {
+    fail(describeConflict(plan, dest));
+    return;
+  }
+  if (plan.action === 'conflict') {
+    log.warn(`--force: overwriting the conflicted target ${dest}`);
+  }
+  await fse.ensureDir(destDir);
+  await fse.writeFile(dest, deployedContent, 'utf-8');
+  // Mirror official RulesHandler: drop legacy `.md` copies that these tools ignore.
+  if (usesCursorMdcRules(agent) || usesCopilotInstructions(agent)) {
+    await fse.remove(path.join(destDir, `${stem}.md`));
+  }
+  const deployedSha = await fileDigest(dest);
+  if (sourceSha === null || deployedSha === null) {
+    return fail(`Cannot verify the installed copy at ${dest}`);
+  }
+  await recordSharedInstall(ctx, {
+    type: 'rules',
+    name: stem,
+    agent,
+    sourceRelPath: `rules/${stem}.md`,
+    sourceSha,
+    deployedSha,
+  });
+  log.success(`✓ ${stem} → ${dest} (${plan.action === 'install' ? 'installed' : 'updated'})`);
+  log.info("Tracked by `teamai get`; a later get reports conflicts instead of overwriting local edits.");
 }

@@ -187,11 +187,8 @@ program
 
 program
   .command('get [type] [name] [tool]')
-  .description('Get a shared skill or rule from the team repo clone into an agent\'s user-global directory. `get list` discovers what is available. docs/wiki remain as a deprecated legacy mirror.')
+  .description('Get a shared skill or rule from the team repo clone into an agent\'s user-global directory — never into project directories. `get list` discovers what the shared area offers.')
   .option('--agent <tool>', 'Target this agent\'s user-global directory (skills/rules only; replaces the legacy positional tool argument)')
-  .option('--all', 'Mirror the whole team docs directory into the project (docs only, deprecated)')
-  .option('--diff', 'Preview team vs local wiki differences without writing (wiki only, deprecated)')
-  .option('--prune', 'Remove local files missing from the team repo (deprecated wiki/docs mirror modes)')
   .option('--force', 'Overwrite an existing or locally-edited target copy')
   .option('--refresh', 'Fast-forward the local team repo clone before reading')
   .action(async (type, name, tool, cmdOpts) => {

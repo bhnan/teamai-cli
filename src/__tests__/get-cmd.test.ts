@@ -3,12 +3,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  computeWikiDiff,
   isValidName,
   listTypeEntries,
-  resolveDocsSource,
-  resolveRuleSource,
-  resolveSkillSource,
+  resolveSharedRuleSource,
+  resolveSharedSkillSource,
 } from '../get-cmd.js';
 import { WikiHandler } from '../resources/wiki.js';
 import type { LocalConfig, TeamaiConfig } from '../types.js';
@@ -49,91 +47,93 @@ describe('isValidName', () => {
   });
 });
 
-describe('resolveSkillSource', () => {
-  it('resolves flat skills', async () => {
+describe('resolveSharedSkillSource', () => {
+  it('resolves a skill at the shared root', async () => {
     write('skills/alpha/SKILL.md', 'x');
-    expect(await resolveSkillSource(path.join(tmp, 'skills'), 'alpha')).toBe(path.join(tmp, 'skills', 'alpha'));
+    expect(await resolveSharedSkillSource(path.join(tmp, 'skills'), 'alpha')).toEqual({
+      source: path.join(tmp, 'skills', 'alpha'),
+      namespacedOnly: [],
+    });
   });
 
-  it('resolves namespaced skills', async () => {
+  it('never resolves a namespace copy; reports it as namespacedOnly', async () => {
     write('skills/ns/beta/SKILL.md', 'x');
-    expect(await resolveSkillSource(path.join(tmp, 'skills'), 'beta')).toBe(path.join(tmp, 'skills', 'ns', 'beta'));
+    expect(await resolveSharedSkillSource(path.join(tmp, 'skills'), 'beta')).toEqual({
+      source: null,
+      namespacedOnly: ['ns/beta'],
+    });
   });
 
-  it('returns null when missing', async () => {
-    expect(await resolveSkillSource(path.join(tmp, 'skills'), 'nope')).toBeNull();
-  });
-
-  it('throws on namespace ambiguity', async () => {
+  it('reports every namespace copy instead of throwing on ambiguity', async () => {
     write('skills/a/dup/SKILL.md', 'x');
     write('skills/b/dup/SKILL.md', 'x');
-    await expect(resolveSkillSource(path.join(tmp, 'skills'), 'dup')).rejects.toThrow(/multiple namespaces/);
+    expect(await resolveSharedSkillSource(path.join(tmp, 'skills'), 'dup')).toEqual({
+      source: null,
+      namespacedOnly: ['a/dup', 'b/dup'],
+    });
+  });
+
+  it('prefers the shared-root copy when both exist', async () => {
+    write('skills/shared/SKILL.md', 'x');
+    write('skills/ns/shared/SKILL.md', 'y');
+    const res = await resolveSharedSkillSource(path.join(tmp, 'skills'), 'shared');
+    expect(res.source).toBe(path.join(tmp, 'skills', 'shared'));
+  });
+
+  it('returns empty when nothing matches', async () => {
+    expect(await resolveSharedSkillSource(path.join(tmp, 'skills'), 'nope')).toEqual({
+      source: null,
+      namespacedOnly: [],
+    });
   });
 });
 
-describe('resolveRuleSource', () => {
-  it('resolves exact, suffix-optional, and deep basename', async () => {
+describe('resolveSharedRuleSource', () => {
+  it('resolves a root rule with or without the .md suffix', async () => {
     write('rules/gamma.md', 'g');
-    write('rules/a/b/deep.md', 'd');
-    const rules = path.join(tmp, 'rules');
-    expect(await resolveRuleSource(rules, 'gamma')).toBe(path.join(tmp, 'rules', 'gamma.md'));
-    expect(await resolveRuleSource(rules, 'gamma.md')).toBe(path.join(tmp, 'rules', 'gamma.md'));
-    expect(await resolveRuleSource(rules, 'a/b/deep')).toBe(path.join(tmp, 'rules', 'a', 'b', 'deep.md'));
-    expect(await resolveRuleSource(rules, 'deep')).toBe(path.join(tmp, 'rules', 'a', 'b', 'deep.md'));
+    expect(await resolveSharedRuleSource(path.join(tmp, 'rules'), 'gamma')).toEqual({
+      source: path.join(tmp, 'rules', 'gamma.md'),
+      namespacedOnly: [],
+    });
+    expect(await resolveSharedRuleSource(path.join(tmp, 'rules'), 'gamma.md')).toEqual({
+      source: path.join(tmp, 'rules', 'gamma.md'),
+      namespacedOnly: [],
+    });
   });
 
-  it('returns null when missing', async () => {
-    write('rules/gamma.md', 'g');
-    expect(await resolveRuleSource(path.join(tmp, 'rules'), 'nope')).toBeNull();
+  it('never resolves deep or namespaced copies; reports them as namespacedOnly', async () => {
+    write('rules/ns/deep.md', 'd');
+    expect(await resolveSharedRuleSource(path.join(tmp, 'rules'), 'deep')).toEqual({
+      source: null,
+      namespacedOnly: ['ns/deep.md'],
+    });
+    expect(await resolveSharedRuleSource(path.join(tmp, 'rules'), 'ns/deep')).toEqual({
+      source: null,
+      namespacedOnly: ['ns/deep.md'],
+    });
   });
-});
 
-describe('resolveDocsSource', () => {
-  it('resolves suffix-optional and subpath docs', async () => {
-    write('docs/epsilon.md', 'e');
-    write('docs/sub/zeta.md', 'z');
-    const docs = path.join(tmp, 'docs');
-    expect(await resolveDocsSource(docs, 'epsilon')).toBe(path.join(tmp, 'docs', 'epsilon.md'));
-    expect(await resolveDocsSource(docs, 'epsilon.md')).toBe(path.join(tmp, 'docs', 'epsilon.md'));
-    expect(await resolveDocsSource(docs, 'sub/zeta')).toBe(path.join(tmp, 'docs', 'sub', 'zeta.md'));
+  it('returns empty when nothing matches', async () => {
+    expect(await resolveSharedRuleSource(path.join(tmp, 'rules'), 'nope')).toEqual({
+      source: null,
+      namespacedOnly: [],
+    });
   });
 });
 
 describe('listTypeEntries', () => {
-  it('lists skills (flat + ns), rules, docs, wiki', async () => {
+  it('lists only shared-root entries for skills and rules', async () => {
     write('skills/alpha/SKILL.md', 'x');
     write('skills/ns/beta/SKILL.md', 'x');
     write('rules/gamma.md', 'g');
-    write('docs/epsilon.md', 'e');
-    write('.wiki/Home.md', 'h');
-    expect(await listTypeEntries(tmp, 'skills')).toEqual(['alpha', 'ns/beta']);
+    write('rules/ns/delta.md', 'd');
+    expect(await listTypeEntries(tmp, 'skills')).toEqual(['alpha']);
     expect(await listTypeEntries(tmp, 'rules')).toEqual(['gamma.md']);
-    expect(await listTypeEntries(tmp, 'docs')).toEqual(['epsilon.md']);
-    expect(await listTypeEntries(tmp, 'wiki')).toEqual(['Home.md']);
   });
 
   it('returns empty for missing directories', async () => {
-    expect(await listTypeEntries(tmp, 'wiki')).toEqual([]);
-  });
-});
-
-describe('computeWikiDiff', () => {
-  it('detects changed / only-in-src / only-in-dst', async () => {
-    write('.wiki/arch/a.md', 'v1');
-    write('.wiki/Home.md', 'h');
-    write('local/.wiki/arch/a.md', 'v2');
-    write('local/.wiki/keep.md', 'k');
-    const diff = await computeWikiDiff(path.join(tmp, '.wiki'), path.join(tmp, 'local', '.wiki'));
-    expect(diff.changed).toEqual(['arch/a.md']);
-    expect(diff.onlyInSrc).toEqual(['Home.md']);
-    expect(diff.onlyInDst).toEqual(['keep.md']);
-  });
-
-  it('treats a missing local wiki as entirely new', async () => {
-    write('.wiki/Home.md', 'h');
-    const diff = await computeWikiDiff(path.join(tmp, '.wiki'), path.join(tmp, 'local', '.wiki'));
-    expect(diff.onlyInSrc).toEqual(['Home.md']);
-    expect(diff.onlyInDst).toEqual([]);
+    expect(await listTypeEntries(tmp, 'skills')).toEqual([]);
+    expect(await listTypeEntries(tmp, 'rules')).toEqual([]);
   });
 });
 
