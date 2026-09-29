@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "profile": "software",
+  "purpose": "TeamAI CLI fork 项目知识库：需求链（001-007）、设计文档、使用指南与 CI 约定的结构化检索入口",
+  "sources": [
+    "docs"
+  ],
+  "extensions": [
+    ".md"
+  ],
+  "exclude": [],
+  "page_dirs": {
+    "topic": "topics"
+  },
+  "max_source_bytes": 300000
+}
