@@ -91,3 +91,15 @@ Status: in_progress（实现与验证已完成，见下方记录；发布准备 
 - 文档同步：`skill-data/core|setup` 相关文件、`docs/usage-guide.{md,zh-CN.md}`、`skill-data/core/references/commands.md`（`commands-reference -u` 再生成）。
 
 P4（发布准备：升级说明、迁移预览指引、发布授权）未开始。不可标记 completed。
+
+## 计划状态 — 2026-09-29 需求方复核修正（get 收紧 + put 新增）
+
+需求方按已确认 intent 复核分支行为，发现 get 三处偏差并拍板新增 put：
+
+1. **`get docs` / `get wiki` 遗留镜像仍写项目目录**（docs 目标在项目作用域锚回 `projectRoot`，wiki 写 `<projectRoot>/.wiki`），违反"项目内执行零项目写入"。已移除两个镜像分支与 `--all/--diff/--prune`：显式传入即非零退出并指引到 push 单向发布 + 团队仓副本读取。
+2. **namespace 副本可被 get 解析**（`skills/<ns>/<name>` 单候选回退），违反"get 只接受共享区"。源解析收紧为共享根（`skills/<name>/`、`rules/<name>.md`）；仅存在于 namespace 的名字报错并列出副本，指引 `pull`。
+3. **`sharedInstalls` 记录写入项目分区 state**：目标目录是机器全局的，记录必须跨目录一致，否则换目录重复 get 误报 unmanaged conflict。记录改为始终落在 user 级 state（`~/.teamai/state.json`；无 user 配置的纯项目机器用合成 user 视图落 `~/.teamai`）。
+
+新增 **`teamai put skills <path>|rules <file> [--namespace <ns>]`**（需求方拍板，作为 get 的同型反向命令）：把本地单个 skill/rule 经既有 provider 分支/PR 管线（`pushGroup`：回滚、marketplace 刷新、PR 复用）发布到团队仓共享根；`--namespace` 发布到 namespace。`push --skill` 行为不变（共享区收敛留待后续 push 改造统一处理）。
+
+验证：`npx tsc --noEmit` 通过；`npm run build` 成功；`scripts/e2e-007.sh` 扩至 **37/37 通过**（新增：项目目录零写入断言、安装记录在 user state 且不在项目分区的断言、namespace-only skill/rule 拒绝、`get docs/wiki` 拒绝、put 发布→合并→`get --refresh` 回环）；`npx vitest run` 全量结果见提交记录。文档同步：双语 usage-guide（get 收紧 + put 章节）、`skill-data/core/SKILL.md`、`contribute-member.md`、`commands.md` 再生成。

@@ -382,7 +382,7 @@ export function collectUnsafeDirtyPaths(
  * The caller distinguishes these so the `push` webhook fires only after a real
  * completed push — never on a no-change or PR-creation-failed run (#702 follow-up).
  */
-type PushGroupOutcome = 'pushed' | 'nochange' | 'pr-failed' | 'failed';
+export type PushGroupOutcome = 'pushed' | 'nochange' | 'pr-failed' | 'failed';
 
 /**
  * The paths that would make `placedAt` a second copy of the same resource.
@@ -549,7 +549,7 @@ async function placeNewResources(args: {
  * open (or update) the matching PR. On a thrown failure it rolls back the copies
  * so the next scan sees a clean tree and returns `'failed'`.
  */
-async function pushGroup(args: {
+export async function pushGroup(args: {
   group: PushGroup;
   teamConfig: TeamaiConfig;
   localConfig: LocalConfig;

@@ -97,6 +97,7 @@ says so and why.)
 teamai pull        # Sync the four resource types (skills, rules, env, agents) into this project's AI tools now
 teamai push        # Publish project resources: skills, rules, env, agents + one-way docs and wiki
 teamai get skills <name> --agent <tool>   # Install or update one shared skill into an agent's global directory
+teamai put skills <path>                  # Publish one local skill into the team repo shared area (get's counterpart)
 teamai status      # Show local vs team differences
 teamai doctor      # Diagnose configuration and hook problems
 teamai list        # List resources (skills|rules|docs|env|agents|hooks|mcp)

@@ -846,9 +846,24 @@ teamai get skills deploy --agent claude --force     # overwrite a conflicted tar
 ```
 
 - **Agent selection.** `--agent <tool>` (or the legacy positional tool argument) names the target explicitly. Without it, the single installed agent derives; several installed agents ask interactively, and a non-interactive run with several candidates fails instead of guessing.
-- **Repeat gets are three-way compared.** TeamAI records what it installed, from where, and what it wrote. A repeat run reports `unchanged` (nothing rewritten), safely `update`s when the team repo copy moved and your copy did not, and **reports a conflict instead of overwriting** when your installed copy was edited locally (`--force` discards it after the conflict is shown), when both sides changed, or when the target exists but was never installed by `get`.
+- **Sources come from the shared root only.** `get` resolves `skills/<name>/` and `rules/<name>.md` at the team repo's shared root. A name that only exists under a namespace (`skills/<ns>/<name>`) is rejected with the copies listed — namespace resources arrive via `pull` where the namespace is active, and never fall back to `get`.
+- **Repeat gets are three-way compared.** TeamAI records what it installed, from where, and what it wrote (in the user-scope state, not per project, so the record reads the same from any directory). A repeat run reports `unchanged` (nothing rewritten), safely `update`s when the team repo copy moved and your copy did not, and **reports a conflict instead of overwriting** when your installed copy was edited locally (`--force` discards it after the conflict is shown), when both sides changed, or when the target exists but was never installed by `get`.
 - **--refresh** only fast-forwards the local team-repo clone; it never runs a resource pull or any hook/MCP/usage side effects, and a failed refresh says plainly that the run used the existing (possibly stale) clone.
-- `get docs` / `get wiki` are deprecated legacy mirrors kept for compatibility; they print a deprecation warning and may be removed in a future release. Project docs and wiki are one-way published by `push` and read from the clone.
+- `get docs` / `get wiki` have been removed. They used to mirror team docs/wiki into the local (project) directory; project docs and wiki are one-way published by `push` and read from the clone, and pull never deploys or cleans them.
+
+### Publish a shared skill or rule (put)
+
+`teamai put` is the counterpart of `get`: it publishes **one** local skill or rule into the team repo's **shared area**, through the same provider branch/PR flow as `push` (your working tree is never committed to directly, and a failed publish rolls the clone back).
+
+```bash
+teamai put skills ~/skills/my-skill          # publish into skills/my-skill (shared root)
+teamai put rules ./style.md                  # publish into rules/style.md
+teamai put skills ~/skills/my-skill --namespace backend   # into skills/backend/my-skill
+```
+
+- The default destination is the **shared root** — exactly what every teammate can `teamai get` into their agent's global directory. `--namespace <ns>` targets a role/project namespace instead (`skills/<ns>/<name>`), which is delivered by `pull` where that namespace is active.
+- Publishing goes through the provider's branch/PR flow, exactly like `push`: the clone's default branch is never committed to directly. With `provider: git` there is no PR — the branch is the publish, and the run says so.
+- Once merged, teammates install it with `teamai get skills <name> --agent <tool>`.
 
 ### Check status
 

@@ -57,13 +57,15 @@ Generated: do not edit by hand. Regenerate with
 
 ## get
 
-- `teamai get [type] [name] [tool]` — Get a shared skill or rule from the team repo clone into an agent's user-global directory. `get list` discovers what is available. docs/wiki remain as a deprecated legacy mirror.
+- `teamai get [type] [name] [tool]` — Get a shared skill or rule from the team repo clone into an agent's user-global directory — never into project directories. `get list` discovers what the shared area offers.
   - `--agent <tool>` — Target this agent's user-global directory (skills/rules only; replaces the legacy positional tool argument)
-  - `--all` — Mirror the whole team docs directory into the project (docs only, deprecated)
-  - `--diff` — Preview team vs local wiki differences without writing (wiki only, deprecated)
-  - `--prune` — Remove local files missing from the team repo (deprecated wiki/docs mirror modes)
   - `--force` — Overwrite an existing or locally-edited target copy
   - `--refresh` — Fast-forward the local team repo clone before reading
+
+## put
+
+- `teamai put [type] [name]` — Publish one local skill or rule into the team repo shared area (the counterpart of `get`). Default destination is the shared root; --namespace targets a role/project namespace.
+  - `--namespace <ns>` — Publish into a namespace directory (skills/<ns>/<name>) instead of the shared root
 
 ## status
 

@@ -753,9 +753,24 @@ teamai get skills deploy --agent claude --force     # 覆盖先前列出的冲�
 ```
 
 - **Agent 选择。** `--agent <tool>`（或旧的位置参数 tool）显式指定目标。省略时唯一已安装的 Agent 自动推导；多个已安装 Agent 会交互询问；非交互且有多个候选时直接报错，不做猜测。
-- **重复 get 做三方比较。** TeamAI 记录安装来源与写入内容。重复运行报告 `unchanged`（不重写）、团队仓副本更新且本地未改时安全 `update`，而本地已改动的安装副本会**报告冲突而不是覆盖**（`--force` 在展示冲突后丢弃本地版本）；两端都改、或目标存在但不是 get 安装的，同样报告冲突。
+- **来源仅限共享区根。** `get` 只解析团队仓共享根下的 `skills/<name>/` 与 `rules/<name>.md`。仅存在于 namespace（`skills/<ns>/<name>`）的名字会被拒绝并列出副本——namespace 资源由 `pull` 在 namespace 生效的项目里下发，绝不回退到 `get`。
+- **重复 get 做三方比较。** TeamAI 记录安装来源与写入内容（记录保存在 user 级状态里，不随项目分区走，从任何目录运行读到的都是同一份）。重复运行报告 `unchanged`（不重写）、团队仓副本更新且本地未改时安全 `update`，而本地已改动的安装副本会**报告冲突而不是覆盖**（`--force` 在展示冲突后丢弃本地版本）；两端都改、或目标存在但不是 get 安装的，同样报告冲突。
 - **--refresh** 只快进本地团队仓 clone；绝不运行资源 pull，也没有任何 hook/MCP/usage 副作用；刷新失败会明确说明本次用的是现有（可能过期的）clone。
-- `get docs` / `get wiki` 是保留兼容的弃用镜像，会打印弃用警告，未来版本可能移除。项目 docs 与 wiki 由 `push` 单向发布，从 clone 读取。
+- `get docs` / `get wiki` 已移除。它们过去把团队 docs/wiki 镜像到本地（项目）目录；现在项目 docs 与 wiki 由 `push` 单向发布、从团队仓副本读取，pull 不部署也不清理它们。
+
+### 发布共享 skill 或 rule（put）
+
+`teamai put` 是 `get` 的反向操作：把**一个**本地 skill 或 rule 发布到团队仓**共享区**，走与 `push` 相同的 provider 分支/PR 流程（不直接提交你的工作区，发布失败会回滚 clone 的改动）。
+
+```bash
+teamai put skills ~/skills/my-skill          # 发布到 skills/my-skill（共享根）
+teamai put rules ./style.md                  # 发布到 rules/style.md
+teamai put skills ~/skills/my-skill --namespace backend   # 发布到 skills/backend/my-skill
+```
+
+- 默认目标是**共享根**——正是每个成员都能 `teamai get` 安装到自己 Agent 全局目录的内容。`--namespace <ns>` 改为发布到角色/项目 namespace（`skills/<ns>/<name>`），由 `pull` 在该 namespace 生效处下发。
+- 发布走 provider 的分支/PR 流程，与 `push` 完全一致：不会直接提交 clone 的默认分支。`provider: git` 没有 PR——推送的分支即发布结果，命令会明确说明。
+- 合并后，成员用 `teamai get skills <name> --agent <tool>` 安装。
 
 ### 查看状态
 

@@ -93,6 +93,9 @@ The doc lands in the team's `learnings/` and appears for teammates on their next
    ```
 
    To publish into a specific role namespace: `teamai push --skill <path> --role <id>`.
+   To share one local skill or rule directly at the shared root — exactly what
+   every teammate can `teamai get` — use `teamai put skills <path>` /
+   `teamai put rules <file>` (`--namespace <ns>` targets a namespace instead).
 
    Pushing docs and wiki: `teamai push` also one-way publishes the project's own
    `docs/` and `.wiki/` into `docs/<project>/` and `.wiki/<project>/` in the team

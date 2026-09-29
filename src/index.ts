@@ -198,6 +198,16 @@ program
   });
 
 program
+  .command('put [type] [name]')
+  .description('Publish one local skill or rule into the team repo shared area (the counterpart of `get`). Default destination is the shared root; --namespace targets a role/project namespace.')
+  .option('--namespace <ns>', 'Publish into a namespace directory (skills/<ns>/<name>) instead of the shared root')
+  .action(async (type, name, cmdOpts) => {
+    const globalOpts = program.opts() as GlobalOptions;
+    const { put } = await import('./put-cmd.js');
+    await put({ ...globalOpts, ...cmdOpts, type, name });
+  });
+
+program
   .command('status')
   .description('Show local vs team repo diff')
   .option('--all', 'List every project data partition under ~/.teamai/projects (flags stale/orphan ones)')
