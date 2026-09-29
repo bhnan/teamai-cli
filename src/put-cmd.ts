@@ -127,6 +127,18 @@ export async function put(options: PutOptions): Promise<void> {
       + `(${namespace ? `namespace ${namespace}` : 'shared root'}), source=${sourcePath}`,
   );
 
+  if (options.dryRun) {
+    // Read-only resolution above touched nothing; publishing (team repo copy,
+    // branch, PR, pending-push record) all happen inside pushGroup, which a
+    // dry run never reaches.
+    log.info(
+      `[dry-run] Would publish ${sourcePath} → ${relativePath} `
+        + `(${namespace ? `namespace ${namespace}` : 'shared root'}) via the provider branch/PR flow. `
+        + 'Nothing was written and no branch was pushed.',
+    );
+    return;
+  }
+
   const pushState = await loadStateForScope(ctx.localConfig);
   const outcome = await pushGroup({
     group: { items: [item] },

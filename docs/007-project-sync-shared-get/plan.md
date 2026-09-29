@@ -103,3 +103,13 @@ P4（发布准备：升级说明、迁移预览指引、发布授权）未开始
 新增 **`teamai put skills <path>|rules <file> [--namespace <ns>]`**（需求方拍板，作为 get 的同型反向命令）：把本地单个 skill/rule 经既有 provider 分支/PR 管线（`pushGroup`：回滚、marketplace 刷新、PR 复用）发布到团队仓共享根；`--namespace` 发布到 namespace。`push --skill` 行为不变（共享区收敛留待后续 push 改造统一处理）。
 
 验证：`npx tsc --noEmit` 通过；`npm run build` 成功；`scripts/e2e-007.sh` 扩至 **37/37 通过**（新增：项目目录零写入断言、安装记录在 user state 且不在项目分区的断言、namespace-only skill/rule 拒绝、`get docs/wiki` 拒绝、put 发布→合并→`get --refresh` 回环）；`npx vitest run` 全量结果见提交记录。文档同步：双语 usage-guide（get 收紧 + put 章节）、`skill-data/core/SKILL.md`、`contribute-member.md`、`commands.md` 再生成。
+
+## 计划状态 — 2026-09-29 第二轮复核修正
+
+需求方指出两处实现缺口并确认一项语义：
+
+1. **get/put 未处理全局 `--dry-run`**：已实现。get dry-run 解析来源/Agent/目标并报告三方计划（Would install/update、已最新、将命中的冲突），零写入、零记录改动；与 pull 的 dry-run 一致，`--refresh` 仍快进 clone。put dry-run 打印解析出的来源与目标，不进 pushGroup（不复制团队仓、不推分支、不开 PR、不动 pending-push 记录）。
+2. **显式 namespace 路径仍可命中命名空间资源**：`resolveSharedSkillSource` 对含 `/` 的名字一律不解析——共享根是平铺的，分段路径只可能指向 namespace 树；存在则按 namespacedOnly 报告并指引 pull，不存在按未找到处理。
+3. **pull 省略 `--project` 的多激活语义**（确认现状即为目标行为，不改代码）：无 `--project` 时对当前目录全部激活项目生效（`[pull] scope: project=a,b,…`），`--project` 收窄到单个；push 保持多激活必须显式指定（发布 namespace 存在歧义）。补 e2e 断言与双语文档说明。
+
+验证：e2e-007.sh 新增 get --dry-run 零写入、put --dry-run 远端分支数不变、显式 namespace 路径拒绝、双项目激活 pull（demo+demo2 部署 demo2/extra 并报告 project=demo,demo2）与 `--project demo` 收窄共 7 项断言；单测补显式 namespace 路径用例。全量门槛见提交记录。

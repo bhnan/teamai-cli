@@ -52,6 +52,13 @@ export async function resolveSharedSkillSource(
   repoSkills: string,
   name: string,
 ): Promise<{ source: string | null; namespacedOnly: string[] }> {
+  if (name.includes('/')) {
+    // The shared root is flat: a segmented name can only point into a
+    // namespace tree, so it is never resolved — not by fallback and not when
+    // the caller spells the namespace path out.
+    const exists = await pathExists(path.join(repoSkills, name, 'SKILL.md'));
+    return { source: null, namespacedOnly: exists ? [name] : [] };
+  }
   const flat = path.join(repoSkills, name, 'SKILL.md');
   if (await pathExists(flat)) return { source: path.join(repoSkills, name), namespacedOnly: [] };
   const namespacedOnly: string[] = [];
@@ -310,6 +317,25 @@ function legacyMirrorRemoved(type: string): string {
     + 'never deploys or cleans them.';
 }
 
+/**
+ * What a `--dry-run` get reports per plan action. A dry run reads the source
+ * and the target to compute the plan but writes nothing and does not touch the
+ * install records (not even for a would-be conflict takeover).
+ */
+function reportDryRun(plan: SharedGetPlan, name: string, target: string): void {
+  if (plan.action === 'unchanged') {
+    log.info(`[dry-run] ${name} is already up to date (${target}); nothing to do.`);
+    return;
+  }
+  if (plan.action === 'conflict') {
+    log.info(
+      `[dry-run] Conflict at ${target} (${plan.reason}). Nothing is written; re-run without --dry-run and --force to overwrite the local copy with the team copy.`,
+    );
+    return;
+  }
+  log.info(`[dry-run] Would ${plan.action} ${name} → ${target}`);
+}
+
 function namespacedOnlyError(kind: 'Skill' | 'Rule', name: string, copies: string[]): string {
   return `${kind} "${name}" exists only outside the shared area (under ${copies.join(', ')}). `
     + 'Namespace resources are not shared: they arrive via `teamai pull` where the namespace is active.';
@@ -441,6 +467,10 @@ export async function get(options: GetOptions): Promise<void> {
       baselineSourceSha: record?.sourceSha256,
       baselineDeployedSha: record?.deployedSha256,
     });
+    if (options.dryRun) {
+      reportDryRun(plan, name, target);
+      return;
+    }
     if (plan.action === 'unchanged') {
       log.success(`✓ ${name} is up to date for ${agent} (${target})`);
       return;
@@ -511,6 +541,10 @@ export async function get(options: GetOptions): Promise<void> {
     baselineSourceSha: record?.sourceSha256,
     baselineDeployedSha: record?.deployedSha256,
   });
+  if (options.dryRun) {
+    reportDryRun(plan, stem, dest);
+    return;
+  }
   if (plan.action === 'unchanged') {
     log.success(`✓ ${stem} is up to date for ${agent} (${dest})`);
     return;

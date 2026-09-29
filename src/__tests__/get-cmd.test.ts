@@ -73,6 +73,18 @@ describe('resolveSharedSkillSource', () => {
     });
   });
 
+  it('never resolves an explicit namespace path, even when it exists', async () => {
+    write('skills/demo/deploy/SKILL.md', 'x');
+    expect(await resolveSharedSkillSource(path.join(tmp, 'skills'), 'demo/deploy')).toEqual({
+      source: null,
+      namespacedOnly: ['demo/deploy'],
+    });
+    expect(await resolveSharedSkillSource(path.join(tmp, 'skills'), 'a/b/c')).toEqual({
+      source: null,
+      namespacedOnly: [],
+    });
+  });
+
   it('prefers the shared-root copy when both exist', async () => {
     write('skills/shared/SKILL.md', 'x');
     write('skills/ns/shared/SKILL.md', 'y');

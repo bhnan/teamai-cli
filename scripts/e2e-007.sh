@@ -135,6 +135,9 @@ grep -q "Kept docs/demo/handbook.md\|kept" "$WORK/push4.log" && ok "pending-dele
 
 step "shared get: install → unchanged → conflict → force (user-global only)"
 CLAUDE_HOME="$HOME/.claude"; mkdir -p "$CLAUDE_HOME/skills"
+node "$CLI" get skills onboarding --agent claude --dry-run >"$WORK/get-dry.log" 2>&1; rc=$?
+[ $rc -eq 0 ] && grep -q "Would install" "$WORK/get-dry.log" && ok "get --dry-run previews install" || bad "get --dry-run preview missing: $(tail -3 "$WORK/get-dry.log")"
+expect_no_file "$HOME/.claude/skills/onboarding"
 node "$CLI" get skills onboarding --agent claude >"$WORK/get1.log" 2>&1; rc=$?
 [ $rc -eq 0 ] && ok "get install exit 0" || bad "get install exit $rc: $(tail -3 "$WORK/get1.log")"
 expect_file "$HOME/.claude/skills/onboarding/SKILL.md"
@@ -157,6 +160,8 @@ node "$CLI" get rules style --agent claude >"$WORK/get-rule.log" 2>&1; rc=$?
 expect_file "$HOME/.claude/rules/style.md"
 node "$CLI" get skills deploy --agent claude >"$WORK/get-ns.log" 2>&1; rc=$?
 [ $rc -ne 0 ] && grep -q "outside the shared area" "$WORK/get-ns.log" && ok "namespace-only skill rejected" || bad "namespace-only skill accepted: $(tail -3 "$WORK/get-ns.log")"
+node "$CLI" get skills demo/deploy --agent claude >"$WORK/get-ns3.log" 2>&1; rc=$?
+[ $rc -ne 0 ] && grep -q "outside the shared area" "$WORK/get-ns3.log" && ok "explicit namespace path rejected" || bad "explicit namespace path accepted: $(tail -3 "$WORK/get-ns3.log")"
 node "$CLI" get rules nsrule --agent claude >"$WORK/get-ns2.log" 2>&1; rc=$?
 [ $rc -ne 0 ] && grep -q "outside the shared area" "$WORK/get-ns2.log" && ok "namespace-only rule rejected" || bad "namespace-only rule accepted: $(tail -3 "$WORK/get-ns2.log")"
 node "$CLI" get docs handbook >"$WORK/get-docs.log" 2>&1; rc=$?
@@ -167,6 +172,11 @@ node "$CLI" get wiki spec/overview >"$WORK/get-wiki.log" 2>&1; rc=$?
 step "put: publish a local skill to the shared area, then get it back"
 mkdir -p "$WORK/local-skills/publish-me"
 printf -- '---\nname: publish-me\ndescription: put e2e skill\n---\n\n# publish-me skill\n' > "$WORK/local-skills/publish-me/SKILL.md"
+BRANCHES_BEFORE=$(git -C "$CLONE" ls-remote --heads origin | wc -l | tr -d ' ')
+node "$CLI" put skills "$WORK/local-skills/publish-me" --dry-run >"$WORK/put-dry.log" 2>&1; rc=$?
+[ $rc -eq 0 ] && grep -q "dry-run. Would publish" "$WORK/put-dry.log" && ok "put --dry-run previews publish" || bad "put --dry-run preview missing: $(tail -3 "$WORK/put-dry.log")"
+BRANCHES_AFTER=$(git -C "$CLONE" ls-remote --heads origin | wc -l | tr -d ' ')
+[ "$BRANCHES_BEFORE" = "$BRANCHES_AFTER" ] && ok "put --dry-run pushed no branch" || bad "put --dry-run changed remote branches"
 node "$CLI" put skills "$WORK/local-skills/publish-me" >"$WORK/put1.log" 2>&1; rc=$?
 if [ $rc -eq 0 ] || grep -q "has been pushed" "$WORK/put1.log"; then ok "put published (rc=$rc)"; else bad "put failed rc=$rc: $(tail -5 "$WORK/put1.log")"; fi
 git -C "$SEED" fetch -q origin
@@ -179,6 +189,40 @@ git -C "$SEED" show origin/main:skills/publish-me/SKILL.md >/dev/null 2>&1 && ok
 node "$CLI" get skills publish-me --refresh --agent claude >"$WORK/get5.log" 2>&1; rc=$?
 [ $rc -eq 0 ] && ok "get publish-me after put exit 0" || bad "get publish-me exit $rc: $(tail -3 "$WORK/get5.log")"
 expect_file "$HOME/.claude/skills/publish-me/SKILL.md"
+
+step "pull without --project applies every active project; --project narrows"
+cat > "$SEED/manifest/projects.yaml" <<'YAML'
+version: 1
+projects:
+  - id: demo
+    name: Demo
+    description: demo project
+    resources:
+      knowledge: [demo]
+      skills: [demo]
+      agents: []
+  - id: demo2
+    name: Demo Two
+    description: second project
+    resources:
+      skills: [demo2]
+YAML
+mkdir -p "$SEED/skills/demo2/extra"
+printf -- '---\nname: extra\ndescription: demo2 skill\n---\n\n# extra skill\n' > "$SEED/skills/demo2/extra/SKILL.md"
+git -C "$SEED" add -A && git -C "$SEED" commit -qm "demo2 project" && git -C "$SEED" push -q origin main
+node "$CLI" pull -q >/dev/null 2>&1
+expect_no_file "$PROJ/.claude/skills/extra"
+# The first pull migrated the legacy in-repo config to the ~/.teamai partition.
+CFG="$PROJ/.teamai/config.yaml"
+[ -f "$CFG" ] || CFG="$(ls "$HOME"/.teamai/projects/*/config.yaml 2>/dev/null | head -1)"
+[ -n "$CFG" ] && [ -f "$CFG" ] && ok "active config found: $CFG" || bad "no active project config found"
+sed -i '' 's/^projects: \[demo\]$/projects: [demo, demo2]/' "$CFG"
+node "$CLI" pull >"$WORK/pull-multi.log" 2>&1; rc=$?
+[ $rc -eq 0 ] && ok "multi-active pull exit 0" || bad "multi-active pull exit $rc: $(tail -3 "$WORK/pull-multi.log")"
+grep -q "project=demo,demo2" "$WORK/pull-multi.log" && ok "multi-active scope reported" || bad "scope line wrong: $(grep 'scope:' "$WORK/pull-multi.log" | head -1)"
+expect_file "$PROJ/.claude/skills/extra/SKILL.md"
+node "$CLI" pull --project demo >"$WORK/pull-narrow.log" 2>&1; rc=$?
+[ $rc -eq 0 ] && grep -q "project=demo, agent" "$WORK/pull-narrow.log" && ok "pull --project narrows to one" || bad "narrowed pull wrong: $(grep 'scope:' "$WORK/pull-narrow.log" | head -1)"
 
 step "user-scope directory: pull rejected with migration guidance"
 mkdir -p "$WORK/elsewhere" && cd "$WORK/elsewhere"
