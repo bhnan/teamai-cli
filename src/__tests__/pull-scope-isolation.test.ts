@@ -3,8 +3,12 @@ import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
 
-// Issue #73 keeps project scope isolated by default. These tests also cover the
-// explicit safe-resource inheritance path without composing control-plane data.
+// 007: `pull` is a project-scope-only, four-type resource sync. A directory
+// without a project config fails with migration guidance (exit code 2) and
+// syncs nothing — the user scope is never loaded, inherited or otherwise. A
+// project directory syncs exactly that project scope; user-global resource
+// directories are never written, and the coordination passes an older pull
+// bundled in (hooks/MCP reconcile, usage reporting) no longer run from pull.
 
 vi.mock('../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../config.js')>()),
@@ -31,6 +35,7 @@ vi.mock('../utils/logger.js', () => ({
     error: vi.fn(),
     debug: vi.fn(),
     dim: vi.fn(),
+    persist: vi.fn(),
   },
   spinner: vi.fn(() => ({
     start: vi.fn().mockReturnThis(),
@@ -48,6 +53,9 @@ vi.mock('../source.js', () => ({
   pullSources: vi.fn().mockResolvedValue(undefined),
 }));
 
+// These passes were removed from pull (007): `teamai hooks` / `teamai mcp` own
+// them now. The mocks stay so a regression that wires them back into pull is
+// caught by the "not called" assertions below.
 vi.mock('../hooks.js', () => ({
   injectHooksToAllTools: vi.fn().mockResolvedValue(undefined),
   reconcileTeamHooksForConfig: vi.fn().mockResolvedValue({ ok: true, defs: [] }),
@@ -83,6 +91,14 @@ vi.mock('../update.js', () => ({
   releaseLock: vi.fn().mockResolvedValue(undefined),
 }));
 
+// The post-pull doctor checks are exercised in pull-post-checks.test.ts; keep
+// them out of the way so a scope message under test is the only thing printed.
+vi.mock('../doctor.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../doctor.js')>(),
+  resolveDoctorContext: vi.fn(),
+  buildChecks: vi.fn(),
+}));
+
 import { pull } from '../pull.js';
 import {
   loadLocalConfigForScope,
@@ -97,13 +113,13 @@ import { log } from '../utils/logger.js';
 import { reconcileTeamHooksForConfig } from '../hooks.js';
 import { reconcileMcpForConfig } from '../mcp-reconcile.js';
 import { reportUsageToTeam } from '../team-push.js';
-import { capUsageEvents, readUsageEvents, truncateUsageAfterReport } from '../usage-tracker.js';
+import { capUsageEvents, truncateUsageAfterReport } from '../usage-tracker.js';
 import { releaseLock } from '../update.js';
 import { SYNC_LOCK_FILENAME, type TeamaiConfig, type LocalConfig } from '../types.js';
 
-const SKIP_MSG = 'project scope detected, skipped user scope';
+const NO_PROJECT_MSG = 'teamai pull runs in a project scope, but this directory has none.';
 
-describe('pull scope isolation (issue #73)', () => {
+describe('pull scope isolation (007: project scope only)', () => {
   let tmpDir: string;
   let homeDir: string;
   let userRepoPath: string;
@@ -114,8 +130,6 @@ describe('pull scope isolation (issue #73)', () => {
   let projectConfig: LocalConfig;
 
   beforeEach(async () => {
-    vi.mocked(reportUsageToTeam).mockReset().mockResolvedValue(true);
-    vi.mocked(readUsageEvents).mockResolvedValue([]);
     tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-scope-iso-'));
     homeDir = path.join(tmpDir, 'home');
     userRepoPath = path.join(tmpDir, 'user-repo');
@@ -126,6 +140,8 @@ describe('pull scope isolation (issue #73)', () => {
       await fse.ensureDir(path.join(repo, 'skills'));
       await fse.ensureDir(path.join(repo, 'rules'));
     }
+    // A user-scope repo whose resources the OLD inherited pull deployed into
+    // the user-global directories. The new pull must never touch them.
     await fse.ensureDir(path.join(userRepoPath, 'skills', 'org-safe-review'));
     await fse.writeFile(
       path.join(userRepoPath, 'skills', 'org-safe-review', 'SKILL.md'),
@@ -188,239 +204,142 @@ describe('pull scope isolation (issue #73)', () => {
       lastUpdateCheck: null,
       availableUpdate: null,
     }));
+    vi.mocked(detectProjectConfig).mockResolvedValue(null);
   });
 
   afterEach(async () => {
     vi.useRealTimers();
     vi.unstubAllEnvs();
     vi.clearAllMocks();
+    process.exitCode = 0;
     await fse.remove(tmpDir);
   });
 
-  it.each([false, true])('only consumes usage after confirmed success: %s', async (success) => {
-    vi.mocked(detectProjectConfig).mockResolvedValue(projectConfig);
-    vi.mocked(readUsageEvents).mockResolvedValue([{ skill: 'review', timestamp: new Date().toISOString(), tool: 'claude' }]);
-    vi.mocked(reportUsageToTeam).mockResolvedValueOnce(success);
-    await pull({ silent: true });
-    if (success) {
-      expect(truncateUsageAfterReport).toHaveBeenCalledTimes(1);
-      expect(truncateUsageAfterReport).toHaveBeenCalledWith(1, projectConfig);
-    }
-    else expect(truncateUsageAfterReport).not.toHaveBeenCalled();
-  });
-
-  it.each([true, false])('caps the usage file only after the report has truncated it (#788): %s', async (success) => {
-    vi.mocked(detectProjectConfig).mockResolvedValue(projectConfig);
-    vi.mocked(readUsageEvents).mockResolvedValue([{ skill: 'review', timestamp: new Date().toISOString(), tool: 'claude' }]);
-    vi.mocked(reportUsageToTeam).mockResolvedValueOnce(success);
-    await pull({ silent: true });
-    expect(capUsageEvents).toHaveBeenCalledTimes(1);
-    expect(capUsageEvents).toHaveBeenCalledWith(projectConfig);
-    const capOrder = vi.mocked(capUsageEvents).mock.invocationCallOrder[0];
-    expect(vi.mocked(reportUsageToTeam).mock.invocationCallOrder[0]).toBeLessThan(capOrder);
-    if (success) expect(vi.mocked(truncateUsageAfterReport).mock.invocationCallOrder[0]).toBeLessThan(capOrder);
-  });
-
-  it('caps the usage file of a scope with usageReport: false (#788)', async () => {
-    vi.mocked(detectProjectConfig).mockResolvedValue(null);
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(userConfig);
-    vi.mocked(loadTeamConfig).mockResolvedValue({ ...teamConfig, usageReport: false });
-    await pull({ silent: true });
-    expect(reportUsageToTeam).not.toHaveBeenCalled();
-    expect(capUsageEvents).toHaveBeenCalledWith(userConfig);
-  });
-
-  it.each([true, false])('keeps late completion alive without starting a second report: %s', async (success) => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-    vi.mocked(detectProjectConfig).mockResolvedValue(projectConfig);
-    vi.mocked(readUsageEvents).mockResolvedValue([{ skill: 'review', timestamp: new Date().toISOString(), tool: 'claude' }]);
-    let finish!: (value: boolean) => void;
-    let started!: () => void;
-    const pushStarted = new Promise<void>((resolve) => { started = resolve; });
-    const pushResult = new Promise<boolean>((resolve) => { finish = resolve; });
-    vi.mocked(reportUsageToTeam).mockImplementationOnce(() => { started(); return pushResult; });
-    const pulling = pull({ silent: true });
-    await pushStarted;
-    await vi.advanceTimersByTimeAsync(5000);
-    await pulling;
-    expect(truncateUsageAfterReport).not.toHaveBeenCalled();
-    // Partition sync-locks stay held until the late report finishes. The
-    // reports worktree lock (.reports-lock) is acquired and released around
-    // the earlier read-only refresh, which is independent of that wait.
-    expect(
-      vi.mocked(releaseLock).mock.calls.filter(
-        ([lock]) => typeof lock === 'string' && path.basename(lock) === SYNC_LOCK_FILENAME,
-      ),
-    ).toEqual([]);
-    expect(pullSources).toHaveBeenCalled();
-    await pull({ silent: true });
-    expect(reportUsageToTeam).toHaveBeenCalledTimes(1);
-    finish(success);
-    await vi.advanceTimersByTimeAsync(0);
-    if (success) {
-      expect(truncateUsageAfterReport).toHaveBeenCalledTimes(1);
-      expect(truncateUsageAfterReport).toHaveBeenCalledWith(1, projectConfig);
-    }
-    else expect(truncateUsageAfterReport).not.toHaveBeenCalled();
-    await pull({ silent: true });
-    expect(reportUsageToTeam).toHaveBeenCalledTimes(2);
-  });
-
-  it('project mode: skips user scope entirely and pulls source against project', async () => {
-    vi.mocked(detectProjectConfig).mockResolvedValue(projectConfig);
-
-    await pull({ silent: true });
-
-    // User scope must never be loaded / pulled.
+  /** Nothing anywhere may be synced: no user load, no state, no source pull. */
+  async function expectNothingSynced(): Promise<void> {
     expect(loadLocalConfigForScope).not.toHaveBeenCalled();
-    // The skip notice is printed.
-    expect(log.info).toHaveBeenCalledWith(SKIP_MSG);
-    // Source pull still runs (decision 1), against the project config.
+    expect(pullSources).not.toHaveBeenCalled();
+    expect(loadStateForScope).not.toHaveBeenCalled();
+    expect(saveStateForScope).not.toHaveBeenCalled();
+    // The user repo's resources never reach the user-global directories.
+    expect(await fse.readdir(path.join(homeDir, '.claude', 'skills'))).toEqual([]);
+    expect(await fse.pathExists(path.join(homeDir, '.teamai', 'env.sh'))).toBe(false);
+  }
+
+  it('no project config: fails with guidance and exit code 2 without syncing anything', async () => {
+    vi.mocked(detectProjectConfig).mockResolvedValue(null);
+
+    await pull({});
+
+    expect(process.exitCode).toBe(2);
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining(NO_PROJECT_MSG));
+    await expectNothingSynced();
+  });
+
+  it('no project config: a silent run persists the guidance instead of printing it', async () => {
+    vi.mocked(detectProjectConfig).mockResolvedValue(null);
+
+    await pull({ silent: true });
+
+    expect(process.exitCode).toBe(2);
+    expect(log.persist).toHaveBeenCalledWith(expect.stringContaining(NO_PROJECT_MSG));
+    expect(log.error).not.toHaveBeenCalled();
+    await expectNothingSynced();
+  });
+
+  it('unreadable project config: stops before anything is synced (#784)', async () => {
+    vi.mocked(detectProjectConfig).mockImplementation(async (_cwd, onUnreadable) => {
+      onUnreadable?.(path.join(projectRoot, '.teamai', 'config.yaml'), 'Not enough permissions');
+      return null;
+    });
+
+    await pull({});
+
+    expect(process.exitCode).toBe(1);
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('Nothing was synced'));
+    await expectNothingSynced();
+  });
+
+  it('project directory: syncs only the project scope and never loads the user scope', async () => {
+    vi.mocked(detectProjectConfig).mockResolvedValue(projectConfig);
+
+    await pull({ silent: true });
+
+    // The user scope is never loaded — not even to decide whether to skip it.
+    expect(loadLocalConfigForScope).not.toHaveBeenCalled();
+    // The project scope was really synced and recorded.
+    expect(loadStateForScope).toHaveBeenCalledWith(expect.objectContaining({ scope: 'project', projectRoot }));
+    expect(saveStateForScope).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ scope: 'project', projectRoot }),
+    );
+    // Source pull still runs, against the project config.
     expect(pullSources).toHaveBeenCalledTimes(1);
     expect(vi.mocked(pullSources).mock.calls[0][0]).toMatchObject({
       scope: 'project',
       projectRoot,
     });
+    // The partition sync-lock was taken and released for the project scope.
+    expect(
+      vi.mocked(releaseLock).mock.calls.some(
+        ([lock]) => typeof lock === 'string' && path.basename(lock) === SYNC_LOCK_FILENAME,
+      ),
+    ).toBe(true);
+    // User-global resource directories are untouched by a project pull.
+    expect(await fse.readdir(path.join(homeDir, '.claude', 'skills'))).toEqual([]);
+    expect(await fse.pathExists(path.join(homeDir, '.teamai', 'env.sh'))).toBe(false);
+    expect(await fse.pathExists(path.join(homeDir, '.teamai', 'learnings'))).toBe(false);
   });
 
-  it('project mode: inherits user resources only when explicitly enabled', async () => {
+  it('inheritUserScope is ignored: a project pull never inherits user resources', async () => {
     projectConfig.inheritUserScope = true;
     vi.mocked(detectProjectConfig).mockResolvedValue(projectConfig);
+    // Resolve to a live user config so any accidental load would deploy it.
     vi.mocked(loadLocalConfigForScope).mockResolvedValue(userConfig);
 
     await pull({ silent: true });
 
-    expect(loadLocalConfigForScope).toHaveBeenCalledWith('user');
-    expect(loadStateForScope).toHaveBeenCalledWith(expect.objectContaining({ scope: 'user' }));
-    expect(loadStateForScope).toHaveBeenCalledWith(expect.objectContaining({ scope: 'project', projectRoot }));
-    expect(log.info).toHaveBeenCalledWith(
-      'project scope detected, inheriting user-scope resources and knowledge',
+    expect(loadLocalConfigForScope).not.toHaveBeenCalled();
+    expect(loadStateForScope).not.toHaveBeenCalledWith(expect.objectContaining({ scope: 'user' }));
+    expect(saveStateForScope).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ scope: 'user' }),
     );
-    expect(log.info).not.toHaveBeenCalledWith(SKIP_MSG);
-    expect(await fse.pathExists(
-      path.join(homeDir, '.claude', 'skills', 'org-safe-review', 'SKILL.md'),
-    )).toBe(true);
+    expect(log.info).not.toHaveBeenCalledWith('project scope detected, inheriting user-scope resources and knowledge');
+    // The user repo's skill/env stay out of the user-global directories.
+    expect(await fse.pathExists(path.join(homeDir, '.claude', 'skills', 'org-safe-review'))).toBe(false);
     expect(await fse.pathExists(path.join(homeDir, '.teamai', 'env.sh'))).toBe(false);
-    expect(saveStateForScope).toHaveBeenCalledWith(
-      expect.objectContaining({
-        lastPullRev: null,
-        lastInheritedPullRev: 'abc1234',
-      }),
-      expect.objectContaining({ scope: 'user' }),
-    );
-    expect(reconcileTeamHooksForConfig).not.toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({ scope: 'user' }),
-      expect.anything(),
-    );
-    expect(reconcileMcpForConfig).not.toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({ scope: 'user' }),
-    );
-    expect(reportUsageToTeam).not.toHaveBeenCalledWith(
-      userRepoPath,
-      expect.anything(),
-      expect.anything(),
-    );
     // External sources stay bound to the active project scope.
     expect(pullSources).toHaveBeenCalledTimes(1);
     expect(vi.mocked(pullSources).mock.calls[0][0]).toMatchObject({ scope: 'project' });
   });
 
-  it('project mode: warns but continues when inherited user scope is unavailable', async () => {
-    projectConfig.inheritUserScope = true;
+  it('reports the resolved scope and the four-type boundary before any write', async () => {
     vi.mocked(detectProjectConfig).mockResolvedValue(projectConfig);
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(null);
 
-    await pull({ silent: true });
+    await pull({});
 
-    expect(log.warn).toHaveBeenCalledWith(
-      'user-scope inheritance is enabled, but user scope is not initialized',
-    );
-    expect(loadStateForScope).toHaveBeenCalledWith(expect.objectContaining({ scope: 'project', projectRoot }));
-  });
-
-  it('user mode: pulls user scope and routes source against user (no skip notice)', async () => {
-    vi.mocked(detectProjectConfig).mockResolvedValue(null);
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(userConfig);
-
-    await pull({ silent: true });
-
-    expect(loadLocalConfigForScope).toHaveBeenCalledWith('user');
-    expect(log.info).not.toHaveBeenCalledWith(SKIP_MSG);
-    expect(pullSources).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(pullSources).mock.calls[0][0]).toMatchObject({ scope: 'user' });
-    expect(reportUsageToTeam).toHaveBeenCalledWith(
-      userRepoPath,
-      'userscope',
-      expect.objectContaining({
-        selfConfig: expect.objectContaining({
-          repo: expect.objectContaining({ localPath: userRepoPath }),
-        }),
-      }),
+    expect(log.info).toHaveBeenCalledWith(
+      expect.stringContaining('[pull] scope: project=shared (no project partitioning), agent=all, types=skills,rules,env,agents'),
     );
   });
 
-  it('user mode: forwards force option to MCP reconcile', async () => {
-    vi.mocked(detectProjectConfig).mockResolvedValue(null);
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(userConfig);
-
-    await pull({ silent: true, force: true });
-
-    expect(reconcileMcpForConfig).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.anything(),
-      expect.objectContaining({ force: true }),
-    );
-  });
-
-  it('user mode self-repo: reportUsageToTeam receives selfConfig so business repo is never reset', async () => {
-    const businessRoot = path.join(tmpDir, 'business-repo');
-    const selfRepoPath = path.join(businessRoot, '.teamai');
-    const selfUserConfig: LocalConfig = {
-      repo: {
-        localPath: selfRepoPath,
-        remote: 'https://git.woa.com/test/self-repo.git',
-        kind: 'self',
-        businessRepoRoot: businessRoot,
-      },
-      username: 'selfuser',
-      updatePolicy: 'auto',
-      additionalRoles: [],
-      scope: 'user',
-    };
-
-    vi.mocked(detectProjectConfig).mockResolvedValue(null);
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(selfUserConfig);
+  it('no longer auto-reports usage from pull, in any scope or mode', async () => {
+    vi.mocked(detectProjectConfig).mockResolvedValue(projectConfig);
 
     await pull({ silent: true });
 
-    expect(reportUsageToTeam).toHaveBeenCalledWith(
-      selfRepoPath,
-      'selfuser',
-      expect.objectContaining({
-        selfConfig: expect.objectContaining({
-          repo: expect.objectContaining({ kind: 'self' }),
-        }),
-      }),
-    );
-  });
-
-  it('project mode http-repo: never calls reportUsageToTeam (data-loss guard)', async () => {
-    const httpProjectConfig: LocalConfig = {
-      ...projectConfig,
-      repo: { ...projectConfig.repo, kind: 'http' as const },
-    };
-
-    vi.mocked(detectProjectConfig).mockResolvedValue(httpProjectConfig);
-
-    await pull({ silent: true });
-
-    // HTTP-kind repo: kind !== 'http' guard filters out both report targets,
-    // so targets is empty and the business repo's team-repo dir is never reset.
     expect(reportUsageToTeam).not.toHaveBeenCalled();
-    // Its local file is the only source `teamai stats` has, so it is capped
-    // rather than consumed (#788).
-    expect(capUsageEvents).toHaveBeenCalledWith(httpProjectConfig);
+    expect(truncateUsageAfterReport).not.toHaveBeenCalled();
+    expect(capUsageEvents).not.toHaveBeenCalled();
+  });
+
+  it('does not run the hooks or MCP reconcile that `teamai hooks` / `teamai mcp` own', async () => {
+    vi.mocked(detectProjectConfig).mockResolvedValue(projectConfig);
+
+    await pull({ silent: true });
+
+    expect(reconcileTeamHooksForConfig).not.toHaveBeenCalled();
+    expect(reconcileMcpForConfig).not.toHaveBeenCalled();
   });
 });

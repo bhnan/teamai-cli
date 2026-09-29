@@ -63,7 +63,7 @@ vi.mock('../doctor.js', async (importOriginal) => ({
   buildChecks: vi.fn(),
 }));
 
-import { detectProjectConfig, loadLocalConfigForScope, loadTeamConfig } from '../config.js';
+import { detectProjectConfig, loadTeamConfig } from '../config.js';
 import { acquireLock } from '../update.js';
 import { buildChecks, resolveDoctorContext, type Check, type DoctorContext } from '../doctor.js';
 import { log } from '../utils/logger.js';
@@ -106,7 +106,8 @@ describe('checks at the end of an interactive pull', () => {
     const localConfig: LocalConfig = {
       repo: { localPath: repoPath, remote: 'owner/repo' },
       username: 'tester',
-      scope: 'user',
+      scope: 'project',
+      projectRoot: homeDir,
       primaryRole: 'dev',
       additionalRoles: [],
     };
@@ -123,8 +124,7 @@ describe('checks at the end of an interactive pull', () => {
     };
 
     writeInstallConfig(localConfig);
-    vi.mocked(detectProjectConfig).mockResolvedValue(null);
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(localConfig);
+    vi.mocked(detectProjectConfig).mockResolvedValue(localConfig);
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
 
     ctx = {

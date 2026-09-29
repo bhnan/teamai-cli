@@ -71,7 +71,7 @@ vi.mock('../doctor.js', async (importOriginal) => ({
   buildChecks: vi.fn(),
 }));
 
-import { detectProjectConfig, loadLocalConfigForScope, loadStateForScope, loadTeamConfig } from '../config.js';
+import { detectProjectConfig, loadStateForScope, loadTeamConfig } from '../config.js';
 import { acquireLock } from '../update.js';
 import { buildChecks, resolveDoctorContext, type DoctorContext } from '../doctor.js';
 import { log } from '../utils/logger.js';
@@ -104,10 +104,13 @@ describe('env.yaml shape warning on a real pull', () => {
     await fse.writeFile(path.join(repoPath, 'manifest', 'roles.yaml'), 'version: 1\n');
     await fse.ensureDir(path.join(homeDir, '.claude', 'skills'));
 
+    // 007: pull runs in a project scope only; HOME doubles as the project root
+    // so the seeded tool directory and data home keep their paths.
     const localConfig: LocalConfig = {
       repo: { localPath: repoPath, remote: 'owner/repo' },
       username: 'tester',
-      scope: 'user',
+      scope: 'project',
+      projectRoot: homeDir,
       primaryRole: 'dev',
       additionalRoles: [],
     };
@@ -123,8 +126,7 @@ describe('env.yaml shape warning on a real pull', () => {
       toolPaths: { claude: { skills: '.claude/skills', rules: '.claude/rules' } },
     };
 
-    vi.mocked(detectProjectConfig).mockResolvedValue(null);
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(localConfig);
+    vi.mocked(detectProjectConfig).mockResolvedValue(localConfig);
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
     state = { lastPull: null, lastPullRev: null };
     vi.mocked(loadStateForScope).mockResolvedValue(state as never);

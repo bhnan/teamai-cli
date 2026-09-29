@@ -265,7 +265,10 @@ function makeLocalConfig() {
     updatePolicy: 'auto',
     additionalRoles: [],
     resourceProfileVersion: 1,
-    scope: 'user',
+    // 007: push is a project-scoped publish; a user-scope fixture is rejected
+    // before anything is pushed.
+    scope: 'project',
+    projectRoot: '/tmp/teamai-project-fixture',
   };
 }
 

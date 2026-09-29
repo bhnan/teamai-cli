@@ -14,10 +14,11 @@ function hasDotSegment(relativePath: string): boolean {
  * Project-bound `.wiki/` knowledge base.
  *
  * Team convention — distinct from the `teamwiki/` codebase knowledge graph:
- * pages live in `<projectRoot>/.wiki/` and mirror to the team repo's `.wiki/`
- * directory. `teamai push` offers changed pages as MR items; `teamai pull`
- * mirrors the team repo back (overwriting same-named pages while preserving
- * local-only pages).
+ * pages live in `<projectRoot>/.wiki/` and publish one-way to the team repo's
+ * `.wiki/<projectId>/` directory (007), where other projects read them and
+ * `recall --wiki-page` verifies their source anchors. `teamai pull` never
+ * deploys or cleans the project wiki; the pull-side handlers below are kept
+ * only for the deprecated `get wiki` legacy mirror.
  */
 export class WikiHandler extends ResourceHandler {
   readonly type = 'wiki' as const;
@@ -34,11 +35,23 @@ export class WikiHandler extends ResourceHandler {
     return path.join(localConfig.repo.localPath, '.wiki');
   }
 
-  async scanLocalForPush(_teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<ResourceItem[]> {
+  /** The publish target for one project: `.wiki/<projectId>/` (007). */
+  publishTargetDir(localConfig: LocalConfig, projectId: string): string {
+    return path.join(localConfig.repo.localPath, '.wiki', projectId);
+  }
+
+  async scanLocalForPush(
+    _teamConfig: TeamaiConfig,
+    localConfig: LocalConfig,
+    options?: { projectId?: string },
+  ): Promise<ResourceItem[]> {
+    // One-way publish (007): the project's own pages against the team repo's
+    // `.wiki/<projectId>/` copy. push.ts decides modified-vs-conflict against
+    // the recorded baseline.
+    const projectId = options?.projectId;
     const local = this.localWikiDir(localConfig);
-    const repo = this.repoWikiDir(localConfig);
-    // Repo `.wiki/` may not exist yet — every local page is then "new" (bootstrap push).
-    if (!(await pathExists(local))) return [];
+    if (!projectId || !(await pathExists(local))) return [];
+    const repo = this.publishTargetDir(localConfig, projectId);
     const items: ResourceItem[] = [];
     for (const rel of await listFilesRecursive(local)) {
       if (hasDotSegment(rel) || !rel.endsWith('.md')) continue;
@@ -51,8 +64,8 @@ export class WikiHandler extends ResourceHandler {
           name: rel,
           type: 'wiki',
           sourcePath: localFile,
-          // Repo-root-relative so push stages `.wiki/<rel>` in the clone.
-          relativePath: `.wiki/${rel}`,
+          // Repo-root-relative so push stages `.wiki/<projectId>/<rel>`.
+          relativePath: `.wiki/${projectId}/${rel}`,
           status: exists ? 'modified' : 'new',
         });
       }
@@ -69,10 +82,10 @@ export class WikiHandler extends ResourceHandler {
   }
 
   async pushItem(item: ResourceItem, _teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
-    const dest = path.join(this.repoWikiDir(localConfig), item.name);
+    const dest = path.join(localConfig.repo.localPath, item.relativePath);
     await fse.ensureDir(path.dirname(dest));
     await fse.copy(item.sourcePath, dest, { overwrite: true });
-    log.debug(`Pushed wiki page ${item.name} → team repo`);
+    log.debug(`Published wiki page ${item.relativePath} → team repo`);
   }
 
   /** Whole-repo mirror: overwrite same-named pages, preserve local-only pages. */

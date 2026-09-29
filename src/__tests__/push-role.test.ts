@@ -170,6 +170,20 @@ vi.mock('../update.js', () => ({
   releaseLock: vi.fn().mockResolvedValue(undefined),
 }));
 
+// 007: push runs in a project scope, so pushCore asks pull.js which revision
+// this checkout last synced. The fixtures have no pull record for the fixture
+// projectRoot, and an "unrecorded" answer makes the unsureOfEdit guard reject
+// every MODIFIED resource — a pull-record concern these placement tests are
+// not about. Report a recorded checkout, the state a `teamai pull` leaves behind.
+vi.mock('../pull.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../pull.js')>()),
+  resolveCheckoutBases: vi.fn().mockResolvedValue({
+    source: 'checkout',
+    record: { rev: 'pull000', targets: [] },
+    revs: ['pull000'],
+  }),
+}));
+
 function makeLocalConfig(overrides: Record<string, unknown> = {}) {
   return {
     repo: { localPath: '/tmp/team-repo', remote: 'https://git.woa.com/test/repo.git' },
@@ -178,7 +192,12 @@ function makeLocalConfig(overrides: Record<string, unknown> = {}) {
     primaryRole: 'hai',
     additionalRoles: [],
     resourceProfileVersion: 1,
-    scope: 'user',
+    // 007: push is a project-scoped publish; a user-scope fixture is rejected
+    // before anything is pushed. No `projects` by default: docs/wiki then stay
+    // unconfigured and are skipped, keeping these tests on the tool-resource
+    // push they have always exercised.
+    scope: 'project',
+    projectRoot: '/tmp/teamai-project-fixture',
     ...overrides,
   };
 }
@@ -992,7 +1011,8 @@ describe('push namespace routing for rules and agents', () => {
   it('--project resolves each type from its own axis, not from skills', async () => {
     const pushedItems: Array<Record<string, unknown>> = [];
     mockAutoDetectInit.mockResolvedValue({
-      localConfig: makeLocalConfig(),
+      // 007: --project must name a project ACTIVE in this directory.
+      localConfig: makeLocalConfig({ projects: ['front-app'] }),
       teamConfig: makeTeamConfig(),
     });
     mockLoadProjectsManifest.mockResolvedValue({
@@ -1054,7 +1074,7 @@ describe('push namespace routing for rules and agents', () => {
   it('refuses to push to the shared root when the project declares no namespace for the type', async () => {
     const pushedItems: Array<Record<string, unknown>> = [];
     mockAutoDetectInit.mockResolvedValue({
-      localConfig: makeLocalConfig(),
+      localConfig: makeLocalConfig({ projects: ['front-app'] }),
       teamConfig: makeTeamConfig(),
     });
     mockLoadProjectsManifest.mockResolvedValue({
@@ -1076,7 +1096,7 @@ describe('push namespace routing for rules and agents', () => {
   it('pushes a rules-only scan to a project that declares no skills namespace', async () => {
     const pushedItems: Array<Record<string, unknown>> = [];
     mockAutoDetectInit.mockResolvedValue({
-      localConfig: makeLocalConfig(),
+      localConfig: makeLocalConfig({ projects: ['docs-only'] }),
       teamConfig: makeTeamConfig(),
     });
     mockLoadProjectsManifest.mockResolvedValue({
@@ -1156,7 +1176,7 @@ describe('push namespace routing for rules and agents', () => {
   it('fails on a project with no agents namespace even when the scan skipped the agent', async () => {
     const pushedItems: Array<Record<string, unknown>> = [];
     mockAutoDetectInit.mockResolvedValue({
-      localConfig: makeLocalConfig(),
+      localConfig: makeLocalConfig({ projects: ['docs-only'] }),
       teamConfig: makeTeamConfig(),
     });
     mockLoadProjectsManifest.mockResolvedValue({
@@ -1190,7 +1210,7 @@ describe('push namespace routing for rules and agents', () => {
     // rule going out: skipped agents do not block the rest (#649 review).
     const pushedItems: Array<Record<string, unknown>> = [];
     mockAutoDetectInit.mockResolvedValue({
-      localConfig: makeLocalConfig(),
+      localConfig: makeLocalConfig({ projects: ['docs-only'] }),
       teamConfig: makeTeamConfig(),
     });
     mockLoadProjectsManifest.mockResolvedValue({
@@ -1220,7 +1240,7 @@ describe('push namespace routing for rules and agents', () => {
   it('lets a modified namespaced agent through a project whose agents axis is empty', async () => {
     const pushedItems: Array<Record<string, unknown>> = [];
     mockAutoDetectInit.mockResolvedValue({
-      localConfig: makeLocalConfig(),
+      localConfig: makeLocalConfig({ projects: ['docs-only'] }),
       teamConfig: makeTeamConfig(),
     });
     mockLoadProjectsManifest.mockResolvedValue({
@@ -1248,7 +1268,7 @@ describe('push namespace routing for rules and agents', () => {
   it('pushes a selected rule when only the unselected skill lacks a project namespace', async () => {
     const pushedItems: Array<Record<string, unknown>> = [];
     mockAutoDetectInit.mockResolvedValue({
-      localConfig: makeLocalConfig(),
+      localConfig: makeLocalConfig({ projects: ['docs-only'] }),
       teamConfig: makeTeamConfig(),
     });
     mockLoadProjectsManifest.mockResolvedValue({
@@ -1277,7 +1297,7 @@ describe('push namespace routing for rules and agents', () => {
   it('pushes a selected rule when only the unselected new agent lacks a project agents namespace', async () => {
     const pushedItems: Array<Record<string, unknown>> = [];
     mockAutoDetectInit.mockResolvedValue({
-      localConfig: makeLocalConfig(),
+      localConfig: makeLocalConfig({ projects: ['docs-only'] }),
       teamConfig: makeTeamConfig(),
     });
     mockLoadProjectsManifest.mockResolvedValue({
@@ -1310,7 +1330,7 @@ describe('push namespace routing for rules and agents', () => {
   it('still fails when the new agent lacking a project agents namespace is selected', async () => {
     const pushedItems: Array<Record<string, unknown>> = [];
     mockAutoDetectInit.mockResolvedValue({
-      localConfig: makeLocalConfig(),
+      localConfig: makeLocalConfig({ projects: ['docs-only'] }),
       teamConfig: makeTeamConfig(),
     });
     mockLoadProjectsManifest.mockResolvedValue({
@@ -1337,7 +1357,7 @@ describe('push namespace routing for rules and agents', () => {
   it('still fails when the skill lacking a project namespace is selected', async () => {
     const pushedItems: Array<Record<string, unknown>> = [];
     mockAutoDetectInit.mockResolvedValue({
-      localConfig: makeLocalConfig(),
+      localConfig: makeLocalConfig({ projects: ['docs-only'] }),
       teamConfig: makeTeamConfig(),
     });
     mockLoadProjectsManifest.mockResolvedValue({
@@ -1386,7 +1406,7 @@ describe('push namespace routing for rules and agents', () => {
   it('reads the projects manifest only after the team clone has been pulled', async () => {
     const pushedItems: Array<Record<string, unknown>> = [];
     mockAutoDetectInit.mockResolvedValue({
-      localConfig: makeLocalConfig(),
+      localConfig: makeLocalConfig({ projects: ['front-app'] }),
       teamConfig: makeTeamConfig(),
     });
     mockLoadProjectsManifest.mockResolvedValue({
@@ -2136,7 +2156,7 @@ describe('push namespace routing for rules and agents', () => {
   it('--dry-run reports the destination and pushes nothing', async () => {
     const pushedItems: Array<Record<string, unknown>> = [];
     mockAutoDetectInit.mockResolvedValue({
-      localConfig: makeLocalConfig(),
+      localConfig: makeLocalConfig({ projects: ['front-app'] }),
       teamConfig: makeTeamConfig(),
     });
     mockLoadProjectsManifest.mockResolvedValue({
@@ -2160,7 +2180,7 @@ describe('push namespace routing for rules and agents', () => {
 
   it('--dry-run fails on a project axis the real push would refuse', async () => {
     mockAutoDetectInit.mockResolvedValue({
-      localConfig: makeLocalConfig(),
+      localConfig: makeLocalConfig({ projects: ['front-app'] }),
       teamConfig: makeTeamConfig(),
     });
     mockLoadProjectsManifest.mockResolvedValue({

@@ -46,7 +46,7 @@ vi.mock('../utils/logger.js', () => ({
 }));
 
 import { pull, cleanupInactiveNamespaceSkills } from '../pull.js';
-import { loadLocalConfigForScope, loadTeamConfig, detectProjectConfig, loadStateForScope } from '../config.js';
+import { loadTeamConfig, detectProjectConfig, loadStateForScope } from '../config.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
 
 vi.mock('../roles.js', () => ({
@@ -157,12 +157,12 @@ describe('pull role-aware sync and cleanup', () => {
       primaryRole: 'hai',
       additionalRoles: [],
       resourceProfileVersion: 1,
-      scope: 'user',
+      scope: 'project',
+      projectRoot: homeDir,
     };
 
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(localConfig);
+    vi.mocked(detectProjectConfig).mockResolvedValue(localConfig);
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
-    vi.mocked(detectProjectConfig).mockResolvedValue(null);
     // No stored rev by default, so every test does a full sync unless it opts
     // into the unchanged-rev fast path. A fresh object per call, like the real
     // loader: pull writes the rev onto what it reads, and a shared object would
@@ -350,14 +350,15 @@ describe('pull role-aware sync and cleanup', () => {
       '',
     ].join('\n'));
 
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue({
+    vi.mocked(detectProjectConfig).mockResolvedValue({
       repo: { localPath: repoPath, remote: 'https://git.woa.com/test/repo.git' },
       username: 'testuser',
       updatePolicy: 'auto',
       primaryRole: 'hai',
       additionalRoles: [],
       resourceProfileVersion: 1,
-      scope: 'user',
+      scope: 'project',
+      projectRoot: homeDir,
       subscribedTags: ['wanted'],
     });
     const { log } = await import('../utils/logger.js');
@@ -608,7 +609,7 @@ describe('pull role-aware sync and cleanup', () => {
       resourceProfileVersion: 1,
       scope: 'user',
     };
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(pmConfig);
+    vi.mocked(detectProjectConfig).mockResolvedValue(pmConfig);
 
     // Step 3: Pull as pm role — should get common + pm, remove hai-only
     await pull({});

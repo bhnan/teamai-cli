@@ -176,14 +176,14 @@ describe('pull in a project whose config cannot be read (#784)', () => {
     expect(log.error).not.toHaveBeenCalled();
   });
 
-  it('pulls the user scope where there is no project config, as before', async () => {
-    const userRepo = userScope();
+  it('refuses to pull outside a project scope instead of syncing the user scope (007)', async () => {
+    userScope();
     process.chdir(gitRepo('project-b'));
 
     await pull({});
 
-    expect(pulledRepos()).toEqual([userRepo]);
-    expect(process.exitCode).toBe(originalExitCode);
-    expect(log.error).not.toHaveBeenCalled();
+    expect(pulledRepos()).toEqual([]);
+    expect(process.exitCode).toBe(2);
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('teamai pull runs in a project scope'));
   });
 });

@@ -55,7 +55,7 @@ vi.mock('../update.js', () => ({
 }));
 
 import { pull } from '../pull.js';
-import { loadLocalConfigForScope, loadTeamConfig, detectProjectConfig, loadStateForScope } from '../config.js';
+import { loadTeamConfig, detectProjectConfig, loadStateForScope } from '../config.js';
 import { log } from '../utils/logger.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
 
@@ -92,13 +92,14 @@ describe('pull: an active namespace item replaces the root item of the same name
       ...(primaryRole ? { primaryRole } : {}),
       additionalRoles,
       resourceProfileVersion: 1,
-      scope: 'user',
+      scope: 'project',
+      projectRoot: homeDir,
       ...extra,
     };
   }
 
   const as = (roles: string[] | null, extra: Partial<LocalConfig> = {}): void => {
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(configFor(roles, extra));
+    vi.mocked(detectProjectConfig).mockResolvedValue(configFor(roles, extra));
   };
   const read = (rel: string): Promise<string> => fse.readFile(path.join(homeDir, rel), 'utf8');
   const exists = (rel: string): Promise<boolean> => fse.pathExists(path.join(homeDir, rel));
@@ -139,7 +140,6 @@ describe('pull: an active namespace item replaces the root item of the same name
 
     as(['frontend']);
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
-    vi.mocked(detectProjectConfig).mockResolvedValue(null);
     vi.mocked(log.warn).mockClear();
     vi.mocked(log.error).mockClear();
   });
@@ -270,11 +270,10 @@ describe('pull: an active namespace item replaces the root item of the same name
 
     // The admin edits the root rule and adds its namespace override in one push:
     // the member's copy is the version of the last pull, not a member edit.
-    // HOME's copy may come from a project pull that inherits the user scope,
-    // which records its revision apart from the user scope's own (#823).
+    // (The inherited-pull variant left with the user-scope inheritance channel
+    // 007 removed; the project pull records its revision directly.)
     it.each([
       ['the last pull', (rev: string) => ({ lastPullRev: rev })],
-      ['an inherited pull', (rev: string) => ({ lastPullRev: null, lastInheritedPullRev: rev })],
     ])('withdraws the replaced root rule\'s copy when the root rule changed in the same push since %s, and names an edited one', async (_case, delivered) => {
       const base = await loadTeamConfig(repoPath);
       if (!base) throw new Error('no team config');
@@ -526,27 +525,30 @@ roles:
       expect(logged('warn', /variable "API_BASE" is defined in both env\/frontend\/env\.yaml and env\/devops\/env\.yaml/)).toBe(true);
     });
 
-    it('keeps the installed hooks when two active namespaces define one hook, naming both files', async () => {
+    it('leaves installed hooks untouched when namespaces collide (hooks reconcile is a separate entry)', async () => {
       await team('hooks/frontend/hooks.yaml', lintHook('front-lint.sh'));
       await team('hooks/devops/hooks.yaml', lintHook('ops-lint.sh'));
-      await pull({});
+      // 007: pull deploys no hook configuration. Seed an installed hook the way
+      // `teamai hooks inject` would have, then verify a pull never touches it
+      // and never resolves hook conflicts itself.
+      await fse.outputFile(path.join(homeDir, '.claude/settings.json'), JSON.stringify({
+        hooks: { PostToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'front-lint.sh' }] }] },
+      }, null, 2));
       const before = await read('.claude/settings.json');
-      expect(before).toContain('front-lint.sh');
 
       as(['frontend', 'devops']);
       await pull({ force: true });
 
       expect(await read('.claude/settings.json')).toBe(before);
-      expect(logged('warn', /hook "lint" is defined in both hooks\/frontend\/hooks\.yaml and hooks\/devops\/hooks\.yaml/)).toBe(true);
+      expect(logged('warn', /hook "lint" is defined in both hooks\/frontend\/hooks\.yaml and hooks\/devops\/hooks\.yaml/)).toBe(false);
     });
 
-    it('warns that builtin: in a namespace hooks file is ignored', async () => {
+    it('does not resolve team hooks during pull (builtin: warnings come from the hooks entry)', async () => {
       await team('hooks/frontend/hooks.yaml', `${lintHook('front-lint.sh')}builtin:\n  disable: [todo-reminder]\n`);
 
       await pull({});
 
-      expect(logged('warn', /hooks\/frontend\/hooks\.yaml: `builtin:` is ignored outside hooks\/hooks\.yaml/)).toBe(true);
-      expect(await read('.claude/settings.json')).toContain('front-lint.sh');
+      expect(logged('warn', /hooks\/frontend\/hooks\.yaml: `builtin:` is ignored outside hooks\/hooks\.yaml/)).toBe(false);
     });
   });
 

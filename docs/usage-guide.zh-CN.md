@@ -574,7 +574,7 @@ teamai pull --dry-run    # 试运行，不实际修改
 
 手动执行 `teamai pull` 会在结束时运行 `teamai doctor` 的检查，并逐条打印失败项及其修复建议——包括它刚刚报告同步的 skill 是否真的落到每个启用工具的磁盘上、且可被读取。全部通过时不会有任何额外输出，退出码也不变。SessionStart hook 路径和 `--dry-run` 完全不运行检查，会话启动速度保持不变。托管平台相关的检查（`gh`/`gf` 认证）留给 `teamai doctor`：这次 pull 刚刚用过该平台。
 
-> Project scope 默认与 user scope 隔离。当前工作目录包含 project scope 的 `.teamai/config.yaml` 时，`pull` 会处理该项目并跳过 user scope；仅当本地配置包含 `inheritUserScope: true` 时，才会先刷新安全的 user 资源通道。当前目录没有 project 配置时，`pull` 处理 user scope。project 模式下，user 的 `env`、MCP 定义、sources、reporting 和写入行为仍保持隔离。hooks 是唯一例外：project scope 的 hooks 会注入到你的 **HOME** 工具设置（`~/.claude/settings.json` 等），而非 `<projectRoot>`——因为内置 hooks 依据传给 `hook-dispatch` 的 `cwd` 门控，且 `~/.claude` 恒存在、能通过「已安装工具」门槛（详见 Hooks 章节）。在没有 teamai 配置的目录中（既没有 project 配置也没有 user scope），团队 hooks 不做任何事：不显示提醒，也不记录会话或 skill 使用；只运行机器级别的工作（CLI 更新检查、SessionStart 时的 pull、本地 agent，以及 pull 暂存的包提示）。对团队 hooks 和 skill 使用记录而言，存在但无法读取的 project 配置视为没有配置，而不会退回 user scope，也不会退回其后优先级更低的 project 配置（如旧的 `.teamai/config.yaml`）。`pull` 遵循同一规则：此时不同步任何 scope，输出 ``Nothing was synced: <file>: <reason>. Fix the file, or move it aside and run `teamai init` to write a new one.`` 并以 exit 1 退出（加 `--silent` 时不输出，但仍以 exit 1 退出）；会话启动时不运行 pull，也不创建 agent 目录、不暂存包提示。`cwd` 已被删除的 hook（会话比它的 worktree 活得更久）沿用该会话最后记录的 scope，因此会话最后的事件和 skill 使用仍归属项目，分享提醒也遵循项目的设置，而不是 user scope 的。这需要本地事件日志中仍保留该会话之前的事件（压缩只保留活跃会话），且不适用于 Copilot，因为它的事件不记录目录。self 单仓模式则把 hooks 保留在业务仓库里，随 clone 传播。
+> pull 是项目级资源同步（007）：只把四类资源——`skills`、`rules`、`env`、`agents`——部署到当前项目的工具目录，且只在已初始化的 project scope 中运行。没有 project 配置的目录会被拒绝并给出迁移指引（在该目录执行 `teamai init`，再 `teamai projects set <id>` 激活项目）；user scope 安装不再由 pull 同步，`inheritUserScope` 也不再生效。项目 docs 与项目 wiki（`docs/`、`.wiki/`）由 `push` 单向发布，pull 不会部署、镜像、创建或清理它们——团队仓 clone 更新带回的副本只是 clone，不是部署。过去随 pull 附带的协调动作——hook/MCP/co-author reconcile、团队模型 profile 同步、usage 上报、`postPull` 脚本——现在各有自己的显式命令（`teamai hooks inject`、`teamai mcp inject`、`teamai models …`），pull 与 get 都不会隐式触发。跨团队 source skills 仍按 `sources` 声明同步。写入任何内容之前，pull 会先打印解析出的作用域：`[pull] scope: project=<id>, agent=<tool|all>, types=<list>`。可用 `--types skills,rules` 收窄（传入 docs/wiki 会被拒绝并说明原因）、`--agent <tool>`（只部署该 Agent 的目录）、`--skill <name>` / `--rule <name>`（更新单个资源；跳过清理动作与版本记录，下一次完整 pull 仍会交付其余资源），或 `--project <id>`（必须在本目录激活且在 manifest 中声明）。hooks 是唯一例外：在没有 teamai 配置的目录中（既没有 project 配置也没有 user scope），团队 hooks 不做任何事：不显示提醒，也不记录会话或 skill 使用；只运行机器级别的工作（CLI 更新检查、SessionStart 时的 pull、本地 agent，以及 pull 暂存的包提示）。对团队 hooks 和 skill 使用记录而言，存在但无法读取的 project 配置视为没有配置，而不会退回 user scope，也不会退回其后优先级更低的 project 配置（如旧的 `.teamai/config.yaml`）。`pull` 遵循同一规则：此时不同步任何 scope，输出 ``Nothing was synced: <file>: <reason>. Fix the file, or move it aside and run `teamai init` to write a new one.`` 并以 exit 1 退出（加 `--silent` 时不输出，但仍以 exit 1 退出）；会话启动时不运行 pull，也不创建 agent 目录、不暂存包提示。`cwd` 已被删除的 hook（会话比它的 worktree 活得更久）沿用该会话最后记录的 scope，因此会话最后的事件和 skill 使用仍归属项目，分享提醒也遵循项目的设置，而不是 user scope 的。这需要本地事件日志中仍保留该会话之前的事件（压缩只保留活跃会话），且不适用于 Copilot，因为它的事件不记录目录。self 单仓模式则把 hooks 保留在业务仓库里，随 clone 传播。
 
 启用角色化 skills 后，`pull` 的 skills 同步来源会变成 `skills/<namespace>/` 中的内容，按 `primaryRole + additionalRoles` 展开对应的 namespace，拍平安装到本地各 AI 工具 skills 目录。`rules/<namespace>/` 和 `claudemd/<namespace>/` 按 `knowledge` namespace 同步，`docs/<namespace>/` 在被声明后按 `docs` namespace 同步（见 [Docs（文档）](#docs文档)）；`agents/<namespace>/` 按角色的 `agents` namespace 同步（见 [Agents 资源类型](#agents-资源类型)）。`learnings/` 根目录对所有人共享，而 `learnings/<project-id>/` 子目录只对本目录激活的项目同步（见 [多项目](#多项目project-作为与-role-正交的维度)）。
 
@@ -693,7 +693,15 @@ teamai push          # 扫描新增/修改的资源，创建 MR
 teamai push --all    # 跳过确认，直接推送
 teamai push --role pm  # 推送到 pm namespace（skills/pm/、rules/pm/、agents/pm/）
 teamai push --branch feature/gitee-destination  # 使用显式目标分支
+teamai push --types docs,wiki   # 只发布单向 docs/wiki
+teamai push --agent claude      # 只扫描并发布该 Agent 的工具资源
+teamai push --rule my-rule      # 发布单个 rule
+teamai push --force             # 接管先前列出的 docs/wiki 发布冲突
 ```
+
+`push` 与 pull 一样是项目级命令：只在已初始化的 project scope 中运行（user scope 目录与 HTTP 只读团队仓会被拒绝并给出指引），写入前打印 `[push] scope: project=<id>, agent=<tool|all>, types=<list>`。它发布六类资源：`skills`、`rules`、`env`、`agents`，加上单向的 `docs` 与 `wiki`。单向发布把项目自己的 `docs/` 与 `.wiki/` 只读发布到团队仓的 `docs/<project>/` 与 `.wiki/<project>/`，供其他项目从 clone 中读取已发布副本；`--agent` 不改变它们的落点，缺失的 `docs/`/`.wiki/` 只是无可发布。发布需要一个归属项目：`--project` 必须在本目录激活且在 manifest 中声明；未指定时从唯一激活项目推导——多个项目激活且本次要发布 docs/wiki 时会列出候选并停止，而没有项目分区的团队会报告 docs/wiki `unconfigured`，工具资源照常推送。
+
+**单向发布安全：** 每个已发布文件都会与团队仓副本、以及本机上次推送的基线做三方比较。团队仓副本在你上次发布后被他人修改（或本机从未推送过）的文件会被**暂缓**：报告、排除出本次推送，并以非零退出码反映——其他资源照常发出。`--force` 只接管先前列出的冲突项。项目里已删除原文的已发布文件属于 pending-delete：只有在删除清单被显式确认后才从团队仓删除（交互式运行会询问；非交互运行保留文件并以非零退出），且仅当团队仓副本仍与你的基线一致时才可删——远端已改动的副本会被保留并点名。
 
 `--branch` 指定新推送使用的分支；已有开放 PR 始终沿用其记录的分支进行更新。如果团队仓库 clone 存在用户修改、暂存、未跟踪或冲突文件，TeamAI 会在 push 前拒绝执行；TeamAI 自己管理的 `teamai.yaml` 和 sync-lock 状态会单独处理。其他本地改动请先提交或 stash。
 
@@ -730,6 +738,24 @@ Choose namespace [1-3] (default: 1 = common):
 **更新已存在的 PR 而非重复创建：** 如果某个资源已在一个未合并的 PR 中等待评审，再次对它执行 `teamai push` 会就地更新那个已存在的 PR（通过 force-push 其分支），而不是新开一个重复的 PR。保持该资源被选中即更新其 PR；取消勾选则不动它。同一次运行中选中的其他无关资源会进入各自新开的 PR。一旦该 PR 合并（或其分支从远端删除），记录会被清除，下次 push 照常新开 PR。
 
 **YAML Frontmatter 自动补全：** 推送时 CLI 自动检查合法的 mapping 形式 `SKILL.md` frontmatter，缺少 `name`/`description` 则自动补全。格式损坏或根节点为标量时会保留原文并告警，需要手动修复。
+
+### 获取共享 skill 或 rule
+
+`teamai get` 把**一个**共享资源安装或更新到**一个 Agent 的 user 全局目录**——与 pull 的作用域正好相反：不写项目目录、不批量操作、也没有任何协调副作用（不做 hooks/MCP reconcile、不切模型、不上报 usage、不跑 postPull）。
+
+```bash
+teamai get list                    # 共享区有哪些资源（skills、rules）
+teamai get list skills             # 只看 skills
+teamai get skills deploy --agent claude   # 安装/更新一个 skill 到 Claude 的全局 skills 目录
+teamai get rules style --agent codex      # 安装/更新一个 rule，按该 Agent 的格式渲染
+teamai get skills deploy --agent claude --refresh   # 先快进团队仓 clone
+teamai get skills deploy --agent claude --force     # 覆盖先前列出的冲突目标
+```
+
+- **Agent 选择。** `--agent <tool>`（或旧的位置参数 tool）显式指定目标。省略时唯一已安装的 Agent 自动推导；多个已安装 Agent 会交互询问；非交互且有多个候选时直接报错，不做猜测。
+- **重复 get 做三方比较。** TeamAI 记录安装来源与写入内容。重复运行报告 `unchanged`（不重写）、团队仓副本更新且本地未改时安全 `update`，而本地已改动的安装副本会**报告冲突而不是覆盖**（`--force` 在展示冲突后丢弃本地版本）；两端都改、或目标存在但不是 get 安装的，同样报告冲突。
+- **--refresh** 只快进本地团队仓 clone；绝不运行资源 pull，也没有任何 hook/MCP/usage 副作用；刷新失败会明确说明本次用的是现有（可能过期的）clone。
+- `get docs` / `get wiki` 是保留兼容的弃用镜像，会打印弃用警告，未来版本可能移除。项目 docs 与 wiki 由 `push` 单向发布，从 clone 读取。
 
 ### 查看状态
 
@@ -974,23 +1000,22 @@ variables:
 
 ### Docs（文档）
 
-将文档放入团队仓库 `docs/` 目录，push 后团队成员 pull 时自动同步。
+docs 归项目所有并单向发布（007）。每个项目把文档保存在项目根的 `docs/` 目录；`teamai push` 只读发布到团队仓的 `docs/<project>/`，其他项目从本地团队仓 clone 读取已发布副本（`recall` 也在那里索引）。`teamai pull` 不会部署、镜像、创建或清理项目 docs：clone 更新带回的只是 clone，不是部署；旧版 CLI 留下的 `sharing.docs.localDir` 镜像目录不会再被写入，可自行删除。已发布文件在你上次发布后被远端修改时会被暂缓并报告而不是覆盖；项目原文消失的已发布文件只有在显式确认后才从团队仓删除（见[推送本地资源](#推送本地资源)）。
 
-**按 namespace 分发 docs。** 只要有任一角色或项目在 `resources.docs` 中列出某个顶层 `docs/<ns>/`，它就成为一个 namespace，此后只分发给激活了它的成员（其角色与所在目录项目的 namespace 并集），其他人不再收到。没有任何角色或项目列出的 `docs/<dir>/` 仍然共享，因此已有的子目录继续分发给所有人：
+**按 namespace 过滤 docs。** 只要有任一角色或项目在 `resources.docs` 中列出某个顶层 `docs/<ns>/`，它就成为一个 namespace；namespace 现在约束的是成员 `recall` 的索引范围（未激活的 namespace 不索引），而不再约束 pull 的分发——pull 根本不分发 docs：
 
 ```yaml
 # manifest/projects.yaml
 projects:
   - id: checkout
     resources:
-      docs: [checkout]     # docs/checkout/ 只在 checkout 激活时分发
+      docs: [checkout]     # docs/checkout/ 只在 checkout 激活时索引
 ```
 
 - 没有覆盖规则：每个 namespace 是独立的子树，namespace 中的文件不会替换根目录的文件。
-- 某个 namespace 对你不再激活时，下一次 pull 会删除本地仍与团队副本（或团队更早的某个版本，即你收到后团队又修改过）逐字节一致的该 namespace 文档；你修改过的文档会保留，并打印一行说明它的路径。其中团队仓库没有的本地文件会被删除，与文档镜像的其他位置一样。
 - `team-codebase` 不能作为 docs namespace：`docs/team-codebase/` 是旧版 codebase 输出目录。声明它的 manifest 会加载失败。
-- `recall` 和 `teamai doctor` 使用同一过滤规则：recall 只索引你收到的文档，`Team docs delivered` 不会要求你拥有未激活的 namespace。
-- 旧模式（没有角色，也没有 `projects.yaml`）照旧分发整个 `docs/`。
+- `recall` 使用同一送达过滤规则：只索引你收到的文档。
+- 旧模式（没有角色，也没有 `projects.yaml`）照旧索引整个 `docs/`。
 
 ### MCP Server
 
@@ -1856,7 +1881,7 @@ teamai remove rules <name> --force   # 跳过确认，用于脚本和 CI
 
 仅当所有检查通过时，`teamai doctor` 才以状态码 0 退出；任一检查失败时以状态码 1 退出。尚未初始化时，它只报告缺少配置，不会臆测 Git 托管平台。手动执行 `teamai pull` 结束时会运行同一批检查（不含托管平台相关的检查，也不含本次 pull 已经自行报告过的检查）。被标记为 informational 的检查——目前只有 `No stale env blocks left behind`——仍会计入 `doctor` 的退出码，但 pull 不会把它的失败并入 `Pull finished, but N check(s) failed`：早期安装留下的遗留文件属于清理事项，不代表这次 pull 弄坏了什么，因此依旧会被点名，只是单独用一行更轻的提示呈现。
 
-除了托管平台、clone、配置和 hook 检查之外，`doctor` 还会验证落到本机上的内容。`<tool> is installed` 在 `enabledAgents` 列出了不会收到任何内容的工具时失败——这正是 pull 报告成功、而该工具什么都没收到的情况。它使用与同步相同的解析逻辑，因此像 OpenClaw 这样把 skills 放在 workspace 目录而非工具根目录的工具，会在同步真正写入的位置被判断。工具已安装时也会作为通过项报告，因此 `--json` 无论哪种情况都会为每个已启用工具给出一条记录。pull 结束时的检查只覆盖它从当前目录解析出的那个 scope；其他 scope 请在对应目录下运行 `teamai doctor`。`Skills delivered to <tool>` 会把角色命名空间、标签订阅与排除规则解析出的 skill 集合，与每个已安装工具磁盘上的内容比对：从未送达的 skill 与送达但不可读的 skill 会分别报告——后者指 `SKILL.md` 缺失、frontmatter 无法解析，或其 `name` 与目录名不一致，导致 agent 永远发现不了它。`Team docs delivered` 将你应收到的文档（不含未激活的 docs namespace）与 `sharing.docs.localDir` 比对（它只有一个目标目录，而非每个工具一个）；每个应有的文档都必须是可读取的文件，因此占用了该名字的目录或断链接也算缺失。它还会将本地多余的非隐藏文件报告为过期文档，即使团队文档已经删空也会检查；本地隐藏文件会保留，不会使检查失败，未激活 namespace 中团队文档的本地副本也不会：pull 会删除未修改的副本，并点名你修改过的副本。`doctor` 还会输出提示，它们只是信息，不是失败的检查。每条提示指出一个在本机替换了根目录条目的 namespace skill、agent、rule、共享指令文件、env 变量、hook、MCP server 或团队模型配置（`rules: "style" from rules/checkout/style.md replaces rules/style.md`）。当某个 namespace 提供了 env 变量、hook、MCP server 或团队模型配置时，还会有一条提示按来源统计该类型的条目（`env: 3 received here (2 root, 1 checkout)`）。未配置角色或项目时，提示改为列出团队仓库中重复定义的每个文件，以及在根文件中重复出现的每个 env 变量、hook 或 MCP server 名称。
+除了托管平台、clone、配置和 hook 检查之外，`doctor` 还会验证落到本机上的内容。`<tool> is installed` 在 `enabledAgents` 列出了不会收到任何内容的工具时失败——这正是 pull 报告成功、而该工具什么都没收到的情况。它使用与同步相同的解析逻辑，因此像 OpenClaw 这样把 skills 放在 workspace 目录而非工具根目录的工具，会在同步真正写入的位置被判断。工具已安装时也会作为通过项报告，因此 `--json` 无论哪种情况都会为每个已启用工具给出一条记录。pull 结束时的检查只覆盖它从当前目录解析出的那个 scope；其他 scope 请在对应目录下运行 `teamai doctor`。`Skills delivered to <tool>` 会把角色命名空间、标签订阅与排除规则解析出的 skill 集合，与每个已安装工具磁盘上的内容比对：从未送达的 skill 与送达但不可读的 skill 会分别报告——后者指 `SKILL.md` 缺失、frontmatter 无法解析，或其 `name` 与目录名不一致，导致 agent 永远发现不了它。`Team docs delivered` 检查本机应收到的文档（不含未激活的 docs namespace）与旧版送达集合的一致性；由于 pull 已不再部署 docs，它的失败应视为旧版本残留——本地镜像目录不会被自动清理，可自行处理。`doctor` 还会输出提示，它们只是信息，不是失败的检查。每条提示指出一个在本机替换了根目录条目的 namespace skill、agent、rule、共享指令文件、env 变量、hook、MCP server 或团队模型配置（`rules: "style" from rules/checkout/style.md replaces rules/style.md`）。当某个 namespace 提供了 env 变量、hook、MCP server 或团队模型配置时，还会有一条提示按来源统计该类型的条目（`env: 3 received here (2 root, 1 checkout)`）。未配置角色或项目时，提示改为列出团队仓库中重复定义的每个文件，以及在根文件中重复出现的每个 env 变量、hook 或 MCP server 名称。
 
 `Rules delivered to <tool>` 与 `Agents delivered to <tool>` 对另外两类按工具下发的资源做同样的事，并且都向 handler 询问落点，而不是自行拼路径：rule 的文件名和内容因工具而异（`.md` 原样、`.mdc` 带派生的 `globs`/`alwaysApply`、`.instructions.md` 带 `applyTo`），agent 的落点来自渲染结果，且由 `targets:` 决定哪些工具应当收到。已送达的 rule 会与 handler 为该工具渲染出的字节逐一比对，而不只是检查该工具所需的键是否存在：`globs` 与团队 rule 的 `paths:` 不再一致的 `.mdc`，即使 `alwaysApply` 取值合法，也会作用到错误的文件上；这里会报告为 `delivered from an older copy`——正文漂移的副本同样如此，因为两者都写入成功，却都是错的。agent 会与渲染结果逐字节比对：旧版 spec 留下的副本（普通 pull 会跳过团队仓库未变化的 scope，它可能一直留在那里）报告为 `delivered from an older spec`，而不是当作已送达。`Every team agent reaches a tool` 会指出在任何已安装工具上都无法渲染的 agent，通常是 spec 解析失败，或 `targets:` 只列了本机没有的工具。这两项仅在 `doctor` 中运行：它们会按工具读取每条 rule、解析每个 agent，放进 pull 结束时的检查会耗尽其时间预算。
 
@@ -2132,7 +2157,7 @@ sharing:
         retries: 3             # 可选，失败重试次数（默认 3）
 ```
 
-`teamai pull` 将你收到的 `docs/` 非隐藏文件（见[按 namespace 分发 docs](#docs文档)）镜像同步到 `sharing.docs.localDir`：团队库删除的文档，本地也会一并删除，包括删除最后一篇文档或整个团队文档目录的情况。过期的空目录也会删除，隐藏文件和隐藏目录会保留。请使用专用文档目录，因为仅存在于本地的草稿也会删除。目标目录若与团队仓库重叠，或包含主目录／项目根目录，会被拒绝同步；若目标本身就是团队的 `docs/`，则无需复制或清理。同名路径的文件／目录类型变化会先准备替换内容，替换失败时恢复冲突的本地条目。若待替换目录含本地隐藏条目，需先移走这些条目；同步不会丢弃它们。复制失败时不会继续清理。`teamai pull --dry-run` 只预览同步，不修改文件；对于旧版 CLI 已同步过的版本，可用 `teamai pull --force` 清理历史残留。
+`sharing.docs.localDir` 是旧版本的文档镜像配置。pull 不再镜像 docs（007）：项目 docs 由 `push` 单向发布并从团队仓 clone 读取，因此该配置现已失效——旧版 CLI 留下的镜像目录不会被本版本写入、清理或删除，可自行处理。新的 `teamai.yaml` 不必再配置它。
 
 ### config.yaml（本地配置）
 

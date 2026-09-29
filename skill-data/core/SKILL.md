@@ -94,8 +94,9 @@ says so and why.)
 ## Daily commands
 
 ```bash
-teamai pull        # Sync team resources into local AI tools now
-teamai push        # Publish your local skills/rules/docs to the team
+teamai pull        # Sync the four resource types (skills, rules, env, agents) into this project's AI tools now
+teamai push        # Publish project resources: skills, rules, env, agents + one-way docs and wiki
+teamai get skills <name> --agent <tool>   # Install or update one shared skill into an agent's global directory
 teamai status      # Show local vs team differences
 teamai doctor      # Diagnose configuration and hook problems
 teamai list        # List resources (skills|rules|docs|env|agents|hooks|mcp)
@@ -107,9 +108,18 @@ teamai recall --wiki-page .wiki/<pid>/<name>wiki/.../<page>.md  # implies --json
 Every other command, every flag, and the flags `--help` hides live in the
 generated reference below. Read it instead of guessing a flag.
 
-`teamai pull` mirrors the non-hidden docs you receive into `sharing.docs.localDir`,
-removing stale and local-only documents; an edited doc of a docs namespace you left
-is kept and named. Use a dedicated directory; preview with `--dry-run`.
+Scope boundaries (007): `pull` and `push` run only inside an initialized project
+scope and touch exactly the resolved project — never a user-global fallback.
+`pull` deploys only skills/rules/env/agents; project docs and the project wiki
+(`docs/`, `.wiki/`) are one-way published by `push` to `docs/<project>/` and
+`.wiki/<project>/` in the team repo, for other projects to read from the clone —
+`pull` never creates, overwrites or cleans them. Published copies that changed
+remotely are held and reported, not overwritten; a published file whose project
+original disappeared is deleted from the team repo only after an explicit
+confirmation. `get` installs one shared skill/rule into one agent's user-global
+directory and reports conflicts instead of overwriting local edits. Hook/MCP
+reconcile, model switching, usage reporting and postPull scripts have their own
+explicit commands and are never triggered implicitly by pull or get.
 
 ## References
 

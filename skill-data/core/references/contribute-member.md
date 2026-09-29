@@ -93,6 +93,15 @@ The doc lands in the team's `learnings/` and appears for teammates on their next
    ```
 
    To publish into a specific role namespace: `teamai push --skill <path> --role <id>`.
+
+   Pushing docs and wiki: `teamai push` also one-way publishes the project's own
+   `docs/` and `.wiki/` into `docs/<project>/` and `.wiki/<project>/` in the team
+   repo, so other projects can read them from the clone. Narrow with
+   `--types docs` (or `wiki`) and preview with `--dry-run`. A published file that
+   someone else changed in the team repo is held and reported, never silently
+   overwritten (`--force` names and takes over exactly the listed conflicts); a
+   published file whose project original you deleted is offered for deletion
+   from the team repo only after an explicit confirmation.
    `--role <ns>` / `--project <id>` place every new resource, not only skills: a
    new rule and a new agent land in that namespace too (a project resolves each
    from its own axis — `knowledge` for rules, `agents` for agents). Without one,

@@ -52,6 +52,8 @@ export const ToolPathsSchema = z.object({
     .optional(),
 });
 
+export type ToolPaths = z.infer<typeof ToolPathsSchema>;
+
 // ─── Scope ──────────────────────────────────────────────
 
 export const ScopeEnum = z.enum(['user', 'project']);
@@ -802,6 +804,34 @@ export const StateSchema = z.object({
   retiredPlacedAgents: z.record(z.string(), z.string()).optional(),
   pushedSkills: z.array(z.string()).default([]),
   pushedEnvVars: z.array(z.string()).default([]),
+  /**
+   * Shared-resource installs recorded by `teamai get` (007), one entry per
+   * (type, agent, resource) installed into an agent's user-global directory.
+   * Key: `${type}:${agent}:${name}`, where name is the resource's path
+   * relative to its repo root segment (`ns/skill` or a rule stem). The two
+   * digests are the S/B pair of the three-way compare get runs on a repeat:
+   * `sourceSha256` is the team repo content the resource came from,
+   * `deployedSha256` what this machine last wrote to the target. Tokens and
+   * remote URLs are never recorded here.
+   */
+  sharedInstalls: z.record(z.string(), z.object({
+    type: z.enum(['skills', 'rules']),
+    name: z.string(),
+    agent: z.string(),
+    sourceRelPath: z.string(),
+    sourceSha256: z.string(),
+    deployedSha256: z.string(),
+    lastSyncedAt: z.string(),
+  })).optional(),
+  /**
+   * Publishing baselines for the one-way docs/wiki push (007): repo-relative
+   * target path (`docs/<pid>/…`, `.wiki/<pid>/…`) → sha256 of the content this
+   * machine last pushed there. The conflict detection compares the project
+   * source (S), the team repo copy (T) and this baseline (B); only what push
+   * itself wrote is recorded, and a delete may land only where T still equals
+   * B.
+   */
+  publishedFiles: z.record(z.string(), z.string()).optional(),
   /** Push branches whose PR is still open — see PendingPushSchema. */
   pendingPushes: z.array(PendingPushSchema).default([]),
   /**

@@ -33,26 +33,36 @@ Generated: do not edit by hand. Regenerate with
 
 ## push
 
-- `teamai push` — Push local resources to team repo
+- `teamai push` — Push project resources to the team repo: skills, rules, env, agents, plus one-way published docs and wiki
   - `--all` — Push all without confirmation
   - `--skill <path>` — Push a specific skill by path (e.g., ~/.claude/skills/hai/my-skill or skills/hai_dev/my-skill)
+  - `--rule <name>` — Push only the rule matching this name
+  - `--types <list>` — Comma-separated resource types to publish (skills,rules,docs,env,agents,wiki; default all six)
+  - `--agent <tool>` — Scan and publish tool resources from this agent only (skills/rules/agents)
   - `--role <id>` — Namespace for new skills, rules and agents (skills/<id>/, rules/<id>/, agents/<id>/)
-  - `--project <id>` — Target a project: each new resource goes to that project's namespace for its own type — skills, knowledge for rules, agents (from manifest/projects.yaml)
+  - `--project <id>` — Project scope for this push. The project must be active in this directory and declared in manifest/projects.yaml; docs and wiki publish to docs/<id>/ and .wiki/<id>/, and other new resources go to that project's namespaces
   - `--branch <name>` — Push to this destination branch instead of a generated teamai/push branch
+  - `--force` — Overwrite held docs/wiki publish conflicts listed before the push (their paths are shown first)
 
 ## pull
 
-- `teamai pull` — Pull team resources and inject into local AI tools
+- `teamai pull` — Pull the four team resource types (skills, rules, env, agents) into this project's tool directories
   - `--silent` — Silent mode (for hooks)
   - `--force` — Force full sync even if repo is unchanged
+  - `--project <id>` — Project scope for this pull (defaults to the single active project in this directory)
+  - `--types <list>` — Comma-separated resource types (skills,rules,env,agents; default all four). docs and wiki are pull-managed never: they are one-way published by push
+  - `--agent <tool>` — Deploy only this agent's tool directories
+  - `--skill <name>` — Update a single skill by name (skips cleanup and revision recording)
+  - `--rule <name>` — Update a single rule by name (skips cleanup and revision recording)
 
 ## get
 
-- `teamai get [type] [name] [tool]` — Get individual resources (skills|rules|docs|wiki) from the team repo clone into this project. `get list [type]` discovers what is available.
-  - `--all` — Mirror the whole team docs directory into the project (docs only)
-  - `--diff` — Preview team vs local wiki differences without writing (wiki only)
-  - `--prune` — Remove local files missing from the team repo (wiki/docs mirror modes)
-  - `--force` — Overwrite existing local copies
+- `teamai get [type] [name] [tool]` — Get a shared skill or rule from the team repo clone into an agent's user-global directory. `get list` discovers what is available. docs/wiki remain as a deprecated legacy mirror.
+  - `--agent <tool>` — Target this agent's user-global directory (skills/rules only; replaces the legacy positional tool argument)
+  - `--all` — Mirror the whole team docs directory into the project (docs only, deprecated)
+  - `--diff` — Preview team vs local wiki differences without writing (wiki only, deprecated)
+  - `--prune` — Remove local files missing from the team repo (deprecated wiki/docs mirror modes)
+  - `--force` — Overwrite an existing or locally-edited target copy
   - `--refresh` — Fast-forward the local team repo clone before reading
 
 ## status

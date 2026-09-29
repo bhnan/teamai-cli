@@ -151,19 +151,22 @@ describe('WikiHandler', () => {
     };
   }
 
-  it('scanLocalForPush returns only new/modified pages vs the team repo', async () => {
+  it('scanLocalForPush publishes against .wiki/<projectId>/ and needs one', async () => {
     write('.wiki/changed.md', 'local-v2');
     write('.wiki/same.md', 'same');
     write('.wiki/new.md', 'n');
-    write('repo/.wiki/changed.md', 'local-v1');
-    write('repo/.wiki/same.md', 'same');
+    write('repo/.wiki/proj/changed.md', 'local-v1');
+    write('repo/.wiki/proj/same.md', 'same');
     const { localConfig, teamConfig } = makeConfigs();
     const handler = new WikiHandler();
-    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+    // Without a projectId the one-way publish has nowhere to land.
+    expect(await handler.scanLocalForPush(teamConfig, localConfig)).toEqual([]);
+    const items = await handler.scanLocalForPush(teamConfig, localConfig, { projectId: 'proj' });
     const names = items.map((i) => i.name).sort();
     expect(names).toEqual(['changed.md', 'new.md']);
     expect(items.find((i) => i.name === 'changed.md')?.status).toBe('modified');
     expect(items.find((i) => i.name === 'new.md')?.status).toBe('new');
+    expect(items.find((i) => i.name === 'new.md')?.relativePath).toBe('.wiki/proj/new.md');
   });
 
   it('localWikiDir binds to the project in project scope', () => {

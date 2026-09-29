@@ -142,18 +142,22 @@ program
 
 program
   .command('push')
-  .description('Push local resources to team repo')
+  .description('Push project resources to the team repo: skills, rules, env, agents, plus one-way published docs and wiki')
   .option('--all', 'Push all without confirmation')
   .option('--skill <path>', 'Push a specific skill by path (e.g., ~/.claude/skills/hai/my-skill or skills/hai_dev/my-skill)')
+  .option('--rule <name>', 'Push only the rule matching this name')
+  .option('--types <list>', 'Comma-separated resource types to publish (skills,rules,docs,env,agents,wiki; default all six)')
+  .option('--agent <tool>', 'Scan and publish tool resources from this agent only (skills/rules/agents)')
   .option('--role <id>', 'Namespace for new skills, rules and agents (skills/<id>/, rules/<id>/, agents/<id>/)')
-  .option('--project <id>', "Target a project: each new resource goes to that project's namespace for its own type "
-    + '— skills, knowledge for rules, agents (from manifest/projects.yaml)')
+  .option('--project <id>', 'Project scope for this push. The project must be active in this directory and declared in manifest/projects.yaml; '
+    + 'docs and wiki publish to docs/<id>/ and .wiki/<id>/, and other new resources go to that project\'s namespaces')
   .option('--branch <name>', 'Push to this destination branch instead of a generated teamai/push branch')
+  .option('--force', 'Overwrite held docs/wiki publish conflicts listed before the push (their paths are shown first)')
   .action(async (cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;
     const { push } = await import('./push.js');
     // Only notify when a real push actually happened — not on dry-run, cancel,
-    // no-change, or a handled failure (#702 follow-up).
+    // no-change, or a handled failure (#702).
     const outcome = { completed: false };
     await push({ ...globalOpts, ...cmdOpts }, outcome);
     if (outcome.completed) await notifyWebhook('push');
@@ -161,9 +165,14 @@ program
 
 program
   .command('pull')
-  .description('Pull team resources and inject into local AI tools')
+  .description('Pull the four team resource types (skills, rules, env, agents) into this project\'s tool directories')
   .option('--silent', 'Silent mode (for hooks)')
   .option('--force', 'Force full sync even if repo is unchanged')
+  .option('--project <id>', 'Project scope for this pull (defaults to the single active project in this directory)')
+  .option('--types <list>', 'Comma-separated resource types (skills,rules,env,agents; default all four). docs and wiki are pull-managed never: they are one-way published by push')
+  .option('--agent <tool>', 'Deploy only this agent\'s tool directories')
+  .option('--skill <name>', 'Update a single skill by name (skips cleanup and revision recording)')
+  .option('--rule <name>', 'Update a single rule by name (skips cleanup and revision recording)')
   .action(async (cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;
     if (cmdOpts.silent) setSilent(true);
@@ -178,11 +187,12 @@ program
 
 program
   .command('get [type] [name] [tool]')
-  .description('Get individual resources (skills|rules|docs|wiki) from the team repo clone into this project. `get list [type]` discovers what is available.')
-  .option('--all', 'Mirror the whole team docs directory into the project (docs only)')
-  .option('--diff', 'Preview team vs local wiki differences without writing (wiki only)')
-  .option('--prune', 'Remove local files missing from the team repo (wiki/docs mirror modes)')
-  .option('--force', 'Overwrite existing local copies')
+  .description('Get a shared skill or rule from the team repo clone into an agent\'s user-global directory. `get list` discovers what is available. docs/wiki remain as a deprecated legacy mirror.')
+  .option('--agent <tool>', 'Target this agent\'s user-global directory (skills/rules only; replaces the legacy positional tool argument)')
+  .option('--all', 'Mirror the whole team docs directory into the project (docs only, deprecated)')
+  .option('--diff', 'Preview team vs local wiki differences without writing (wiki only, deprecated)')
+  .option('--prune', 'Remove local files missing from the team repo (deprecated wiki/docs mirror modes)')
+  .option('--force', 'Overwrite an existing or locally-edited target copy')
   .option('--refresh', 'Fast-forward the local team repo clone before reading')
   .action(async (type, name, tool, cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;

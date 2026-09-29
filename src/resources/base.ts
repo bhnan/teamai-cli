@@ -36,6 +36,13 @@ export async function isToolInstalledForConfig(
 export interface ScanForPushOptions {
   /** The namespace `--role <ns>` / `--project <id>` resolved to, if any. */
   namespace?: string;
+  /**
+   * The logical project this push runs as, resolved from the directory's
+   * active projects (007). Only the one-way published types read it: docs and
+   * wiki land under `docs/<projectId>/` and `.wiki/<projectId>/`, so their
+   * scan cannot decide new-vs-modified without it.
+   */
+  projectId?: string;
 }
 
 export abstract class ResourceHandler {

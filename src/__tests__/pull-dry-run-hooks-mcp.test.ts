@@ -1,18 +1,10 @@
 /**
- * `pull --dry-run` used to return before the hooks and MCP reconcile stages
- * (`if (options.dryRun) return`), so the warnings those stages raise — an
- * unknown entry id, a per-entry `roles:` key, a hooks.yaml that does not
- * parse — never reached the maintainer who ran the dry run to see exactly
- * them (#822, item 3). A dry run must resolve and warn, then skip the write.
- *
- * MCP already had the capability: `McpReconcileOptions.dryRun` gates every
- * write in mcp-reconcile.ts and `teamai mcp inject --dry-run` uses it, so
- * `reconcileMcpAllScopes` only had to forward it. Hooks had no dry-run path at
- * all, so `reconcileTeamHooksForConfig` gained one.
- *
- * The tests drive `pull()` rather than the reconcile functions, the same way
- * pull-env-shape-warning.test.ts does: the defect was in the orchestration
- * layer, so that is where it has to be pinned.
+ * 007 boundary: `pull` is a four-type project resource sync and no longer
+ * runs the hooks or MCP reconcile in ANY mode — `teamai hooks` / `teamai mcp`
+ * own those, behind their own explicit entry points. These tests pin that
+ * boundary through `pull()` itself (the orchestration layer, the same way the
+ * previous #822 tests did) and keep the dry-run no-write guarantees for the
+ * resource types pull still deploys.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fse from 'fs-extra';
@@ -21,7 +13,7 @@ import path from 'node:path';
 
 vi.mock('../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../config.js')>()),
-  detectProjectConfig: vi.fn().mockResolvedValue(null),
+  detectProjectConfig: vi.fn(),
   loadLocalConfigForScope: vi.fn(),
   loadStateForScope: vi.fn().mockResolvedValue({ lastPull: null, lastPullRev: null }),
   loadTeamConfig: vi.fn(),
@@ -65,8 +57,8 @@ vi.mock('../roles.js', () => ({
   activeRoleIds: vi.fn(() => ['dev']),
 }));
 
-// Isolation: pull() takes a real ~/.teamai/.sync-lock. Parallel vitest workers
-// sharing that path race and skip/error, so these tests mock the lock.
+// Isolation: pull() takes a real sync-lock. Parallel vitest workers sharing
+// that path race and skip/error, so these tests mock the lock.
 vi.mock('../update.js', () => ({
   acquireLock: vi.fn().mockResolvedValue(true),
   releaseLock: vi.fn().mockResolvedValue(undefined),
@@ -80,7 +72,7 @@ vi.mock('../doctor.js', async (importOriginal) => ({
   buildChecks: vi.fn(),
 }));
 
-// Mocked so the dry-run forwarding can be asserted on the arguments. The real
+// Mocked so the "pull never reconciles MCP" boundary can be asserted. The real
 // implementation is covered by mcp-reconcile.test.ts; this file is about the
 // wiring in pull. The spread keeps every other export real, so a symbol this
 // file does not know about still resolves.
@@ -89,36 +81,45 @@ vi.mock('../mcp-reconcile.js', async (importOriginal) => ({
   reconcileMcpForConfig: vi.fn().mockResolvedValue({ changes: [], wrote: false }),
 }));
 
-import { detectProjectConfig, loadLocalConfigForScope, loadStateForScope, loadTeamConfig, saveStateForScope } from '../config.js';
-import { acquireLock } from '../update.js';
-import { buildChecks, resolveDoctorContext, type DoctorContext } from '../doctor.js';
+// Same treatment for hooks: pull must not reach for the reconcile even when a
+// hooks.yaml exists in the team repo.
+vi.mock('../hooks.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../hooks.js')>(),
+  reconcileTeamHooksForConfig: vi.fn().mockResolvedValue({ ok: true, defs: [] }),
+}));
+
+import { detectProjectConfig, loadStateForScope, loadTeamConfig, saveStateForScope } from '../config.js';
 import { log } from '../utils/logger.js';
 import { pull } from '../pull.js';
+import { reconcileTeamHooksForConfig } from '../hooks.js';
 import { reconcileMcpForConfig } from '../mcp-reconcile.js';
 import type { LocalConfig, TeamaiConfig } from '../types.js';
 
-const DEPRECATED_ROLES_WARNING = 'per-entry `roles:`';
-
-describe('pull --dry-run reports hooks and MCP entry warnings', () => {
+describe('pull leaves hooks and MCP reconciliation to their own commands', () => {
   let tempDir: string;
   let homeDir: string;
+  let projectRoot: string;
   let repoPath: string;
+  let localConfig: LocalConfig;
 
   beforeEach(async () => {
-    tempDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-pull-dry-hooksmcp-'));
+    tempDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-pull-hooksmcp-'));
     homeDir = path.join(tempDir, 'home');
+    projectRoot = path.join(tempDir, 'proj');
     repoPath = path.join(tempDir, 'team-repo');
     vi.stubEnv('HOME', homeDir);
 
-    await fse.ensureDir(path.join(homeDir, '.claude', 'skills'));
+    // A project checkout with the claude tool installed, so a skills deploy
+    // has a real target directory to (not) write into.
+    await fse.ensureDir(path.join(projectRoot, '.claude', 'skills'));
     await fse.ensureDir(path.join(repoPath, 'manifest'));
     await fse.writeFile(path.join(repoPath, 'manifest', 'roles.yaml'), 'version: 1\n');
 
-    const localConfig: LocalConfig = {
+    localConfig = {
       repo: { localPath: repoPath, remote: 'owner/repo' },
       username: 'tester',
-      scope: 'user',
-      primaryRole: 'dev',
+      scope: 'project',
+      projectRoot,
       additionalRoles: [],
     };
     const teamConfig: TeamaiConfig = {
@@ -132,34 +133,21 @@ describe('pull --dry-run reports hooks and MCP entry warnings', () => {
       },
       toolPaths: {
         claude: { skills: '.claude/skills', rules: '.claude/rules', settings: '.claude/settings.json' },
-        // Pi ships in every team's default toolPaths, so the dry-run Pi-skip
-        // report has the same reach a real reconcile's per-tool pass has.
+        // Pi ships in every team's default toolPaths; it stays configured so a
+        // regression that reintroduces the hooks pass has the same reach.
         pi: { skills: '.pi/skills', rules: '.pi/rules', claudemd: 'AGENTS.md' },
       },
     };
 
-    vi.mocked(detectProjectConfig).mockResolvedValue(null);
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(localConfig);
+    vi.mocked(detectProjectConfig).mockResolvedValue(localConfig);
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
     vi.mocked(loadStateForScope).mockResolvedValue({ lastPull: null, lastPullRev: null } as never);
-
-    const ctx: DoctorContext = {
-      localConfig,
-      teamConfig,
-      toolPaths: teamConfig.toolPaths,
-      hookToolPaths: teamConfig.toolPaths,
-      baseDir: homeDir,
-    };
-    vi.mocked(resolveDoctorContext).mockResolvedValue(ctx);
-    vi.mocked(buildChecks).mockResolvedValue([]);
-    // clearAllMocks resets calls, not implementations, so a test that makes the
-    // lock contended would otherwise leak into the next one.
-    vi.mocked(acquireLock).mockResolvedValue(true);
   });
 
   afterEach(async () => {
     vi.unstubAllEnvs();
     vi.clearAllMocks();
+    process.exitCode = 0;
     await fse.remove(tempDir);
   });
 
@@ -180,17 +168,17 @@ describe('pull --dry-run reports hooks and MCP entry warnings', () => {
     );
   }
 
-  it('warns about the deprecated per-entry `roles:` key on a dry run', async () => {
+  it('does not run the hooks reconcile on a dry run, so its warnings never surface', async () => {
     await writeHooksWithDeprecatedRoles();
 
     await pull({ dryRun: true, force: true });
 
-    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining(DEPRECATED_ROLES_WARNING));
-    // The debug trail follows the same preview rule: a dry run must not log a
-    // reconcile that did not happen.
+    expect(reconcileTeamHooksForConfig).not.toHaveBeenCalled();
+    // The deprecated `roles:` warning belonged to the reconcile pass; pull
+    // must neither resolve nor repeat it.
+    expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining('per-entry `roles:`'));
     const debugLines = vi.mocked(log.debug).mock.calls.map(([m]) => String(m));
-    expect(debugLines.some((l) => l.includes('Would apply 1 team hook(s)'))).toBe(true);
-    expect(debugLines.some((l) => l.includes('Reconciled'))).toBe(false);
+    expect(debugLines.some((l) => l.includes('Would apply') || l.includes('Reconciled'))).toBe(false);
   });
 
   it('writes no hook settings or manifest on a dry run', async () => {
@@ -198,86 +186,62 @@ describe('pull --dry-run reports hooks and MCP entry warnings', () => {
 
     await pull({ dryRun: true, force: true });
 
-    // The reconcile stage is the only thing that writes these; a dry run must
-    // leave them absent even though it resolved and warned.
-    expect(await fse.pathExists(path.join(homeDir, '.claude', 'settings.json'))).toBe(false);
-    expect(await fse.pathExists(path.join(homeDir, '.teamai', 'managed-hooks.json'))).toBe(false);
+    // Even with a hooks.yaml present, nothing hook-shaped is written and no
+    // state is recorded.
+    expect(await fse.pathExists(path.join(projectRoot, '.claude', 'settings.json'))).toBe(false);
+    expect(await fse.pathExists(path.join(projectRoot, '.teamai', 'managed-hooks.json'))).toBe(false);
     expect(saveStateForScope).not.toHaveBeenCalled();
   });
 
-  it('still warns on a real pull, so the dry run reports what would happen', async () => {
+  it('does not run the hooks reconcile on a real pull either', async () => {
     await writeHooksWithDeprecatedRoles();
 
     await pull({ force: true });
 
-    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining(DEPRECATED_ROLES_WARNING));
+    expect(reconcileTeamHooksForConfig).not.toHaveBeenCalled();
+    expect(await fse.pathExists(path.join(projectRoot, '.claude', 'settings.json'))).toBe(false);
     const debugLines = vi.mocked(log.debug).mock.calls.map(([m]) => String(m));
-    expect(debugLines.some((l) => l.includes('Reconciled 1 team hook(s)'))).toBe(true);
+    expect(debugLines.some((l) => l.includes('Reconciled'))).toBe(false);
   });
 
-  it('reports the Pi skip on a dry run, like a real pull would', async () => {
-    // A hook scoped to Pi is never applied — Pi runs built-in lifecycle hooks
-    // only — and a real pull says so during the per-tool pass. The dry run
-    // stops before that pass but must repeat the skip, or its "Would apply"
-    // line promises hooks no tool will run.
-    await fse.ensureDir(path.join(repoPath, 'hooks'));
-    await fse.writeFile(
-      path.join(repoPath, 'hooks', 'hooks.yaml'),
-      [
-        'hooks:',
-        '  - id: pi-note',
-        '    description: Pi only',
-        '    event: PostToolUse',
-        '    command: teamai hook-dispatch post-tool-use',
-        '    tools: [pi]',
-        '',
-      ].join('\n'),
-    );
-    await fse.ensureDir(path.join(homeDir, '.pi'));
+  it.each([
+    ['dry run', { dryRun: true, force: true }],
+    ['real pull', { force: true }],
+  ] as const)('does not run the MCP reconcile on a %s', async (_mode, options) => {
+    await pull(options);
 
-    await pull({ dryRun: true, force: true });
-
-    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('Pi supports built-in lifecycle hooks only; skipping 1 custom team hook(s)'));
-  });
-
-  it('forwards dryRun to the MCP reconcile so its writes are skipped too', async () => {
-    // The MCP entry resolution runs inside reconcileMcpForConfig, which already
-    // gates its writes on dryRun; the bug was that pull never passed it.
-    await pull({ dryRun: true, force: true });
-
-    expect(reconcileMcpForConfig).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.anything(),
-      expect.objectContaining({ dryRun: true }),
-    );
-  });
-
-  it('reports MCP changes on a dry run without claiming they were applied', async () => {
-    // A dry run still returns the changes it *would* make — `wrote: false` is the
-    // only difference — so pull's summary line must not read as a completed
-    // apply. Reporting "Restart your AI tool session to load them" after a run
-    // that wrote nothing is the same class of defect as "Applying" was on the
-    // hooks side before the preview flag.
-    vi.mocked(reconcileMcpForConfig).mockResolvedValueOnce({
-      changes: [{ tool: 'claude', server: 'team-server', action: 'added' }],
-      wrote: false,
-    });
-
-    await pull({ dryRun: true, force: true });
-
+    expect(reconcileMcpForConfig).not.toHaveBeenCalled();
+    // Nor claim MCP changes it did not make.
     const lines = vi.mocked(log.info).mock.calls.map(([m]) => String(m));
-    expect(lines.some((l) => l.includes('[dry-run]') && l.includes('Would make'))).toBe(true);
     expect(lines.some((l) => l.includes('Restart your AI tool session'))).toBe(false);
+    expect(lines.some((l) => l.includes('Would make'))).toBe(false);
   });
 
-  it('keeps the applied wording on a real pull', async () => {
-    vi.mocked(reconcileMcpForConfig).mockResolvedValueOnce({
-      changes: [{ tool: 'claude', server: 'team-server', action: 'added' }],
-      wrote: true,
-    });
+  it('previews the resources pull still owns on a dry run without writing them', async () => {
+    await fse.ensureDir(path.join(repoPath, 'skills', 'alpha'));
+    await fse.writeFile(
+      path.join(repoPath, 'skills', 'alpha', 'SKILL.md'),
+      '---\nname: alpha\ndescription: test\n---\nbody\n',
+    );
+
+    await pull({ dryRun: true, force: true });
+
+    expect(log.info).toHaveBeenCalledWith(expect.stringContaining('[dry-run] Would pull 1 skills'));
+    // The preview wrote nothing: no skill, not even the built-in stub.
+    expect(await fse.readdir(path.join(projectRoot, '.claude', 'skills'))).toEqual([]);
+    expect(saveStateForScope).not.toHaveBeenCalled();
+  });
+
+  it('a real pull does write the resource, so the dry-run absence is the dry run', async () => {
+    await fse.ensureDir(path.join(repoPath, 'skills', 'alpha'));
+    await fse.writeFile(
+      path.join(repoPath, 'skills', 'alpha', 'SKILL.md'),
+      '---\nname: alpha\ndescription: test\n---\nbody\n',
+    );
 
     await pull({ force: true });
 
-    expect(log.info).toHaveBeenCalledWith(expect.stringContaining('Restart your AI tool session to load them'));
+    expect(await fse.pathExists(path.join(projectRoot, '.claude', 'skills', 'alpha', 'SKILL.md'))).toBe(true);
+    expect(saveStateForScope).toHaveBeenCalled();
   });
 });

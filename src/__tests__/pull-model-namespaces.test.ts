@@ -56,9 +56,9 @@ vi.mock('../update.js', () => ({
 }));
 
 import { pull } from '../pull.js';
-import { modelsConfigure, modelsList, modelsSwitch } from '../models-cmd.js';
+import { syncTeamModelProfiles, modelsConfigure, modelsList, modelsSwitch } from '../models-cmd.js';
 import { getTeamValuesPath, saveModelInputs } from '../models/profile.js';
-import { autoDetectInit, loadLocalConfigForScope, loadTeamConfig, requireInit } from '../config.js';
+import { autoDetectInit, loadLocalConfigForScope, loadTeamConfig, requireInit, detectProjectConfig } from '../config.js';
 import { log } from '../utils/logger.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
 
@@ -109,14 +109,19 @@ describe('pull: team model profiles by namespace', () => {
       additionalRoles: [],
       projects,
       resourceProfileVersion: 1,
-      scope: 'user',
+      scope: 'project',
+      projectRoot: homeDir,
     };
   }
 
+  /** The config the active projects resolve to (007: model sync is called directly). */
+  let activeConfig: LocalConfig;
   /** Work in these projects, for pull and for the models commands. */
   const inProjects = (...projects: string[]): void => {
     const localConfig = configFor(projects);
+    activeConfig = localConfig;
     vi.mocked(loadLocalConfigForScope).mockResolvedValue(localConfig);
+    vi.mocked(detectProjectConfig).mockResolvedValue(localConfig);
     vi.mocked(requireInit).mockResolvedValue({ localConfig, teamConfig });
     vi.mocked(autoDetectInit).mockResolvedValue({ localConfig, teamConfig });
   };
@@ -206,11 +211,11 @@ describe('pull: team model profiles by namespace', () => {
 
     await team('models/checkout/models.yaml', catalog({ base_url: `${COMPANY}/checkout`, models: ['checkout-model'] }));
     inProjects('checkout');
-    await pull({});
+    await syncTeamModelProfiles(activeConfig);
     expect(await claude()).toEqual({ url: `${COMPANY}/checkout`, token: 'company-secret', model: 'checkout-model' });
 
     inProjects();
-    await pull({});
+    await syncTeamModelProfiles(activeConfig);
     expect(await claude()).toEqual({ url: COMPANY, token: 'company-secret', model: 'company-model' });
   });
 
@@ -219,7 +224,7 @@ describe('pull: team model profiles by namespace', () => {
     await team('models/checkout/models.yaml', catalog({ base_url: CHECKOUT, models: ['checkout-model'] }));
     inProjects('checkout');
 
-    await pull({});
+    await syncTeamModelProfiles(activeConfig);
     // The agent is left alone and the member is told how to set the other key.
     expect(await claude()).toEqual({ url: COMPANY, token: 'company-secret', model: 'company-model' });
     expect(logged('warn', /team:gw now uses https:\/\/gw\.checkout\.test.*claude keeps? its settings.*teamai models switch team:gw/)).toBe(true);
@@ -236,11 +241,11 @@ describe('pull: team model profiles by namespace', () => {
 
     // Leaving the project returns to the root profile with the key stored for it.
     inProjects();
-    await pull({});
+    await syncTeamModelProfiles(activeConfig);
     expect(await claude()).toEqual({ url: COMPANY, token: 'company-secret', model: 'company-model' });
 
     inProjects('checkout');
-    await pull({});
+    await syncTeamModelProfiles(activeConfig);
     expect(await claude()).toEqual({ url: CHECKOUT, token: 'checkout-secret', model: 'checkout-model' });
   });
 
@@ -251,7 +256,7 @@ describe('pull: team model profiles by namespace', () => {
     expect((await claude()).model).toBe('proj-model');
 
     inProjects();
-    await pull({});
+    await syncTeamModelProfiles(activeConfig);
     expect(await claude()).toEqual({ url: COMPANY, token: 'company-secret', model: 'proj-model' });
     expect(logged('warn', /team:proj is no longer active in your namespaces; claude keeps? (its|their) settings/)).toBe(true);
     expect(logged('persist', /team:proj is no longer active in your namespaces/)).toBe(true);
@@ -261,7 +266,7 @@ describe('pull: team model profiles by namespace', () => {
     await switchTo('gw');
     await team('models/models.yaml', catalog({ id: 'other', base_url: COMPANY, models: ['other-model'] }));
 
-    await pull({});
+    await syncTeamModelProfiles(activeConfig);
     expect((await claude()).model).toBe('company-model');
     expect(logged('warn', /team:gw was removed/)).toBe(true);
   });
@@ -272,7 +277,7 @@ describe('pull: team model profiles by namespace', () => {
     await team('models/models.yaml', catalog({ id: 'other', base_url: COMPANY, models: ['other-model'] }));
     await team('models/checkout/models.yaml', catalog({ base_url: COMPANY, models: ['checkout-model'] }));
 
-    await pull({});
+    await syncTeamModelProfiles(activeConfig);
     expect(logged('warn', /team:gw was removed/)).toBe(true);
     expect(logged('warn', /no longer active in your namespaces/)).toBe(false);
   });
@@ -296,7 +301,8 @@ describe('pull: team model profiles by namespace', () => {
     await team('rules/later.md', '# Later rule\n');
     inProjects('checkout', 'billing');
 
-    await pull({});
+    await syncTeamModelProfiles(activeConfig);
+    await pull({ silent: true });
     expect(logged('warn', /"gw" is defined in both models\/(checkout|billing)\/models\.yaml and models\/(billing|checkout)\/models\.yaml/)).toBe(true);
     expect(await claude()).toEqual({ url: COMPANY, token: 'company-secret', model: 'company-model' });
     expect(await fse.readFile(path.join(homeDir, '.claude', 'rules', 'later.md'), 'utf8')).toBe('# Later rule\n');
@@ -309,7 +315,8 @@ describe('pull: team model profiles by namespace', () => {
     await team('rules/later.md', '# Later rule\n');
     inProjects('checkout');
 
-    await pull({});
+    await syncTeamModelProfiles(activeConfig);
+    await pull({ silent: true });
     expect(logged('warn', /models\/checkout\/models\.yaml.*models was not applied this run/)).toBe(true);
     expect(await claude()).toEqual({ url: COMPANY, token: 'company-secret', model: 'company-model' });
     expect(await fse.readFile(path.join(homeDir, '.claude', 'rules', 'later.md'), 'utf8')).toBe('# Later rule\n');
@@ -323,12 +330,12 @@ describe('pull: team model profiles by namespace', () => {
 
     await team('models/checkout/models.yaml', catalog({ base_url: CHECKOUT, models: ['checkout-model'] }));
     inProjects('checkout');
-    await pull({});
+    await syncTeamModelProfiles(activeConfig);
     expect(await claude()).toEqual({ url: COMPANY, token: 'company-secret', model: 'company-model' });
     expect(logged('warn', /teamai models switch team:gw/)).toBe(true);
 
     await team('models/checkout/models.yaml', catalog({ base_url: `${COMPANY}/checkout`, models: ['checkout-model'] }));
-    await pull({});
+    await syncTeamModelProfiles(activeConfig);
     expect(await claude()).toEqual({ url: `${COMPANY}/checkout`, token: 'company-secret', model: 'checkout-model' });
   });
 
@@ -341,7 +348,7 @@ describe('pull: team model profiles by namespace', () => {
     await saveModelInputs(getTeamValuesPath(configFor([])), beta);
 
     await team('models/models.yaml', catalog({ base_url: ELSEWHERE, models: ['elsewhere-model'] }));
-    await pull({});
+    await syncTeamModelProfiles(activeConfig);
 
     expect(await claude()).toEqual({ url: COMPANY, token: 'company-secret', model: 'company-model' });
     expect(logged('warn', /team:gw now uses https:\/\/gw\.elsewhere\.test.*teamai models switch team:gw/)).toBe(true);
@@ -351,7 +358,7 @@ describe('pull: team model profiles by namespace', () => {
 
   it('binds a beta key no agent used to the root gateway at the first pull, and does not follow a later move', async () => {
     await saveModelInputs(getTeamValuesPath(configFor([])), { 'team:gw': { API_KEY: { env: 'COMPANY_KEY' } } });
-    await pull({});
+    await syncTeamModelProfiles(activeConfig);
 
     await team('models/models.yaml', catalog({ base_url: ELSEWHERE, models: ['elsewhere-model'] }));
     await expect(modelsSwitch('team:gw', { agent: ['claude'] })).rejects.toThrow(/no API key for https:\/\/gw\.elsewhere\.test/);
@@ -365,7 +372,7 @@ describe('pull: team model profiles by namespace', () => {
     await team('models/checkout/models.yaml', catalog({ base_url: `${COMPANY}/checkout`, models: ['checkout-model'] }));
     await team('models/models.yaml', catalog({ base_url: COMPANY, models: ['company-model-2'] }));
 
-    await pull({});
+    await syncTeamModelProfiles(activeConfig);
     expect(await claude()).toEqual({ url: COMPANY, token: 'company-secret', model: 'company-model-2' });
   });
 

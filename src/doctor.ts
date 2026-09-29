@@ -416,6 +416,21 @@ export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'docto
     });
   }
 
+  // 007: push/pull are project-scoped. A user-scope install still serves
+  // get/contribute/recall, but resource sync needs a project directory. This
+  // is migration guidance, not a broken state, so it is informational.
+  if (localConfig.scope === 'user') {
+    checks.push({
+      name: 'Project scope bound for push/pull',
+      source: 'local',
+      informational: true,
+      check: async () => false,
+      fix: '`teamai push` and `teamai pull` now run in a project scope. Run `teamai init` inside your '
+        + 'project directory (project scope is the default) and activate a project with `teamai projects '
+        + 'set <id>`. Your existing user-scope install is kept for get/contribute/recall.',
+    });
+  }
+
   checks.push(
     {
       name: 'Team repo exists locally',

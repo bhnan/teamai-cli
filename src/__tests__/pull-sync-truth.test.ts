@@ -63,7 +63,7 @@ vi.mock('../update.js', () => ({
   releaseLock: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { checkoutKey, pull } from '../pull.js';
+import { pull } from '../pull.js';
 import { detectProjectConfig, loadLocalConfigForScope, loadTeamConfig, loadStateForScope, saveStateForScope } from '../config.js';
 import { log } from '../utils/logger.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
@@ -77,7 +77,7 @@ describe('pull reports what reached the tool directory (#585)', () => {
   let ioSpy: { mockRestore(): void } | undefined;
 
   beforeEach(async () => {
-    vi.mocked(detectProjectConfig).mockResolvedValue(null);
+    vi.mocked(detectProjectConfig).mockReset();
     vi.mocked(saveStateForScope).mockClear();
     vi.mocked(loadStateForScope).mockResolvedValue({ lastPull: null, lastPullRev: null } as Awaited<ReturnType<typeof loadStateForScope>>);
     vi.mocked(log.success).mockClear();
@@ -123,11 +123,12 @@ describe('pull reports what reached the tool directory (#585)', () => {
       username: 'member',
       updatePolicy: 'auto',
       additionalRoles: [],
-      scope: 'user',
+      scope: 'project',
+      projectRoot: homeDir,
     };
 
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(localConfig);
+    vi.mocked(detectProjectConfig).mockResolvedValue(localConfig);
   });
 
   afterEach(async () => {
@@ -143,120 +144,21 @@ describe('pull reports what reached the tool directory (#585)', () => {
     return vi.mocked(log.success).mock.calls.map(([msg]) => String(msg));
   }
 
-  it.each(['copy', 'prune', 'unsafe destination', 'unreadable source', 'realpath'])(
-    'does not report a successful docs sync after %s fails, and retries on the next pull', async (failure) => {
-      // Simulate a force-pull of an already-synced revision: failure must clear
-      // even that marker, otherwise the following ordinary pull skips the retry.
-      const state = await loadStateForScope(localConfig);
-      state.lastPullRev = 'abc1234';
-      state.lastPullTargets = [];
-      await fse.outputFile(path.join(homeDir, 'docs', 'stale.md'), 'stale');
-      await fse.outputFile(path.join(repoPath, 'env', 'env.yaml'), 'variables:\n  - key: DOCS_TEST\n    value: delivered\n');
-      if (failure === 'copy') ioSpy = vi.spyOn(fse, 'copy').mockRejectedValueOnce(new Error('copy failed'));
-      if (failure === 'prune') ioSpy = vi.spyOn(fse, 'unlink').mockRejectedValueOnce(new Error('prune failed'));
-      if (failure === 'unsafe destination') teamConfig.sharing.docs.localDir = homeDir;
-      // A file in place of the source directory makes its scan fail without
-      // relying on Unix permissions (the suite also runs on Windows).
-      if (failure === 'unreadable source') {
-        await fse.remove(path.join(repoPath, 'docs'));
-        await fse.writeFile(path.join(repoPath, 'docs'), 'not a directory');
-      }
-      if (failure === 'realpath') ioSpy = vi.spyOn(fse, 'realpath').mockRejectedValueOnce(new Error('realpath failed'));
-
-      await pull({ silent: true, force: true });
-
-      expect(successLines().filter(msg => /Synced \d+ docs/.test(msg))).toEqual([]);
-      expect(vi.mocked(log.warn).mock.calls.flat()).toEqual(expect.arrayContaining([
-        expect.stringContaining('Failed to sync docs:'),
-      ]));
-      expect(await fse.readFile(path.join(homeDir, 'docs', 'stale.md'), 'utf8')).toBe('stale');
-      expect(state.lastPullRev).toBeNull();
-      expect(saveStateForScope).toHaveBeenCalledWith(expect.objectContaining({ lastPullRev: null }), localConfig);
-      // A docs failure must not prevent the next resource type from syncing.
-      expect(successLines().some(msg => msg.includes('Synced 1 env variable(s)'))).toBe(true);
-
-      ioSpy?.mockRestore();
-      ioSpy = undefined;
-      teamConfig.sharing.docs.localDir = 'docs';
-      if (failure === 'unreadable source') {
-        await fse.remove(path.join(repoPath, 'docs'));
-        await fse.outputFile(path.join(repoPath, 'docs', 'guide.md'), '# Guide\n');
-      }
-      await pull({ silent: true });
-      expect(successLines()).toContain('[user] Synced 1 docs');
-      expect(await fse.pathExists(path.join(homeDir, 'docs', 'stale.md'))).toBe(false);
-      expect(state.lastPullRev).toBe('abc1234');
-    },
-  );
-
-  it.each(['user', 'project', 'none'])('aggregates inherited scope completion when docs fail in %s', async (failure) => {
-    const projectRoot = path.join(tmpDir, 'project');
-    await fse.ensureDir(projectRoot);
-    vi.mocked(detectProjectConfig).mockResolvedValue({
-      ...localConfig, scope: 'project', projectRoot, inheritUserScope: true,
-    });
-    if (failure !== 'none') {
-      await fse.outputFile(path.join(failure === 'user' ? homeDir : projectRoot, 'docs'), 'blocks docs directory');
-    }
-    const outcome = { completed: false };
-    await pull({ silent: true, force: true }, outcome);
-    expect(outcome.completed).toBe(failure === 'none');
-    for (const scope of ['user', 'project']) {
-      const succeeded = scope !== failure;
-      expect(successLines().includes(`[${scope}] Synced 1 docs`)).toBe(succeeded);
-      if (!succeeded) {
-        expect(vi.mocked(log.warn).mock.calls.flat()).toContainEqual(expect.stringContaining(`[${scope}] Failed to sync docs:`));
-      }
-    }
-  });
-
-  it('adds the revision a pull delivered to the checkout\'s push bases when its docs mirror fails (#823)', async () => {
-    const projectRoot = path.join(tmpDir, 'project');
-    await fse.ensureDir(projectRoot);
-    vi.mocked(detectProjectConfig).mockResolvedValue({ ...localConfig, scope: 'project', projectRoot });
-    const key = await checkoutKey(projectRoot);
-    const state = await loadStateForScope(localConfig);
-    state.lastPullByWorkspace = { [key]: { rev: 'old1234', targets: [] } };
-    await fse.outputFile(path.join(projectRoot, 'docs'), 'blocks docs directory');
+  // 007: docs are one-way published by push; pull never deploys, prunes or
+  // creates them. What an older release mirrored stays as it was.
+  it('leaves the local docs directory completely untouched', async () => {
+    // A stale file in an older release's mirror directory, and a plain file
+    // sitting on the docs destination path itself: neither may be touched.
+    await fse.outputFile(path.join(homeDir, 'docs', 'stale.md'), 'stale draft');
 
     await pull({ silent: true, force: true });
 
-    expect(vi.mocked(log.warn).mock.calls.flat()).toContainEqual(expect.stringContaining('[project] Failed to sync docs:'));
-    // The marker stays cleared for a retry, and the record keeps its rev.
-    expect(state.lastPullRev).toBeNull();
-    expect(state.lastPullByWorkspace?.[key]).toEqual({ rev: 'old1234', targets: [], pushBaseRevs: ['abc1234'] });
-  });
-
-  it.each(['empty', 'missing'])('prunes only stale empty directories when the team bundle is %s', async (state) => {
-    await fse.remove(path.join(repoPath, 'docs'));
-    if (state === 'empty') await fse.ensureDir(path.join(repoPath, 'docs'));
-    const destination = path.join(homeDir, 'docs');
-    await fse.ensureDir(path.join(destination, 'old', 'nested'));
-    await fse.outputFile(path.join(destination, 'private', '.keep'), 'hidden');
-    await pull({ silent: true, dryRun: true });
-    expect(await fse.pathExists(path.join(destination, 'old', 'nested'))).toBe(true);
-    expect(vi.mocked(log.info).mock.calls.flat()).toContain('[user] [dry-run] Would sync 0 docs and remove stale local docs');
-    await pull({ silent: true, force: true });
-    expect(await fse.pathExists(path.join(destination, 'old'))).toBe(false);
-    expect(await fse.readFile(path.join(destination, 'private', '.keep'), 'utf8')).toBe('hidden');
-    expect(successLines()).toContain('[user] Synced 0 docs');
-  });
-
-  it.each(['empty', 'missing'])('prunes docs through pull when the team bundle is %s (#794)', async (state) => {
-    await pull({ silent: true, force: true });
-    await fse.remove(path.join(repoPath, 'docs'));
-    if (state === 'empty') await fse.ensureDir(path.join(repoPath, 'docs'));
-    await pull({ silent: true, force: true });
+    expect(successLines().filter((msg) => /docs/.test(msg))).toEqual([]);
+    expect(vi.mocked(log.warn).mock.calls.flat().some((m) => String(m).includes('docs'))).toBe(false);
     expect(await fse.pathExists(path.join(homeDir, 'docs', 'guide.md'))).toBe(false);
-    expect(successLines()).toContain('[user] Synced 0 docs');
-  });
-
-  it('previews pruning without deleting files during a dry run', async () => {
-    await fse.outputFile(path.join(homeDir, 'docs', 'stale.md'), 'local');
-    await fse.remove(path.join(repoPath, 'docs'));
-    await pull({ silent: true, dryRun: true });
-    expect(await fse.readFile(path.join(homeDir, 'docs', 'stale.md'), 'utf8')).toBe('local');
-    expect(vi.mocked(log.info).mock.calls.flat()).toContain('[user] [dry-run] Would sync 0 docs and remove stale local docs');
+    expect(await fse.readFile(path.join(homeDir, 'docs', 'stale.md'), 'utf8')).toBe('stale draft');
+    // The revision still advances: a docs absence is not a sync failure.
+    expect(saveStateForScope).toHaveBeenCalled();
   });
 
   it('claims no skills synced when no tool directory exists', async () => {
@@ -264,10 +166,9 @@ describe('pull reports what reached the tool directory (#585)', () => {
 
     expect(successLines().filter((msg) => /Synced \d+ skills/.test(msg))).toEqual([]);
     expect(await fse.pathExists(path.join(homeDir, '.claude', 'skills', 'org-review'))).toBe(false);
-    // Docs are not gated: they are copied to the team's own docs directory,
-    // which the copy creates, so that report stays truthful.
-    expect(successLines().filter((msg) => /Synced \d+ docs/.test(msg)).length).toBeGreaterThan(0);
-    expect(await fse.pathExists(path.join(homeDir, 'docs', 'guide.md'))).toBe(true);
+    // Docs are never deployed by pull (007): nothing lands and nothing is claimed.
+    expect(successLines().filter((msg) => /Synced \d+ docs/.test(msg))).toEqual([]);
+    expect(await fse.pathExists(path.join(homeDir, 'docs', 'guide.md'))).toBe(false);
   });
 
   it('still claims skills synced once the tool directory exists', async () => {

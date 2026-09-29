@@ -120,9 +120,13 @@ Team resources sync on **session start**, so they may be empty right after init.
 To confirm now:
 
 ```bash
-teamai pull        # sync immediately
+teamai pull        # sync skills/rules/env/agents into this project now
 teamai list        # see the team skills / rules / docs you now have
 ```
+
+`pull` deploys the four resource types only. Project docs and the project wiki
+are one-way published by `push` and are never mirrored into the project by pull;
+read published copies from the team repo clone.
 
 Then tell the user: from now on, **opening a new session in this AI tool
 auto-syncs** the latest team resources — no manual step needed. If their tool has

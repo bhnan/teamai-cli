@@ -117,6 +117,20 @@ vi.mock('../update.js', () => ({
   releaseLock: vi.fn().mockResolvedValue(undefined),
 }));
 
+// 007: push runs in a project scope, so pushCore asks pull.js which revision
+// this checkout last synced. The fixtures have no pull record for the fixture
+// projectRoot, and an "unrecorded" answer makes the unsureOfEdit guard reject
+// every MODIFIED resource — a pull-record concern these --skill tests are not
+// about. Report a recorded checkout, the state a `teamai pull` leaves behind.
+vi.mock('../pull.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../pull.js')>()),
+  resolveCheckoutBases: vi.fn().mockResolvedValue({
+    source: 'checkout',
+    record: { rev: 'pull000', targets: [] },
+    revs: ['pull000'],
+  }),
+}));
+
 function makeLocalConfig(overrides: Record<string, unknown> = {}) {
   return {
     repo: { localPath: '/tmp/team-repo', remote: 'https://git.woa.com/test/repo.git' },
@@ -125,7 +139,8 @@ function makeLocalConfig(overrides: Record<string, unknown> = {}) {
     primaryRole: 'hai',
     additionalRoles: [],
     resourceProfileVersion: 1,
-    scope: 'user',
+    scope: 'project',
+    projectRoot: '/tmp/teamai-project-fixture',
     ...overrides,
   };
 }

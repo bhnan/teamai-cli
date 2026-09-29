@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import fse from 'fs-extra';
 import { ResourceHandler } from './base.js';
 import { resolveBaseDir, type ResourceItem, type TeamaiConfig, type LocalConfig } from '../types.js';
-import { expandHome, listDirs, pruneEmptyDirs } from '../utils/fs.js';
+import { expandHome, listDirs, pruneEmptyDirs, pathExists, readFileSafe } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
 import { caseFoldKey } from '../manifest-schema.js';
 import { resolveResourceNamespaces } from '../resource-namespaces.js';
@@ -256,9 +256,51 @@ async function withdrawInactiveNamespaces(desired: DesiredDocs, localDocsDir: st
 export class DocsHandler extends ResourceHandler {
   readonly type = 'docs' as const;
 
-  async scanLocalForPush(_teamConfig: TeamaiConfig, _localConfig: LocalConfig): Promise<ResourceItem[]> {
-    // Docs are managed directly in team repo
-    return [];
+  /**
+   * The publish source for one-way docs push (007): the project's own `docs/`
+   * directory, read-only. Never the docs pull destination — pulling a mirror
+   * back in would round-trip the team's own copies.
+   */
+  publishSourceDir(localConfig: LocalConfig): string | null {
+    if (localConfig.scope !== 'project' || !localConfig.projectRoot) return null;
+    return path.join(localConfig.projectRoot, 'docs');
+  }
+
+  /** The team repo copy for one project: `docs/<projectId>/`. */
+  publishTargetDir(localConfig: LocalConfig, projectId: string): string {
+    return path.join(localConfig.repo.localPath, 'docs', projectId);
+  }
+
+  async scanLocalForPush(
+    _teamConfig: TeamaiConfig,
+    localConfig: LocalConfig,
+    options?: { projectId?: string },
+  ): Promise<ResourceItem[]> {
+    // One-way publish (007): compare the project's own docs/ with the team
+    // repo's docs/<projectId>/ copy. A file that matches byte-for-byte is
+    // unchanged; push.ts decides modified-vs-conflict against the recorded
+    // baseline. Only visible files publish — dotfiles stay project-local.
+    const projectId = options?.projectId;
+    const source = this.publishSourceDir(localConfig);
+    if (!projectId || !source || !(await pathExists(source))) return [];
+    const items: ResourceItem[] = [];
+    for (const rel of await listDocFiles(source)) {
+      const localFile = path.join(source, rel);
+      const targetFile = path.join(this.publishTargetDir(localConfig, projectId), rel);
+      const exists = await pathExists(targetFile);
+      const same = exists
+        && (await readFileSafe(localFile)) === (await readFileSafe(targetFile));
+      if (!same) {
+        items.push({
+          name: rel,
+          type: 'docs',
+          sourcePath: localFile,
+          relativePath: `docs/${projectId}/${rel}`,
+          status: exists ? 'modified' : 'new',
+        });
+      }
+    }
+    return items;
   }
 
   async scanTeamForPull(_teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<ResourceItem[]> {
@@ -278,8 +320,13 @@ export class DocsHandler extends ResourceHandler {
     return (await listDocFiles(sourcePath)).length;
   }
 
-  async pushItem(_item: ResourceItem, _teamConfig: TeamaiConfig, _localConfig: LocalConfig): Promise<void> {
-    // No-op
+  async pushItem(item: ResourceItem, _teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
+    // One-way publish (007): copy the project original into the team repo's
+    // docs/<projectId>/ copy. The project original is never written to.
+    const dest = path.join(localConfig.repo.localPath, item.relativePath);
+    await fse.ensureDir(path.dirname(dest));
+    await fse.copy(item.sourcePath, dest, { overwrite: true });
+    log.debug(`Published doc ${item.relativePath} → team repo`);
   }
 
   /**

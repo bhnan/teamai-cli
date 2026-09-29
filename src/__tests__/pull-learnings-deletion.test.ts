@@ -27,7 +27,7 @@ vi.mock('../utils/git.js', () => ({
 }));
 
 vi.mock('../utils/logger.js', () => ({
-  log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: vi.fn() },
+  log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: vi.fn(), persist: vi.fn() },
   spinner: vi.fn(() => ({
     start: vi.fn().mockReturnThis(),
     succeed: vi.fn().mockReturnThis(),
@@ -66,18 +66,20 @@ vi.mock('../update.js', () => ({
 }));
 
 const { pull } = await import('../pull.js');
-const { loadLocalConfigForScope, loadTeamConfig } = await import('../config.js');
-const { getUserLearningsDir, getUserSearchIndexPath } = await import('../types.js');
+const { detectProjectConfig, loadTeamConfig } = await import('../config.js');
+const { getUserSearchIndexPath, getProjectSearchIndexPath } = await import('../types.js');
 const { loadIndex } = await import('../utils/search-index.js');
 import type { LocalConfig, TeamaiConfig } from '../types.js';
 
 const repoPath = path.join(testRoot, 'team-repo');
+const projectRoot = path.join(testRoot, 'project');
 const localConfig: LocalConfig = {
   repo: { localPath: repoPath, remote: 'https://example.test/team/repo.git' },
   username: 'alice',
   updatePolicy: 'auto',
   additionalRoles: [],
-  scope: 'user',
+  scope: 'project',
+  projectRoot,
 };
 const teamConfig: TeamaiConfig = {
   team: 'test',
@@ -94,15 +96,15 @@ const teamConfig: TeamaiConfig = {
   toolPaths: {},
 };
 
-describe('pull — user-scope learning deletion propagation (issue #458)', () => {
+describe('pull — learning deletion propagation through the project index (issue #458)', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     await fse.remove(repoPath);
-    await fse.remove(getUserLearningsDir());
+    await fse.remove(projectRoot);
     await fse.remove(getUserSearchIndexPath());
     await fse.outputFile(path.join(repoPath, 'learnings', 'shared-a.md'), '---\ntitle: shared a\n---\n');
     await fse.outputFile(path.join(repoPath, 'learnings', 'shared-b.md'), '---\ntitle: shared b\n---\n');
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(localConfig);
+    vi.mocked(detectProjectConfig).mockResolvedValue(localConfig);
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
   });
 
@@ -111,15 +113,17 @@ describe('pull — user-scope learning deletion propagation (issue #458)', () =>
     await fse.remove(testRoot);
   });
 
-  it('removes a shared Markdown file deleted upstream and drops it from the index', async () => {
+  it('drops an upstream-deleted learning from the project search index (007)', async () => {
+    // 007: pull is project-scoped and indexes learnings straight from the
+    // repo, so an upstream deletion leaves the index on the next pull.
     await pull({ silent: true });
-    expect(await fse.pathExists(path.join(getUserLearningsDir(), 'shared-b.md'))).toBe(true);
+    let index = await loadIndex(getProjectSearchIndexPath(localConfig));
+    expect(index?.entries.map((entry) => entry.title).sort()).toEqual(['shared a', 'shared b']);
 
     await fse.remove(path.join(repoPath, 'learnings', 'shared-b.md'));
     await pull({ silent: true, force: true });
 
-    expect(await fse.pathExists(path.join(getUserLearningsDir(), 'shared-b.md'))).toBe(false);
-    const index = await loadIndex(getUserSearchIndexPath());
+    index = await loadIndex(getProjectSearchIndexPath(localConfig));
     expect(index?.entries.map((entry) => entry.title)).toEqual(['shared a']);
   });
 });

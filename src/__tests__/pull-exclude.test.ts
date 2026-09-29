@@ -52,7 +52,7 @@ vi.mock('../update.js', () => ({
   releaseLock: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { detectProjectConfig, loadLocalConfigForScope, loadTeamConfig } from '../config.js';
+import { detectProjectConfig, loadTeamConfig } from '../config.js';
 import { pull } from '../pull.js';
 import type { LocalConfig, TeamaiConfig } from '../types.js';
 
@@ -81,10 +81,13 @@ describe('pull with excluded skills', () => {
     await fse.writeFile(path.join(repoPath, 'manifest', 'roles.yaml'), 'version: 1\n');
     await fse.ensureDir(path.join(homeDir, '.claude', 'skills'));
 
+    // 007: pull runs in a project scope only; the fixture keeps HOME as the
+    // project root so the seeded tool directories stay where they were.
     const localConfig: LocalConfig = {
       repo: { localPath: repoPath, remote: 'owner/repo' },
       username: 'tester',
-      scope: 'user',
+      scope: 'project',
+      projectRoot: homeDir,
       primaryRole: 'dev',
       additionalRoles: [],
       excludedSkills: ['excluded-skill'],
@@ -101,8 +104,7 @@ describe('pull with excluded skills', () => {
       toolPaths: { claude: { skills: '.claude/skills', rules: '.claude/rules' } },
     };
 
-    vi.mocked(detectProjectConfig).mockResolvedValue(null);
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(localConfig);
+    vi.mocked(detectProjectConfig).mockResolvedValue(localConfig);
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
   });
 

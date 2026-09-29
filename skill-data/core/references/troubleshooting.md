@@ -30,8 +30,11 @@ This is the #1 onboarding issue. In order:
    ```
 4. **Wrong scope?** Project-scope hooks are written to your HOME tool settings
    (e.g. `~/.claude/settings.json`), not the project folder — that is intentional.
-   If you initialized project scope but expected machine-wide resources, re-run
-   with `--scope user`.
+   `teamai pull` / `teamai push` run only inside an initialized project scope; a
+   user-scope install is rejected with migration guidance. To sync a project,
+   run `teamai init` inside its directory and activate a project
+   (`teamai projects set <id>`). `teamai get` still installs one shared
+   skill/rule into an agent's global directory.
 5. **Tool has no hook surface** (e.g. Gemini CLI, JoyCode): there is no auto-sync;
    run `teamai pull` manually each time.
 6. **Claude Code reads a different directory** (`CLAUDE_CONFIG_DIR` is set).

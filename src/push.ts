@@ -30,8 +30,13 @@ import {
   resolveProjectNamespace, skillNamespacePath, withNamespace, type PlaceableType,
 } from './push-namespaces.js';
 import { askQuestion, askSelection, isInteractive } from './utils/prompt.js';
-import { pathExists, pruneEmptyDirs, readFileSafe, writeFile } from './utils/fs.js';
+import { pathExists, pruneEmptyDirs, readFileSafe, remove, writeFile } from './utils/fs.js';
 import { brokenTeamProfileFiles } from './models/profile.js';
+import {
+  PUSH_RESOURCE_TYPES, parseResourceTypes, resolveProjectScope, deriveSingleActiveProject,
+  filterToolPathsForAgent, ScopeError,
+} from './sync-scope.js';
+import { fileDigest } from './utils/digest.js';
 
 /**
  * Filter a list of repo-root-relative paths (e.g. "rules/", "env/") down to
@@ -718,7 +723,16 @@ async function pushGroup(args: {
 }
 
 export async function push(
-  options: GlobalOptions & { all?: boolean; role?: string; project?: string; branch?: string },
+  options: GlobalOptions & {
+    all?: boolean;
+    role?: string;
+    project?: string;
+    branch?: string;
+    types?: string;
+    agent?: string;
+    rule?: string;
+    force?: boolean;
+  },
   /**
    * Optional out-param: set to `{ completed: true }` only when a real push
    * actually happened (resources or config pushed) — never on dry-run, cancel,
@@ -730,6 +744,60 @@ export async function push(
   // Auto-detect scope: project scope if cwd has project config, else user scope
   const { localConfig, teamConfig } = await autoDetectInit();
   assertNotReadOnly(localConfig, 'teamai push');
+
+  // 007: push is a project-scoped publish. A user-scope install has no project
+  // to publish from, and an HTTP team repo is a read-only consumer — both are
+  // rejected with guidance instead of silently pushing global resources.
+  if (localConfig.scope !== 'project' || !localConfig.projectRoot) {
+    log.error(
+      'teamai push runs in a project scope, but this directory has none. '
+      + 'Run `teamai init` here (project scope is the default) and activate a project with `teamai projects set <id>` before pushing. '
+      + 'Existing user-scope resources are left untouched.',
+    );
+    process.exitCode = 2;
+    return;
+  }
+  if (localConfig.repo.kind === 'http') {
+    log.error('Cannot push to an HTTP team repo: it is a read-only consumer with no git tree to publish to.');
+    process.exitCode = 2;
+    return;
+  }
+  // Resource selection and agent validation fail before anything is written.
+  let resourceTypes: readonly ResourceType[];
+  try {
+    resourceTypes = parseResourceTypes(options.types, PUSH_RESOURCE_TYPES);
+  } catch (e) {
+    if (e instanceof ScopeError) {
+      log.error(e.message);
+      process.exitCode = e.exitCode;
+      return;
+    }
+    throw e;
+  }
+  if (options.agent) {
+    try {
+      filterToolPathsForAgent(teamConfig, localConfig, options.agent);
+    } catch (e) {
+      if (e instanceof ScopeError) {
+        log.error(e.message);
+        process.exitCode = e.exitCode;
+        return;
+      }
+      throw e;
+    }
+  }
+  if (options.skill && options.rule) {
+    log.error('Use either --skill or --rule, not both.');
+    process.exitCode = 2;
+    return;
+  }
+  if (options.rule) {
+    if (!resourceTypes.includes('rules')) {
+      log.error('--rule selects a rule, but --types does not include rules.');
+      process.exitCode = 2;
+      return;
+    }
+  }
 
   // --project is a destination override expressed as a logical project. Each
   // resource type then resolves from its OWN axis in manifest/projects.yaml —
@@ -846,11 +914,34 @@ export async function push(
 async function pushCore(
   localConfig: LocalConfig,
   teamConfig: TeamaiConfig,
-  options: GlobalOptions & { all?: boolean; role?: string; project?: string; branch?: string },
+  options: GlobalOptions & {
+    all?: boolean;
+    role?: string;
+    project?: string;
+    branch?: string;
+    types?: string;
+    agent?: string;
+    rule?: string;
+    force?: boolean;
+  },
   initialPendingTeamConfig: string | null = null,
   result?: { completed: boolean },
 ): Promise<void> {
   const selfMode = localConfig.repo.kind === 'self';
+
+  // The --types selection pushCore scans by (validated once in push(); the
+  // worktree path in self mode re-enters here without it).
+  let resourceTypes: readonly ResourceType[];
+  try {
+    resourceTypes = parseResourceTypes(options.types, PUSH_RESOURCE_TYPES);
+  } catch (e) {
+    if (e instanceof ScopeError) {
+      log.error(e.message);
+      process.exitCode = e.exitCode;
+      return;
+    }
+    throw e;
+  }
 
   // Pull latest default branch BEFORE scanning so detection runs against up-to-date repo.
   // The team repo may be in various broken states from previous failed pushes:
@@ -929,19 +1020,13 @@ async function pushCore(
     return;
   }
 
-  // --project is a destination override expressed as a logical project. Each
-  // resource type then resolves from its OWN axis in manifest/projects.yaml —
-  // skills from `skills`, rules from `knowledge`, agents from `agents` — because
-  // a project may declare different namespaces for each (issue #649). A missing
-  // namespace only blocks a push that actually selects that type: the skills
-  // axis resolves against the scan, because it also relocates modified skills
-  // and the listing has to show where they go, but a failure there is held
-  // until the selection proves a skill is going out.
-  // Deliberately manifest-resolved, not the raw project id, so it agrees with
-  // what pull syncs (issue #375 P2 lesson). Read from the clone the pull above
-  // just refreshed (or the fresh worktree, in self mode), never from an earlier
-  // state of it.
+  // 007: the project this run publishes as. `--project` is validated strictly
+  // — declared in manifest/projects.yaml AND active in this directory; without
+  // the flag the single active project derives, and only the one-way docs/wiki
+  // publish consumes it (a team without project partitioning publishes no
+  // docs/wiki and keeps its shared+role flow for the tool resources).
   let projectsManifest: ProjectsManifest | null = null;
+  let publishProjectId: string | null = null;
   if (options.project) {
     // A warning is not enough here: with the clone unrefreshed, a namespace
     // the remote has changed would send this run's new rules and agents to
@@ -954,25 +1039,25 @@ async function pushCore(
       process.exitCode = 1;
       return;
     }
-    const { loadProjectsManifest, findProject, unknownProjectMessage } = await import('./projects.js');
     try {
-      projectsManifest = await loadProjectsManifest(localConfig.repo.localPath);
+      const scope = await resolveProjectScope(localConfig, options.project);
+      projectsManifest = scope.manifest;
+      publishProjectId = scope.projectId;
     } catch (e) {
+      if (e instanceof ScopeError) {
+        log.error(e.message);
+        process.exitCode = e.exitCode;
+        return;
+      }
       log.error(`Cannot resolve --project destinations: ${(e as Error).message}`);
       process.exitCode = 2;
       return;
     }
-    if (!projectsManifest) {
-      log.error('This team repo defines no projects (no manifest/projects.yaml).');
-      process.exitCode = 2;
-      return;
-    }
-    // The id is checked here, not with the namespaces: a typo must fail even on
-    // a push where nothing needs placing, instead of being silently ignored.
-    if (!findProject(projectsManifest, options.project)) {
-      log.error(unknownProjectMessage(projectsManifest, options.project));
-      process.exitCode = 2;
-      return;
+  } else {
+    try {
+      publishProjectId = (await deriveSingleActiveProject(localConfig)).projectId;
+    } catch (e) {
+      log.warn(`Could not derive the publishing project: ${(e as Error).message}. docs/wiki are skipped this run.`);
     }
   }
 
@@ -1082,20 +1167,51 @@ async function pushCore(
   // and pre-push sync must never target .teamai/skills (that would copy knowledge
   // back onto itself). getHandler(type).scanLocalForPush reads toolPaths for the
   // source list only; pushItem writes via localConfig.repo.localPath, unaffected.
-  const scanTeamConfig: TeamaiConfig = selfMode
-    ? {
-      ...teamConfig,
+  //
+  // `--agent` narrows the scan to that one agent's tool directories first; the
+  // self-mode source rides along after the narrowing so it is never filtered out.
+  let scanTeamConfig: TeamaiConfig = teamConfig;
+  if (options.agent) {
+    scanTeamConfig = {
+      ...scanTeamConfig,
+      toolPaths: filterToolPathsForAgent(scanTeamConfig, localConfig, options.agent),
+    };
+  }
+  if (selfMode) {
+    scanTeamConfig = {
+      ...scanTeamConfig,
       toolPaths: {
-        ...teamConfig.toolPaths,
+        ...scanTeamConfig.toolPaths,
         [SELF_KNOWLEDGE_SCAN_KEY]: { skills: '.teamai/skills', rules: '.teamai/rules' },
       },
-    }
-    : teamConfig;
+    };
+  }
 
   // Scan for pushable resources first, then resolve namespace for new skills only.
   // Modified skills already carry their namespace from scanLocalForPush.
-  const pushableTypes: ResourceType[] = ['skills', 'rules', 'env', 'agents'];
+  const toolTypes: ResourceType[] = (['skills', 'rules', 'env', 'agents'] as const)
+    .filter((type) => resourceTypes.includes(type));
+  const publishTypes = (['docs', 'wiki'] as const).filter((type) => resourceTypes.includes(type));
   const fullScan: ResourceItem[] = [];
+
+  // The one-way docs/wiki publish needs a project to publish into. An explicit
+  // `--project` was validated above; a derived project must be unambiguous.
+  // A team without project partitioning keeps its tool-resource push and
+  // reports docs/wiki as unconfigured — never guessing an owner.
+  if (publishTypes.length > 0 && !publishProjectId) {
+    const active = localConfig.projects ?? [];
+    if (active.length > 1) {
+      log.error(
+        `docs/wiki publish needs one project, but several are active here (${active.join(', ')}). `
+        + 'Pass --project <id>, or drop docs/wiki from --types.',
+      );
+      process.exitCode = 2;
+      return;
+    }
+    for (const type of publishTypes) {
+      log.warn(`[${type}] unconfigured: no active project to publish under. Activate one with \`teamai projects set <id>\` or pass --project.`);
+    }
+  }
 
   // Agents are the one type whose SCAN needs the destination: it has to tell
   // "an edit of the team's copy" from "a new agent for this namespace", and an
@@ -1115,13 +1231,22 @@ async function pushCore(
     }
   }
 
-  for (const type of pushableTypes) {
+  const scanTypes: ResourceType[] = [
+    ...toolTypes,
+    ...(publishProjectId ? publishTypes : []),
+  ];
+  for (const type of scanTypes) {
     const handler = getHandler(type);
+    const scanOptions = type === 'agents'
+      ? { namespace: requestedAgentsNamespace }
+      : type === 'docs' || type === 'wiki'
+        ? { projectId: publishProjectId ?? undefined }
+        : undefined;
     try {
       const items = await handler.scanLocalForPush(
         scanTeamConfig,
         localConfig,
-        type === 'agents' ? { namespace: requestedAgentsNamespace } : undefined,
+        scanOptions,
       );
       fullScan.push(...items);
     } catch (e) {
@@ -1155,9 +1280,95 @@ async function pushCore(
   const skippedForWantOfDestination = (item: ResourceItem): boolean => item.type === 'agents'
     && 'needsDestination' in item && item.needsDestination === true;
 
+  // ── One-way publish gate (007): docs/wiki conflicts and pending deletes ──
+  // A modified docs/wiki item may overwrite the team repo copy only when that
+  // copy still equals the baseline this machine last pushed (T == B). Every
+  // other modified item is held: reported, excluded from this push, and
+  // reflected in the exit code — an unrelated resource still goes out.
+  // `--force` takes over exactly the listed conflicts, after showing them.
+  const publishConflicts: Array<{ item: ResourceItem; reason: string }> = [];
+  const heldKeys = new Set<string>();
+  if (fullScan.some((i) => i.type === 'docs' || i.type === 'wiki')) {
+    const state = await loadStateForScope(localConfig);
+    for (const item of fullScan) {
+      if (item.type !== 'docs' && item.type !== 'wiki') continue;
+      if (item.status !== 'modified') continue;
+      const baseline = state.publishedFiles?.[item.relativePath];
+      const targetSha = await fileDigest(path.join(localConfig.repo.localPath, item.relativePath));
+      const sourceSha = await fileDigest(item.sourcePath);
+      if (baseline === undefined) {
+        publishConflicts.push({ item, reason: 'the team repo copy exists but this machine never pushed it (unmanaged)' });
+      } else if (targetSha !== baseline) {
+        publishConflicts.push({
+          item,
+          reason: sourceSha === baseline
+            ? 'the team repo copy changed since your last publish (your copy is unchanged)'
+            : 'both your copy and the team repo copy changed',
+        });
+      }
+    }
+  }
+  if (publishConflicts.length > 0 && !options.force) {
+    for (const { item, reason } of publishConflicts) {
+      log.warn(`[${item.type}] Held ${item.relativePath}: ${reason}. Nothing was overwritten.`);
+      heldKeys.add(item.relativePath);
+    }
+    log.warn('Run with --force to overwrite the held file(s) listed above with your copy.');
+  } else if (publishConflicts.length > 0) {
+    for (const { item } of publishConflicts) {
+      log.warn(`--force: overwriting ${path.join(localConfig.repo.localPath, item.relativePath)} with your copy.`);
+    }
+  }
+
+  // Pending deletes: a published file whose project original disappeared. It
+  // is deletable only while the team repo copy still equals the baseline, and
+  // only after the delete list is confirmed. Evaluated now, executed (and
+  // confirmed) after the resource push.
+  const pendingDeletes: Array<{ rel: string; remoteChanged: boolean }> = [];
+  const staleBaselines: string[] = [];
+  if (publishProjectId && localConfig.projectRoot) {
+    const state = await loadStateForScope(localConfig);
+    for (const [key, baseline] of Object.entries(state.publishedFiles ?? {})) {
+      const prefix = key.startsWith(`docs/${publishProjectId}/`)
+        ? `docs/${publishProjectId}/`
+        : key.startsWith(`.wiki/${publishProjectId}/`)
+          ? `.wiki/${publishProjectId}/`
+          : null;
+      if (!prefix) continue;
+      const repoFile = path.join(localConfig.repo.localPath, key);
+      if (!(await pathExists(repoFile))) {
+        // Nothing at the target: our earlier push never merged, or the remote
+        // deleted it. Either way the record says nothing anymore.
+        staleBaselines.push(key);
+        continue;
+      }
+      const sourceRoot = prefix.startsWith('docs/')
+        ? path.join(localConfig.projectRoot, 'docs')
+        : path.join(localConfig.projectRoot, '.wiki');
+      if (await pathExists(path.join(sourceRoot, key.slice(prefix.length)))) continue;
+      pendingDeletes.push({ rel: key, remoteChanged: (await fileDigest(repoFile)) !== baseline });
+    }
+  }
+  if (staleBaselines.length > 0) {
+    const state = await loadStateForScope(localConfig);
+    state.publishedFiles = Object.fromEntries(
+      Object.entries(state.publishedFiles ?? {}).filter(([key]) => !staleBaselines.includes(key)),
+    );
+    await saveStateForScope(state, localConfig);
+    log.debug(`Dropped ${staleBaselines.length} publish baseline(s) whose team repo file is gone`);
+  }
+  for (const { rel, remoteChanged } of pendingDeletes) {
+    if (remoteChanged) {
+      log.warn(`[pending-delete] Kept ${rel}: the team repo copy changed since your last publish, so it is not yours to delete. Review it in the team repo.`);
+    } else {
+      log.info(`[pending-delete] ${rel}: the project original is gone; the team repo copy will be deleted after confirmation.`);
+    }
+  }
+
   // Preserve blocked items in the full scan so their pending PR records survive.
   // Exclude them before selection and grouping: pushItem cannot write their paths.
   const allItems = fullScan.filter((item) => {
+    if (heldKeys.has(item.relativePath)) return false;
     if (item.type === 'agents' && 'skipReason' in item
       && typeof item.skipReason === 'string' && item.skipReason) {
       log.warn(`[agents] Skipped ${item.name}: ${item.skipReason}`);
@@ -1313,6 +1524,30 @@ async function pushCore(
     }
   }
 
+  // ── Handle --rule parameter: filter to a single specific rule ───────
+  if (options.rule) {
+    const stem = options.rule.replace(/\.md$/, '');
+    const matched = allItems.filter(
+      (item) => item.type === 'rules' && (item.name === stem || item.name.endsWith(`/${stem}`)),
+    );
+    if (matched.length === 0) {
+      const ruleNames = allItems
+        .filter((i) => i.type === 'rules')
+        .map((i) => `  - ${i.name} (from: ${i.sourcePath})`)
+        .join('\n');
+      log.error(`Rule not found with changes to push: ${stem}`);
+      if (ruleNames) {
+        console.log('');
+        console.log('Available rules with changes:');
+        console.log(ruleNames);
+      }
+      process.exitCode = 1;
+      return;
+    }
+    allItems.length = 0;
+    allItems.push(...matched);
+  }
+
   // An explicit --role or --project is a destination override for every selected
   // skill, including modified ones. Keep relativePath aligned with pushItem's
   // destination so git stages the files that were actually copied (#331).
@@ -1428,6 +1663,12 @@ async function pushCore(
   }
 
   if (allItems.length === 0) {
+    // Held publish conflicts are unresolved even when nothing else goes out.
+    if (publishConflicts.length > 0 && !options.force) process.exitCode = 1;
+    // A delete-only run still has work: published files whose source vanished
+    // are confirmed and deleted even when no resource changed.
+    const deletable = pendingDeletes.filter((d) => !d.remoteChanged);
+    if (deletable.length > 0) await runPublishDeletes(localConfig, teamConfig, options, deletable);
     // No resource changes, but the user may have edited teamai.yaml (sources /
     // publicSkills) via `teamai source add`. Push that config change on its own
     // rather than reporting "nothing to push".
@@ -1558,6 +1799,7 @@ async function pushCore(
       items: allItems, options, localConfig, projectsManifest, skillsDestinationError, teamRepoStale,
     });
     if (!placed) return;
+    if (publishConflicts.length > 0 && !options.force) process.exitCode = 1;
     log.info('Dry run — no changes made');
     return;
   }
@@ -1617,6 +1859,8 @@ async function pushCore(
   // one group actually pushed AND no group's PR creation failed (#702 follow-up).
   let anyPushed = false;
   let anyPrFailed = false;
+  // Repo-relative docs/wiki path → sha of the content this run published.
+  const publishedBaselines = new Map<string, string>();
   for (const [groupIndex, group] of groups.entries()) {
     const outcome = await pushGroup({
       group,
@@ -1646,6 +1890,18 @@ async function pushCore(
     // (`reconcilePlacementRecords`).
     if (outcome === 'pushed') anyPushed = true;
     if (outcome === 'pr-failed') anyPrFailed = true;
+    // A published docs/wiki file that reached the repo (or already matched it)
+    // advances its baseline to what this machine just wrote, so the next push
+    // can tell its own change from somebody else's. A PR-creation failure
+    // still pushed the branch, so its content counts too; only a run that
+    // rolled the tree back ('failed') leaves the baseline alone.
+    if (outcome === 'pushed' || outcome === 'nochange' || outcome === 'pr-failed') {
+      for (const item of group.items) {
+        if (item.type === 'docs' || item.type === 'wiki') {
+          publishedBaselines.set(item.relativePath, await fileDigest(item.sourcePath));
+        }
+      }
+    }
   }
 
   // Update state (pushState already carries the pendingPushes records above)
@@ -1666,7 +1922,19 @@ async function pushCore(
       state.pushedEnvVars.push(item.name);
     }
   }
+  if (publishedBaselines.size > 0) {
+    state.publishedFiles = {
+      ...state.publishedFiles,
+      ...Object.fromEntries(publishedBaselines),
+    };
+  }
   await saveStateForScope(state, localConfig);
+
+  // Confirmed deletes of published files whose project original disappeared.
+  {
+    const deletable = pendingDeletes.filter((d) => !d.remoteChanged);
+    if (deletable.length > 0) await runPublishDeletes(localConfig, teamConfig, options, deletable);
+  }
 
   // When every selected resource reuses an existing PR, --branch still names a
   // real destination for the pending config edit. The reuse groups have already
@@ -1686,7 +1954,83 @@ async function pushCore(
   // failed. Not set on dry-run/cancel (return earlier), a no-change run (every
   // group 'nochange' → anyPushed stays false), or a PR-creation failure
   // (anyPrFailed) — so the caller does not fire a misleading webhook (#702 follow-up).
+  if (publishConflicts.length > 0 && !options.force) process.exitCode = 1;
   if (result && anyPushed && !anyPrFailed) result.completed = true;
+}
+
+/**
+ * Confirm and execute the deletion of published docs/wiki files whose project
+ * original disappeared (007). The delete list is shown in full; deletion goes
+ * through the same branch/PR flow as every other team repo change, and the
+ * project side is never touched (its copy is already gone). A cancelled or
+ * non-interactive confirmation keeps the files and marks the run unresolved
+ * (non-zero exit).
+ */
+async function runPublishDeletes(
+  localConfig: LocalConfig,
+  teamConfig: TeamaiConfig,
+  options: GlobalOptions & { branch?: string },
+  deletable: Array<{ rel: string }>,
+): Promise<void> {
+  if (options.dryRun) {
+    log.info(`[dry-run] Would ask to delete ${deletable.length} published file(s) from the team repo: ${deletable.map((d) => d.rel).join(', ')}`);
+    return;
+  }
+  if (!isInteractive()) {
+    log.warn(
+      `Non-interactive run: kept ${deletable.length} published file(s) whose project source is gone `
+      + `(${deletable.map((d) => d.rel).join(', ')}). Re-run interactively to confirm their deletion from the team repo.`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  console.log('');
+  console.log('The following published file(s) no longer exist in the project:');
+  for (const { rel } of deletable) console.log(`  - ${rel}`);
+  const answer = await askQuestion(`Delete these ${deletable.length} file(s) from the team repo? [y/N]: `);
+  if (answer === null || !/^(y|yes)$/i.test(answer.trim())) {
+    log.info('Kept the published file(s); nothing was deleted.');
+    process.exitCode = 1;
+    return;
+  }
+  const pushSpin = spinner('Deleting published files...').start();
+  const branchName = options.branch ?? generateBranchName(localConfig.username);
+  const commitMsg = `[teamai] Remove ${deletable.length} published file(s) from ${localConfig.username}`;
+  try {
+    for (const { rel } of deletable) {
+      const repoFile = path.join(localConfig.repo.localPath, rel);
+      await remove(repoFile);
+      await pruneEmptyDirs(path.dirname(repoFile));
+    }
+    const hasChanges = await pushRepoBranch(
+      localConfig.repo.localPath,
+      commitMsg,
+      deletable.map((d) => d.rel),
+      branchName,
+    );
+    if (hasChanges) {
+      pushSpin.succeed(`Pushed branch ${branchName}`);
+    } else {
+      pushSpin.succeed('Published files already deleted');
+    }
+    const prUrl = await createPrWithFallback(
+      teamConfig,
+      localConfig,
+      branchName,
+      commitMsg,
+      `Removed published file(s):\n${deletable.map((d) => `- ${d.rel}`).join('\n')}`,
+    );
+    if (!prUrl) process.exitCode = 1;
+    await checkoutMaster(localConfig.repo.localPath);
+  } catch (e) {
+    pushSpin.fail(`Delete push failed: ${(e as Error).message}`);
+    try {
+      await checkoutMaster(localConfig.repo.localPath);
+    } catch {
+      // Already on a branch pushRepoBranch could not leave; the next run resets.
+    }
+    process.exitCode = 1;
+  }
 }
 
 /**

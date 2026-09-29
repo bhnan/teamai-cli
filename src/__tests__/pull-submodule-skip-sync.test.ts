@@ -93,14 +93,14 @@ const localConfig = {
   username: 'test',
   updatePolicy: 'auto' as const,
   additionalRoles: [],
-  scope: 'user' as const,
+  scope: 'project' as const,
+  projectRoot: homeDir,
 };
 
 vi.mock('../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../config.js')>()),
   requireInit: vi.fn(),
-  detectProjectConfig: vi.fn().mockResolvedValue(null),
-  loadLocalConfigForScope: vi.fn().mockResolvedValue(localConfig),
+  detectProjectConfig: vi.fn().mockResolvedValue(localConfig),
   // Load the REAL teamai.yaml from the clone, so `submodules: true` is read from
   // the same file the pull under test resolves.
   loadTeamConfig: vi.fn(async (repoPath: string) => {
@@ -251,8 +251,12 @@ describe('pull submodule skip-sync (issue #525)', () => {
    * returns `rev-parse --short HEAD`, so a full SHA would never match and the
    * fast path this test exercises would never be reached.
    */
-  function seedSyncedState(): void {
+  async function seedSyncedState(): Promise<void> {
     const head = git(['rev-parse', '--short', 'HEAD'], localPath).trim();
+    // 007: a project-scope pull keys its fast path on the checkout's own
+    // record, so the seeded state carries it too.
+    const { checkoutKey } = await import('../pull.js');
+    const key = await checkoutKey(homeDir);
     fs.writeFileSync(
       path.join(homeDir, '.teamai', 'state.json'),
       JSON.stringify({
@@ -260,6 +264,7 @@ describe('pull submodule skip-sync (issue #525)', () => {
         lastPull: '2026-04-01T00:00:00.000Z',
         lastPullRev: head,
         lastPullTargets: ['claude'],
+        lastPullByWorkspace: { [key]: { rev: head, targets: ['claude'] } },
         pushedRules: [],
         pushedSkills: [],
         pushedEnvVars: [],
@@ -273,7 +278,7 @@ describe('pull submodule skip-sync (issue #525)', () => {
   it('deploys submodule content on a pull whose parent rev is already cached', async () => {
     // The upgrade scenario: the parent SHA was already synced (empty submodule
     // dir), then the CLI starts honoring `submodules: true`.
-    seedSyncedState();
+    await seedSyncedState();
 
     await pull({});
 
@@ -291,7 +296,7 @@ describe('pull submodule skip-sync (issue #525)', () => {
     // Populate the submodule and cache the same rev: nothing changed this run,
     // so the fast path must still apply (no needless full re-deploy).
     git(['-c', 'protocol.file.allow=always', 'submodule', 'update', '--init'], localPath);
-    seedSyncedState();
+    await seedSyncedState();
 
     await pull({});
 

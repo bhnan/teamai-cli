@@ -68,11 +68,13 @@ vi.mock('../update.js', () => ({
 }));
 
 const { pull } = await import('../pull.js');
-const { loadLocalConfigForScope, loadTeamConfig } = await import('../config.js');
+const { detectProjectConfig, loadTeamConfig } = await import('../config.js');
 const { reconcilePlacementRecords } = await import('../utils/pending-push.js');
 import type { LocalConfig, TeamaiConfig } from '../types.js';
 
 const business = path.join(testRoot, 'product');
+// 007: pull runs in a project scope only; HOME doubles as the project root.
+const projectRoot = path.join(testRoot, 'home');
 const teamConfig: TeamaiConfig = {
   team: 'test',
   description: '',
@@ -98,13 +100,15 @@ function config(kind: 'git' | 'self'): LocalConfig {
         businessRepoRoot: business,
       },
       username: 'alice',
-      scope: 'user',
+      scope: 'project',
+      projectRoot: business,
       additionalRoles: [],
     }
     : {
       repo: { localPath: path.join(testRoot, 'team-repo'), remote: 'https://example.test/team/repo.git', kind: 'git' },
       username: 'alice',
-      scope: 'user',
+      scope: 'project',
+      projectRoot,
       additionalRoles: [],
     };
 }
@@ -131,7 +135,7 @@ describe('teamai pull settles placement records against the default branch', () 
   });
 
   it('in an independent clone', async () => {
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(config('git'));
+    vi.mocked(detectProjectConfig).mockResolvedValue(config('git'));
 
     await pull({ silent: true, force: true });
 
@@ -139,7 +143,7 @@ describe('teamai pull settles placement records against the default branch', () 
   });
 
   it('in single-repo mode, through origin/<default> rather than the member\'s checkout', async () => {
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(config('self'));
+    vi.mocked(detectProjectConfig).mockResolvedValue(config('self'));
 
     await pull({ silent: true, force: true });
 

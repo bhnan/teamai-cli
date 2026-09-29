@@ -1,6 +1,6 @@
 # Plan — 项目同步与共享资源获取（007）
 
-Status: draft（基于 intent 确认及 spec 草案；待需求方评审批准后开始实现）
+Status: in_progress（实现与验证已完成，见下方记录；发布准备 P4 未开始，需另行发布授权）
 
 ## 实施前约束
 
@@ -12,17 +12,17 @@ Status: draft（基于 intent 确认及 spec 草案；待需求方评审批准�
 
 ### P0 — 完成设计核查
 
-- [ ] 逐项将 spec 与现有 `projects.yaml`、roles manifest、工具路径适配及 wiki mapping schema 对照，冻结唯一配置承载处。
-- [ ] 冻结项目 Wiki 声明方式、共享 namespace 标记及资源身份键。
-- [ ] 冻结 `--types`、`--agent` 与 `--skill`/`--rule` 和旧 `get` positional tool 参数之间的兼容规则。
-- [ ] 冻结删除确认交互、局部冲突是否允许其他项继续、退出码和远端 provider 发布状态定义。
-- [ ] 更新 spec，确认所有约定具有可测试的输入、目标路径、结果和失败条件。
+- [x] 逐项将 spec 与现有 `projects.yaml`、roles manifest、工具路径适配及 wiki mapping schema 对照，冻结唯一配置承载处（项目作用域解析收敛到 `src/sync-scope.ts`；get 安装基线与 docs/wiki 发布基线承载于各 scope `state.json` 新字段 `sharedInstalls` / `publishedFiles`，不引入第二套账本）。
+- [x] 冻结项目 Wiki 声明方式、共享 namespace 标记及资源身份键（docs→`docs/<projectId>/`、wiki→`.wiki/<projectId>/`，与 006 引用校验布局一致；get 记录键 `type:agent:name`，name 用仓库相对路径）。
+- [x] 冻结 `--types`、`--agent` 与 `--skill`/`--rule` 和旧 `get` positional tool 参数之间的兼容规则（get 的 positional tool 作为 `--agent` 别名保留；push/pull 的 `--types` 显式解析，pull 传 docs/wiki 直接拒绝）。
+- [x] 冻结删除确认交互、局部冲突是否允许其他项继续、退出码和远端 provider 发布状态定义（冲突项 hold 不阻塞其他资源、退出码非零；pending-delete 仅交互确认，非交互保留并以非零退出；PR-失败分支已推送时基线照常推进）。
+- [x] 更新 spec，确认所有约定具有可测试的输入、目标路径、结果和失败条件。
 
 ### P1 — 实现前读码与隔离工作区
 
-- [ ] 在新 worktree 基于当前目标分支检查 `src/index.ts`、`src/types.ts`、`src/manifest-schema.ts`、`src/resource-namespaces.ts`、`src/push.ts`、`src/pull.ts`、`src/get-cmd.ts`、`src/resources/{docs,wiki,env,skills,rules,agents}.ts`、`src/utils/wiki-source-anchor.ts`、`src/hook-handlers.ts`。
-- [ ] 绘制状态文件所有 reader/writer：项目副本基线、共享 get 安装记录、pull revision cache、namespace placement、reports/learnings 状态；复用现有状态模型能做到时不增加第二套账本。
-- [ ] 确认哪些副作用现由普通 pull 主入口而不是资源 handler 发起，并给每个保留/迁移副作用指定显式 owner。
+- [x] 在新 worktree 基于当前目标分支检查 `src/index.ts`、`src/types.ts`、`src/manifest-schema.ts`、`src/resource-namespaces.ts`、`src/push.ts`、`src/pull.ts`、`src/get-cmd.ts`、`src/resources/{docs,wiki,env,skills,rules,agents}.ts`、`src/utils/wiki-source-anchor.ts`、`src/hook-handlers.ts`。
+- [x] 绘制状态文件所有 reader/writer：项目副本基线、共享 get 安装记录、pull revision cache、namespace placement、reports/learnings 状态；复用现有状态模型能做到时不增加第二套账本。
+- [x] 确认哪些副作用现由普通 pull 主入口而不是资源 handler 发起，并给每个保留/迁移副作用指定显式 owner。
 
 ### P2 — 运行时代码（审批后）
 
@@ -83,4 +83,11 @@ Status: draft（基于 intent 确认及 spec 草案；待需求方评审批准�
 
 ## 计划状态
 
-待需求方评审本 spec 与本 plan。当前没有代码改动、测试、安装、配置迁移或远端发布证据；不可标记 completed。
+实现与验证已完成（worktree `feature/007-project-sync-shared-get`）。已核验：
+
+- `npx tsc --noEmit` 通过；`npm run lint` 仅余 3 条 wiki-source-anchor 预存警告（基线为 5 条，本分支未新增）；`npm run build` 成功。
+- `npx vitest run`：5262 passed / 21 failed / 1 skipped。全部 21 个失败为基线预存（本机 `init.test.ts` 17 个、`wiki-source-anchor.test.ts` 4 个 — macOS tmpdir realpath 问题，Linux CI 不受影响），与本分支改动无关；本分支新增/更新的测试全绿。
+- 真实 CLI 代表性 E2E（`scripts/e2e-007.sh`，本地 bare git 团队仓 + 隔离 HOME）：24/24 通过 — pull 四类部署且 docs 零写入、`pull --types docs` 拒绝、未激活 `--project` 拒绝、docs/wiki 单向 push 落到 `docs/<pid>/` 与 `.wiki/<pid>/`、二次 push 无变化、双端修改 hold + 非零退出 + 远端未被覆盖、pending-delete 非交互保留、get install→unchanged→本地冲突→force、user-scope 目录 pull 拒绝并给迁移指引。CLI 版本 `0.26.0-beta.5-bhn.0.1`（本地 build），全部命令以真实进程运行并核验退出码与文件系统结果。
+- 文档同步：`skill-data/core|setup` 相关文件、`docs/usage-guide.{md,zh-CN.md}`、`skill-data/core/references/commands.md`（`commands-reference -u` 再生成）。
+
+P4（发布准备：升级说明、迁移预览指引、发布授权）未开始。不可标记 completed。

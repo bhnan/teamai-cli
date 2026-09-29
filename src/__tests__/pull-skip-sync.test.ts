@@ -20,6 +20,9 @@ vi.mock('../utils/git.js', () => ({
   pullRepo: vi.fn().mockResolvedValue('already up to date'),
   getHeadRev: vi.fn().mockResolvedValue('abc1234'),
   createGit: vi.fn(),
+  // 007: the project-scope revision record lists the repo's worktrees to drop
+  // removed checkouts' records; the fixture has no git repo, so none are live.
+  listWorktrees: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock('../utils/logger.js', () => ({
@@ -88,8 +91,8 @@ vi.mock('../builtin-skills.js', async (importOriginal) => {
   return { ...actual, deployBuiltinSkills: vi.fn(actual.deployBuiltinSkills) };
 });
 
-import { pull, compileRecallRulesBlock, cleanupInactiveNamespaceSkills } from '../pull.js';
-import { loadLocalConfigForScope, loadTeamConfig, detectProjectConfig, loadStateForScope, saveStateForScope } from '../config.js';
+import { pull, compileRecallRulesBlock, cleanupInactiveNamespaceSkills, checkoutKey } from '../pull.js';
+import { loadTeamConfig, detectProjectConfig, loadStateForScope, saveStateForScope } from '../config.js';
 import { getHeadRev, createGit, pullRepo } from '../utils/git.js';
 import { log } from '../utils/logger.js';
 import {
@@ -149,12 +152,12 @@ describe('pull skip-sync when repo HEAD unchanged', () => {
       primaryRole: 'hai',
       additionalRoles: [],
       resourceProfileVersion: 1,
-      scope: 'user',
+      scope: 'project',
+      projectRoot: homeDir,
     };
 
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(localConfig);
+    vi.mocked(detectProjectConfig).mockResolvedValue(localConfig);
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
-    vi.mocked(detectProjectConfig).mockResolvedValue(null);
   });
 
   afterEach(async () => {
@@ -165,18 +168,7 @@ describe('pull skip-sync when repo HEAD unchanged', () => {
 
   it('should skip sync when HEAD rev matches lastPullRev', async () => {
     vi.mocked(getHeadRev).mockResolvedValue('abc1234');
-    vi.mocked(loadStateForScope).mockResolvedValue({
-      lastPull: '2026-04-01',
-      lastPullRev: 'abc1234',
-      lastPullTargets: ['claude'],
-      lastPush: null,
-      pushedRules: [],
-      pushedSkills: [],
-      pushedEnvVars: [],
-      pendingPushes: [],
-      lastUpdateCheck: null,
-      availableUpdate: null,
-    });
+    vi.mocked(loadStateForScope).mockImplementation(async () => stateWithCheckout(homeDir, 'abc1234', ['claude']));
 
     await pull({});
 
@@ -208,10 +200,7 @@ describe('pull skip-sync when repo HEAD unchanged', () => {
     await fse.writeFile(envShPath, "export SHARED_URL='https://shared.example'\nexport DEVOPS_ONLY='devops-secret'\n");
 
     vi.mocked(getHeadRev).mockResolvedValue('abc1234');
-    vi.mocked(loadStateForScope).mockResolvedValue(emptyState({
-      lastPullRev: 'abc1234',
-      lastPullTargets: ['claude'],
-    }));
+    vi.mocked(loadStateForScope).mockImplementation(async () => stateWithCheckout(homeDir, 'abc1234', ['claude'], {       lastPull: null,         }));
 
     await pull({});
 
@@ -241,10 +230,7 @@ describe('pull skip-sync when repo HEAD unchanged', () => {
     await fse.ensureDir(envShPath);
 
     vi.mocked(getHeadRev).mockResolvedValue('abc1234');
-    vi.mocked(loadStateForScope).mockResolvedValue(emptyState({
-      lastPullRev: 'abc1234',
-      lastPullTargets: ['claude'],
-    }));
+    vi.mocked(loadStateForScope).mockImplementation(async () => stateWithCheckout(homeDir, 'abc1234', ['claude'], {       lastPull: null,         }));
 
     await pull({});
 
@@ -258,10 +244,7 @@ describe('pull skip-sync when repo HEAD unchanged', () => {
   it('stops before the revision fast path when role-scoped resources cannot be resolved', async () => {
     await fse.remove(path.join(repoPath, 'skills', 'common'));
     await fse.writeFile(path.join(repoPath, 'skills', 'common'), 'not a directory\n');
-    vi.mocked(loadStateForScope).mockResolvedValue(emptyState({
-      lastPullRev: 'abc1234',
-      lastPullTargets: ['claude'],
-    }));
+    vi.mocked(loadStateForScope).mockImplementation(async () => stateWithCheckout(homeDir, 'abc1234', ['claude'], {       lastPull: null,         }));
 
     await pull({});
 
@@ -313,7 +296,7 @@ describe('pull skip-sync when repo HEAD unchanged', () => {
     const { deployBuiltinSkills } = await import('../builtin-skills.js');
     vi.mocked(deployBuiltinSkills).mockRejectedValueOnce(new Error('EACCES: permission denied'));
     vi.mocked(getHeadRev).mockResolvedValue('abc1234');
-    vi.mocked(loadStateForScope).mockResolvedValue(emptyState({ lastPullRev: 'abc1234', lastPullTargets: ['claude'] }));
+    vi.mocked(loadStateForScope).mockImplementation(async () => stateWithCheckout(homeDir, 'abc1234', ['claude'], { lastPull: null }));
 
     await pull({});
 
@@ -328,7 +311,7 @@ describe('pull skip-sync when repo HEAD unchanged', () => {
     const { deployBuiltinSkills } = await import('../builtin-skills.js');
     vi.mocked(deployBuiltinSkills).mockRejectedValueOnce(new Error('EACCES: permission denied'));
     vi.mocked(getHeadRev).mockResolvedValue('def5678');
-    vi.mocked(loadStateForScope).mockResolvedValue(emptyState({ lastPullRev: 'abc1234' }));
+    vi.mocked(loadStateForScope).mockImplementation(async () => stateWithCheckout(homeDir, 'abc1234', []));
 
     await pull({});
 
@@ -522,18 +505,7 @@ describe('pull skip-sync when repo HEAD unchanged', () => {
     } as unknown as ReturnType<typeof createGit>);
     // Parent SHA is unchanged — the pre-fix fast path would skip here.
     vi.mocked(getHeadRev).mockResolvedValue('abc1234');
-    vi.mocked(loadStateForScope).mockResolvedValue({
-      lastPull: '2026-04-01',
-      lastPullRev: 'abc1234',
-      lastPullTargets: ['claude'],
-      lastPush: null,
-      pushedRules: [],
-      pushedSkills: [],
-      pushedEnvVars: [],
-      pendingPushes: [],
-      lastUpdateCheck: null,
-      availableUpdate: null,
-    });
+    vi.mocked(loadStateForScope).mockImplementation(async () => stateWithCheckout(homeDir, 'abc1234', ['claude']));
 
     await pull({});
 
@@ -556,18 +528,7 @@ describe('pull skip-sync when repo HEAD unchanged', () => {
       submoduleUpdate: vi.fn().mockResolvedValue(undefined),
     } as unknown as ReturnType<typeof createGit>);
     vi.mocked(getHeadRev).mockResolvedValue('abc1234');
-    vi.mocked(loadStateForScope).mockResolvedValue({
-      lastPull: '2026-04-01',
-      lastPullRev: 'abc1234',
-      lastPullTargets: ['claude'],
-      lastPush: null,
-      pushedRules: [],
-      pushedSkills: [],
-      pushedEnvVars: [],
-      pendingPushes: [],
-      lastUpdateCheck: null,
-      availableUpdate: null,
-    });
+    vi.mocked(loadStateForScope).mockImplementation(async () => stateWithCheckout(homeDir, 'abc1234', ['claude']));
 
     await pull({});
 
@@ -644,26 +605,15 @@ describe('pull skip-sync refreshes CLAUDE.md recall block (CLI upgrade)', () => 
       primaryRole: 'hai',
       additionalRoles: [],
       resourceProfileVersion: 1,
-      scope: 'user',
+      scope: 'project',
+      projectRoot: homeDir,
       recallEnabled: true,
     };
 
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(localConfig);
+    vi.mocked(detectProjectConfig).mockResolvedValue(localConfig);
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
-    vi.mocked(detectProjectConfig).mockResolvedValue(null);
     vi.mocked(getHeadRev).mockResolvedValue('abc1234');
-    vi.mocked(loadStateForScope).mockResolvedValue({
-      lastPull: '2026-04-01',
-      lastPullRev: 'abc1234', // matches HEAD → triggers "Already synced" fast-path
-      lastPullTargets: ['claude'],
-      lastPush: null,
-      pushedRules: [],
-      pushedSkills: [],
-      pushedEnvVars: [],
-      pendingPushes: [],
-      lastUpdateCheck: null,
-      availableUpdate: null,
-    });
+    vi.mocked(loadStateForScope).mockImplementation(async () => stateWithCheckout(homeDir, 'abc1234', ['claude']));
   });
 
   afterEach(async () => {
@@ -690,14 +640,15 @@ describe('pull skip-sync refreshes CLAUDE.md recall block (CLI upgrade)', () => 
   });
 
   it('does not touch CLAUDE.md when recall is disabled for the scope', async () => {
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue({
+    vi.mocked(detectProjectConfig).mockResolvedValue({
       repo: { localPath: repoPath, remote: 'https://git.woa.com/test/repo.git' },
       username: 'testuser',
       updatePolicy: 'auto',
       primaryRole: 'hai',
       additionalRoles: [],
       resourceProfileVersion: 1,
-      scope: 'user',
+      scope: 'project',
+      projectRoot: homeDir,
       recallEnabled: false,
     } as LocalConfig);
 
@@ -709,8 +660,12 @@ describe('pull skip-sync refreshes CLAUDE.md recall block (CLI upgrade)', () => 
   });
 
   it('refreshes Copilot recall instructions under a custom COPILOT_HOME', async () => {
+    // 007: pull is project-scoped, so the Copilot instructions land under the
+    // project root even when COPILOT_HOME points elsewhere (the user-global
+    // Copilot layout is served by `teamai get` instead).
     const copilotHome = path.join(tmpDir, 'copilot-home');
-    const copilotInstructions = path.join(copilotHome, 'copilot-instructions.md');
+    const copilotInstructions = path.join(homeDir, '.github', 'copilot-instructions.md');
+    await fse.ensureDir(path.join(homeDir, '.github'));
     await fse.ensureDir(path.join(copilotHome, 'agents'));
     await fse.writeFile(copilotInstructions, '# Personal instructions\n');
     vi.stubEnv('COPILOT_HOME', copilotHome);
@@ -727,11 +682,12 @@ describe('pull skip-sync refreshes CLAUDE.md recall block (CLI upgrade)', () => 
       primaryRole: 'hai',
       additionalRoles: [],
       resourceProfileVersion: 1,
-      scope: 'user',
+      scope: 'project',
+      projectRoot: homeDir,
       recallEnabled: true,
       enabledAgents: ['copilot'],
     };
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(localConfig);
+    vi.mocked(detectProjectConfig).mockResolvedValue(localConfig);
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
     vi.mocked(loadStateForScope).mockResolvedValue(emptyState({
       lastPull: '2026-04-01',
@@ -760,6 +716,23 @@ function emptyState(overrides: Partial<State> = {}): State {
     availableUpdate: null,
     ...overrides,
   };
+}
+
+/** A state whose project checkout is recorded at `rev` — the record the
+ *  project-scope fast path keys on (007 fixture shift from user scope). */
+async function stateWithCheckout(
+  homeDir: string,
+  rev: string,
+  targets: string[],
+  overrides: Partial<State> = {},
+): Promise<State> {
+  return emptyState({
+    lastPull: '2026-04-01',
+    lastPullRev: rev,
+    lastPullTargets: targets,
+    lastPullByWorkspace: { [await checkoutKey(homeDir)]: { rev, targets } },
+    ...overrides,
+  });
 }
 
 describe('enabledAgents whitelist on pull inject, skip-sync, and cleanup (#510)', () => {
@@ -843,12 +816,13 @@ describe('enabledAgents whitelist on pull inject, skip-sync, and cleanup (#510)'
       primaryRole: 'hai',
       additionalRoles: [],
       resourceProfileVersion: 1,
-      scope: 'user',
+      scope: 'project',
+      projectRoot: homeDir,
       recallEnabled: true,
       enabledAgents: ['claude'],
     };
 
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(localConfig);
+    vi.mocked(detectProjectConfig).mockResolvedValue(localConfig);
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
     vi.mocked(loadStateForScope).mockResolvedValue(emptyState());
 
@@ -867,21 +841,15 @@ describe('enabledAgents whitelist on pull inject, skip-sync, and cleanup (#510)'
     expect(codebuddyMd).not.toContain(TEAMAI_RECALL_RULES_START);
   });
 
-  it.each(['user', 'project'] as const)(
+  it.each(['project'] as const)(
     'delivers idempotent Copilot instructions in %s scope without replacing user content or settings',
     async (scope) => {
       const copilotHome = path.join(tmpDir, 'copilot-home');
-      const projectRoot = path.join(tmpDir, 'project');
-      const instructionPath = scope === 'user'
-        ? path.join(copilotHome, 'copilot-instructions.md')
-        : path.join(projectRoot, '.github', 'copilot-instructions.md');
+      const projectRoot = scope === 'project' ? path.join(tmpDir, 'project') : homeDir;
+      const instructionPath = path.join(projectRoot, '.github', 'copilot-instructions.md');
       const settingsPath = path.join(copilotHome, 'settings.json');
-      const docsPath = scope === 'user'
-        ? path.join(homeDir, '.teamai', 'docs', 'copilot-context.md')
-        : path.join(projectRoot, '.teamai', 'docs', 'copilot-context.md');
-      const envPath = scope === 'user'
-        ? path.join(homeDir, '.teamai', 'env.sh')
-        : path.join(projectRoot, '.teamai', 'env.sh');
+      const docsPath = path.join(projectRoot, '.teamai', 'docs', 'copilot-context.md');
+      const envPath = path.join(projectRoot, '.teamai', 'env.sh');
       const userInstructions = '# Personal Copilot instructions\n\nKeep this text.\n';
       const userSettings = '{"theme":"dark"}\n';
       const sharedDoc = '# Copilot team context\n';
@@ -913,12 +881,14 @@ describe('enabledAgents whitelist on pull inject, skip-sync, and cleanup (#510)'
         primaryRole: 'hai',
         additionalRoles: [],
         resourceProfileVersion: 1,
-        scope,
-        projectRoot: scope === 'project' ? projectRoot : undefined,
+        // 007: pull runs in a project scope only; both former branches keep
+        // their own projectRoot so each still writes to its own tree.
+        scope: 'project',
+        projectRoot: scope === 'project' ? projectRoot : homeDir,
         enabledAgents: ['copilot'],
       };
 
-      vi.mocked(loadLocalConfigForScope).mockResolvedValue(localConfig);
+      vi.mocked(detectProjectConfig).mockResolvedValue(localConfig);
       vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
       vi.mocked(loadStateForScope).mockResolvedValue(emptyState());
 
@@ -934,7 +904,9 @@ describe('enabledAgents whitelist on pull inject, skip-sync, and cleanup (#510)'
       expect(second.split(TEAMAI_CULTURE_START)).toHaveLength(2);
       expect(second.split(TEAMAI_CLAUDEMD_START)).toHaveLength(2);
       expect(await fse.readFile(settingsPath, 'utf8')).toBe(userSettings);
-      expect(await fse.readFile(docsPath, 'utf8')).toBe(sharedDoc);
+      // 007: pull no longer mirrors team docs into the project; the seeded
+      // repo doc stays in the clone only.
+      expect(await fse.pathExists(docsPath)).toBe(false);
       expect(await fse.readFile(envPath, 'utf8')).toContain(`export TEAMAI_COPILOT_SCOPE='${sharedEnvValue}'`);
 
       await fse.remove(path.join(repoPath, 'culture.md'));
@@ -966,11 +938,11 @@ describe('enabledAgents whitelist on pull inject, skip-sync, and cleanup (#510)'
   );
 
   it('delivers new Copilot instructions after a CLI upgrade when the repo revision is unchanged', async () => {
-    const copilotHome = path.join(tmpDir, 'copilot-home');
-    const instructionPath = path.join(copilotHome, 'copilot-instructions.md');
+    // 007: project-scope pull resolves the Copilot instructions under the
+    // project root (.github/copilot-instructions.md).
+    const instructionPath = path.join(homeDir, '.github', 'copilot-instructions.md');
     const userInstructions = '# Personal Copilot instructions\n\nKeep this text.\n';
-    vi.stubEnv('COPILOT_HOME', copilotHome);
-    await fse.ensureDir(copilotHome);
+    await fse.ensureDir(path.dirname(instructionPath));
     await fse.writeFile(instructionPath, userInstructions);
 
     const teamConfig = TeamaiConfigSchema.parse({
@@ -984,16 +956,13 @@ describe('enabledAgents whitelist on pull inject, skip-sync, and cleanup (#510)'
       primaryRole: 'hai',
       additionalRoles: [],
       resourceProfileVersion: 1,
-      scope: 'user',
+      scope: 'project',
+      projectRoot: homeDir,
       enabledAgents: ['copilot'],
     };
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(localConfig);
+    vi.mocked(detectProjectConfig).mockResolvedValue(localConfig);
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
-    vi.mocked(loadStateForScope).mockResolvedValue(emptyState({
-      lastPull: '2026-04-01',
-      lastPullRev: 'abc1234',
-      lastPullTargets: ['copilot'],
-    }));
+    vi.mocked(loadStateForScope).mockImplementation(async () => stateWithCheckout(homeDir, 'abc1234', ['copilot']));
 
     await pull({ silent: true });
 
@@ -1007,9 +976,7 @@ describe('enabledAgents whitelist on pull inject, skip-sync, and cleanup (#510)'
   });
 
   it('warns without replacing an unwritable Copilot instruction target', async () => {
-    const copilotHome = path.join(tmpDir, 'copilot-home');
-    const instructionPath = path.join(copilotHome, 'copilot-instructions.md');
-    vi.stubEnv('COPILOT_HOME', copilotHome);
+    const instructionPath = path.join(homeDir, '.github', 'copilot-instructions.md');
     await fse.ensureDir(instructionPath);
 
     const teamConfig = TeamaiConfigSchema.parse({
@@ -1023,15 +990,13 @@ describe('enabledAgents whitelist on pull inject, skip-sync, and cleanup (#510)'
       primaryRole: 'hai',
       additionalRoles: [],
       resourceProfileVersion: 1,
-      scope: 'user',
+      scope: 'project',
+      projectRoot: homeDir,
       enabledAgents: ['copilot'],
     };
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(localConfig);
+    vi.mocked(detectProjectConfig).mockResolvedValue(localConfig);
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
-    vi.mocked(loadStateForScope).mockResolvedValue(emptyState({
-      lastPullRev: 'abc1234',
-      lastPullTargets: ['copilot'],
-    }));
+    vi.mocked(loadStateForScope).mockImplementation(async () => stateWithCheckout(homeDir, 'abc1234', ['copilot'], {       lastPull: null,         }));
 
     await pull({ silent: true });
 
@@ -1049,18 +1014,16 @@ describe('enabledAgents whitelist on pull inject, skip-sync, and cleanup (#510)'
       updatePolicy: 'auto',
       additionalRoles: [],
       resourceProfileVersion: 1,
-      scope: 'user',
+      scope: 'project',
+      projectRoot: homeDir,
       enabledAgents: ['copilot'],
     };
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(localConfig);
+    vi.mocked(detectProjectConfig).mockResolvedValue(localConfig);
     vi.mocked(loadTeamConfig).mockResolvedValue(TeamaiConfigSchema.parse({
       team: 'test',
       repo: 'https://github.com/example/team.git',
     }));
-    vi.mocked(loadStateForScope).mockResolvedValue(emptyState({
-      lastPullRev: 'abc1234',
-      lastPullTargets: ['copilot'],
-    }));
+    vi.mocked(loadStateForScope).mockImplementation(async () => stateWithCheckout(homeDir, 'abc1234', ['copilot'], {       lastPull: null,         }));
 
     await pull({ silent: true });
 
@@ -1096,11 +1059,12 @@ describe('enabledAgents whitelist on pull inject, skip-sync, and cleanup (#510)'
       primaryRole: 'hai',
       additionalRoles: [],
       resourceProfileVersion: 1,
-      scope: 'user',
+      scope: 'project',
+      projectRoot: homeDir,
       enabledAgents: ['workbuddy'],
     };
 
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(localConfig);
+    vi.mocked(detectProjectConfig).mockResolvedValue(localConfig);
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
     vi.mocked(loadStateForScope).mockResolvedValue(emptyState());
 
@@ -1139,11 +1103,12 @@ describe('enabledAgents whitelist on pull inject, skip-sync, and cleanup (#510)'
       primaryRole: 'hai',
       additionalRoles: [],
       resourceProfileVersion: 1,
-      scope: 'user',
+      scope: 'project',
+      projectRoot: homeDir,
       enabledAgents: ['workbuddy'],
     };
 
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(localConfig);
+    vi.mocked(detectProjectConfig).mockResolvedValue(localConfig);
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
     vi.mocked(loadStateForScope).mockResolvedValue(emptyState());
 
@@ -1153,14 +1118,12 @@ describe('enabledAgents whitelist on pull inject, skip-sync, and cleanup (#510)'
 
     vi.mocked(log.success).mockClear();
     vi.mocked(saveStateForScope).mockClear();
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue({
+    vi.mocked(detectProjectConfig).mockResolvedValue({
       ...localConfig,
       enabledAgents: ['workbuddy', 'claude'],
     });
-    vi.mocked(loadStateForScope).mockResolvedValue(emptyState({
+    vi.mocked(loadStateForScope).mockImplementation(async () => stateWithCheckout(homeDir, 'abc1234', ['workbuddy'], {
       lastPull: '2026-04-01',
-      lastPullRev: 'abc1234',
-      lastPullTargets: ['workbuddy'],
     }));
 
     await pull({});
@@ -1199,17 +1162,14 @@ describe('enabledAgents whitelist on pull inject, skip-sync, and cleanup (#510)'
       primaryRole: 'hai',
       additionalRoles: [],
       resourceProfileVersion: 1,
-      scope: 'user',
+      scope: 'project',
+      projectRoot: homeDir,
       enabledAgents: ['workbuddy'],
     };
 
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(localConfig);
+    vi.mocked(detectProjectConfig).mockResolvedValue(localConfig);
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
-    vi.mocked(loadStateForScope).mockResolvedValue(emptyState({
-      lastPull: '2026-04-01',
-      lastPullRev: 'abc1234',
-      lastPullTargets: ['workbuddy'],
-    }));
+    vi.mocked(loadStateForScope).mockImplementation(async () => stateWithCheckout(homeDir, 'abc1234', ['workbuddy']));
 
     await pull({});
 

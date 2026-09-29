@@ -46,7 +46,7 @@ vi.mock('../update.js', () => ({
 }));
 
 import { pull } from '../pull.js';
-import { loadLocalConfigForScope, loadTeamConfig, detectProjectConfig } from '../config.js';
+import { loadTeamConfig, detectProjectConfig } from '../config.js';
 import { log } from '../utils/logger.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
 
@@ -76,6 +76,8 @@ describe('pull agents cleanup after role change', () => {
   let repoPath: string;
 
   function configFor(role: string): LocalConfig {
+    // 007: pull runs in a project scope only; HOME doubles as the project root
+    // so the seeded agent directories keep their paths.
     return {
       repo: { localPath: repoPath, remote: 'https://example.com/test/repo.git' },
       username: 'testuser',
@@ -83,7 +85,8 @@ describe('pull agents cleanup after role change', () => {
       primaryRole: role,
       additionalRoles: [],
       resourceProfileVersion: 1,
-      scope: 'user',
+      scope: 'project',
+      projectRoot: homeDir,
     };
   }
 
@@ -125,9 +128,8 @@ describe('pull agents cleanup after role change', () => {
       },
     };
 
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(configFor('frontend'));
+    vi.mocked(detectProjectConfig).mockResolvedValue(configFor('frontend'));
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
-    vi.mocked(detectProjectConfig).mockResolvedValue(null);
     vi.mocked(log.warn).mockClear();
   });
 
@@ -143,7 +145,7 @@ describe('pull agents cleanup after role change', () => {
     const oldCopy = path.join(homeDir, '.claude/agents/reviewer.md');
     expect(await fse.pathExists(oldCopy)).toBe(true);
     if (edited) await fse.appendFile(oldCopy, '\nLocal edit.\n');
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(configFor('devops'));
+    vi.mocked(detectProjectConfig).mockResolvedValue(configFor('devops'));
     await pull({});
     expect(await fse.pathExists(oldCopy)).toBe(edited);
     expect(await fse.readFile(path.join(homeDir, '.codex/agents/reviewer.toml'), 'utf8')).toContain('Review new.');
@@ -155,7 +157,7 @@ describe('pull agents cleanup after role change', () => {
     await pull({});
     const codexCopy = path.join(homeDir, '.codex/agents/reviewer.toml');
     expect(await fse.pathExists(codexCopy)).toBe(true);
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(configFor('devops'));
+    vi.mocked(detectProjectConfig).mockResolvedValue(configFor('devops'));
     await pull({});
     expect(await fse.pathExists(codexCopy)).toBe(false);
     expect(await fse.readFile(path.join(homeDir, '.claude/agents/reviewer.md'), 'utf8')).toBe('# Active legacy agent\n');
@@ -169,7 +171,7 @@ describe('pull agents cleanup after role change', () => {
     expect(await fse.pathExists(path.join(homeDir, '.codex/agents', 'vr-reviewer.toml'))).toBe(true);
     expect(await fse.pathExists(path.join(homeDir, '.claude/agents', 'tf-reviewer.md'))).toBe(false);
 
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(configFor('devops'));
+    vi.mocked(detectProjectConfig).mockResolvedValue(configFor('devops'));
     await pull({});
 
     expect(await fse.pathExists(path.join(homeDir, '.claude/agents', 'shared.md'))).toBe(true);
@@ -185,7 +187,7 @@ describe('pull agents cleanup after role change', () => {
     const edited = path.join(homeDir, '.claude/agents', 'vr-reviewer.md');
     await fse.appendFile(edited, '\nMy local tweak.\n');
 
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(configFor('devops'));
+    vi.mocked(detectProjectConfig).mockResolvedValue(configFor('devops'));
     await pull({});
 
     expect(await fse.pathExists(edited)).toBe(true);
@@ -198,7 +200,7 @@ describe('pull agents cleanup after role change', () => {
     await fse.writeFile(path.join(homeDir, '.claude/agents', 'my-own.md'), '# mine\n');
 
     await pull({});
-    vi.mocked(loadLocalConfigForScope).mockResolvedValue(configFor('devops'));
+    vi.mocked(detectProjectConfig).mockResolvedValue(configFor('devops'));
     await pull({});
 
     expect(await fse.pathExists(path.join(homeDir, '.claude/agents', 'teamai-recall.md'))).toBe(true);
