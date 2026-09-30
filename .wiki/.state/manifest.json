@@ -1,0 +1,156 @@
+{
+  "version": 1,
+  "pages": {
+    "topics/requirement-001-single-pull.md": {
+      "sha256": "f0eac404380dac1d494eefba04e16e870d58011ed83a1fe097b91cdcdd8451dd",
+      "sources": {
+        "docs/001-teamai-single-pull/intent.md": "7301e8909f9fc9c0f6795749d093d163ae53eb9d7c338bdc49f5d59e7029f7c1",
+        "docs/001-teamai-single-pull/spec.md": "675caa76b9483446599998085cf4764ff55082f8eb3b7cf848fda5a7fbeeda91",
+        "docs/001-teamai-single-pull/plan.md": "93ca0cf5fcf4b766a9ea9ec04af1a4ca335ce8573dec632ab311f54386e0ceb9",
+        "docs/001-teamai-single-pull/change.md": "bdfff25299893c7851f6c0cb6cc4766acc1891d899cc3834b5b502600ab2df83"
+      }
+    },
+    "topics/requirement-002-native-get.md": {
+      "sha256": "baebd6e3fdb367c986e43055bdad9b786a92a04bca235697eacefb68a5108951",
+      "sources": {
+        "docs/002-teamai-native-get/intent.md": "397b7307e70f69d8867ee90775aa4ed1c68fead18f22ff04bea8266a0aadb3e9",
+        "docs/002-teamai-native-get/spec.md": "64b2bc57effeb2a396a9feb6dda2d43bc3c7f9fed548be38a3db7ae1ddfb9133",
+        "docs/002-teamai-native-get/plan.md": "87992ce84619d92e849d79ceb89e1a2fa862250343351c1d0f7288764f3ba02d"
+      }
+    },
+    "topics/requirement-003-docs-wiki-namespaces.md": {
+      "sha256": "bd2143a10423c37ca0685c9e6cb5fdc3da1f2d139478297248f390343e1c6fe6",
+      "sources": {
+        "docs/003-docs-wiki-project-namespace/intent.md": "4e70eb4bfdabadf8ebb2443884a16e1e9c85802a9a6b436fab74ff358569100d",
+        "docs/003-docs-wiki-project-namespace/spec.md": "087a5c156217e850380a0900bc0bd79b607daa4e75b784c592acdc8a7c33b6e6",
+        "docs/003-docs-wiki-project-namespace/plan.md": "cfa2d5a08b640502c2506eeb0f48aa32a70ec4f40c6c78d3a03e63b1ca111563",
+        "docs/003-docs-wiki-project-namespace/change.md": "a26d09643927569b87264c7934b4d2307324e745983f0d78804308357c69b271"
+      }
+    },
+    "topics/requirement-004-git-native.md": {
+      "sha256": "6eaafc5362155fca2d7c4719ea366f7117615350e9e1d77bce7c239f86c159ee",
+      "sources": {
+        "docs/004-wiki-docs-git-native/intent.md": "11dec63b363436369001b467aff012aadaa720ba7b7da03b30c8be1d5fc6ed78",
+        "docs/004-wiki-docs-git-native/spec.md": "7ddd2d76c6aeb5aed5c1e3055deee4d6dedfb23b4c75f805c0951bb6302f8d21",
+        "docs/004-wiki-docs-git-native/plan.md": "cd0f08c885a2677f16a0ae37e646decd7b6e8d9089bab13c0fd832c624bf6bc5"
+      }
+    },
+    "topics/design-multi-project.md": {
+      "sha256": "c86135787f1c2c4061e8ac14419eed2e88d9ab60471e484cb6b666d409aa3f11",
+      "sources": {
+        "docs/designs/multi-project-management.md": "05bd16a627854a234bd98f2ac33cb10abdefc417a43ca8463d4255322ffd6f22"
+      }
+    },
+    "topics/design-data-layout.md": {
+      "sha256": "4653ae187f21c594e5eb0ddfcba5006af0e07d480f90b673f6b811e0c03fa5c7",
+      "sources": {
+        "docs/designs/data-directory-layout.md": "be1f8bf5ca6c699962eddefd04ddf4bbb5d7b2703148be833bdfc0d135000917"
+      }
+    },
+    "topics/usage-guide.md": {
+      "sha256": "5ce75127d771c138d5a0e23941a3f3e416eca17ae0558b9e585c284b1653f1bb",
+      "sources": {
+        "docs/usage-guide.md": "1efb90d9f086d45306f3fb512bf331e7fb847c6d1aa8cd04e9be7021d5d4b3c2",
+        "docs/usage-guide.zh-CN.md": "7568525ebaa97e4e85f0d622b1d440f0985ecf13518716c605f863e06dd8a47f"
+      }
+    },
+    "topics/providers.md": {
+      "sha256": "02c54b51a8978a264faa40edb462ed1e778ee3ae45d23f6df7025433b6fefe9a",
+      "sources": {
+        "docs/providers.md": "72d1389a37b14429fb643fa6bcd9d2c2512264048eba21e2246e0dcc658cff4f"
+      }
+    },
+    "topics/ci-conventions.md": {
+      "sha256": "e9e2e06d0583de9f8215df182a42680323f7bb7a35a45783debf061c061d70aa",
+      "sources": {
+        "docs/ci-e2e-setup.md": "34c253266ac14b847fa596d1242d2f5fe3a4389ef89f6fbafb983e6b699447c0",
+        "docs/ci-code-erosion.md": "434f0fc50da6c777bb14334e4cbf3473a1089908519e3191d04b078783b7a194",
+        "docs/ci-code-erosion.zh-CN.md": "e6f7e9d864efd19d445cae3ce8b0b8836624b8dad29785914c09247978678496"
+      }
+    },
+    "topics/design-namespaces-isolation.md": {
+      "sha256": "48e46734db500cea87547c54b95a97b22feefd49a1a702a0517ebffbe23167dd",
+      "sources": {
+        "docs/004-wiki-docs-git-native/spec.md": "7ddd2d76c6aeb5aed5c1e3055deee4d6dedfb23b4c75f805c0951bb6302f8d21",
+        "docs/004-wiki-docs-git-native/intent.md": "11dec63b363436369001b467aff012aadaa720ba7b7da03b30c8be1d5fc6ed78",
+        "docs/003-docs-wiki-project-namespace/spec.md": "087a5c156217e850380a0900bc0bd79b607daa4e75b784c592acdc8a7c33b6e6"
+      }
+    },
+    "topics/requirement-006-wiki-source-citation-mapping.md": {
+      "sha256": "3ddfffa95c9cb266cf2cb1dbac8bf0f43680c750eefecf26a0f691365ac38040",
+      "sources": {
+        "docs/006-wiki-source-citation-mapping/intent.md": "0e8c0757c3a52f49b08f9ceae13c095d59fa7ed1b380262e314fe5aaef3192e4",
+        "docs/006-wiki-source-citation-mapping/spec.md": "55f1ad2ae271dc8f492e7b7a153171a7527345c3fa6c157b36a74315ccdb98bb",
+        "docs/006-wiki-source-citation-mapping/plan.md": "42cfe50fae70484fd9c6fe22f67909d9310c9532220fa89477cb65ecedca20cd"
+      }
+    },
+    "topics/design-gitcode-provider.md": {
+      "sha256": "1483d77f0dbf64153ad8ba7295c17f204a290b763fbaa09a1cfa88d3d420764d",
+      "sources": {
+        "docs/designs/gitcode-provider.md": "ef8b055c2c7d9b535ed94f589058d18833f3a6a8a6b5945595e2dc0552c75846"
+      }
+    },
+    "topics/design-git-native-memory.md": {
+      "sha256": "b67355f232db0044944d3db688fa81cc7b4564854e286b226c4337e35e09eea3",
+      "sources": {
+        "docs/designs/git-native-memory.md": "986764b75d285a452335d654e19dfb79c2f10252c40f00713fd3cfb0615e79b1"
+      }
+    },
+    "topics/design-management-backend.md": {
+      "sha256": "9e1850a91a5db8118e8a7d0e82d06f3e365df51d11b95127749bae6b95327a3e",
+      "sources": {
+        "docs/designs/management-backend.md": "70f1e05b19e447faf6daf84b29779cd0fa2e7521db23a368d469a5fc8efde302",
+        "docs/designs/management-backend.zh-CN.md": "26f527dcbcfadafdfb5c82eefd2a16eed7184d0628d24f1a3ccd597bfea89b2c"
+      }
+    },
+    "topics/design-team-intelligence-platform.md": {
+      "sha256": "416df1223911d8b78695cbdc8e003e46bed4008478f5784bf215ba38406002a2",
+      "sources": {
+        "docs/designs/team-intelligence-platform.md": "81a022e9bd673573bfdbf0f1aa07257b13f5984ed76fd5532dfc91084e43b4b7"
+      }
+    },
+    "topics/design-dashboard-unified.md": {
+      "sha256": "93a64315e14f674f175d5db6171d3da8ad87a4c63d89d187c2eebef452518f82",
+      "sources": {
+        "docs/designs/dashboard-unified.md": "0d6651a207413b387bc51a7fab519eda33907cbbfd11cb6b09b895c9e207fdd1",
+        "docs/designs/dashboard-unified.zh-CN.md": "d13aedd284f666f6532e04e194e68104ff6caf587593cd987a5ff43aef68a311"
+      }
+    },
+    "topics/design-model-profiles.md": {
+      "sha256": "3a421c78822ca894f96d20b5d7c3d788eeb8e10cd2b8a0cd37323cf1b9f45cb2",
+      "sources": {
+        "docs/designs/model-profiles.md": "3a3e649c108681ee01499618e6ae12cb9e2ea0d83ca24874b1d3836c473ea2bd",
+        "docs/designs/model-profiles.zh-CN.md": "a07a3b8f948f20ecb399ad4b7445f64b4eb8fc269882b7d82d2c172df5ecc0ec"
+      }
+    },
+    "topics/design-skill-serving.md": {
+      "sha256": "7f085e6cec10815a2392db6d69867daa72253cc38d7d178527003a20b1e63f10",
+      "sources": {
+        "docs/designs/skill-serving.md": "408338caa5526deafd6c2e2b3d728eaabfa85223a0aea7da0cd660574b482ad9"
+      }
+    },
+    "topics/product-overview.md": {
+      "sha256": "525e1f0aab97ab588a816f8a6e6e4191fae851e67471b98caea7592f17b8fa3d",
+      "sources": {
+        "docs/product-overview.md": "d74cbd25edcf0a19c3547d97d8a5f5733199530a2074d38bbc7a6ee4fa8988c3",
+        "docs/product-overview.zh-CN.md": "cf553a373acb06d277e1fda0df5386c18c980d9700e52e1ad5752c21cb81199a"
+      }
+    },
+    "topics/windows-hooks.md": {
+      "sha256": "d3ac5b6ae7a471ae8250bce05071b0b597bb5745c01b0875df8f653ecc80d634",
+      "sources": {
+        "docs/windows-hooks.md": "0b59da9effdc0d2e4b05f0fb28ced235b32190fcaebbc8f8ec23d867ff378587",
+        "docs/windows-hooks.zh-CN.md": "f4df4eafd4acceb420bbfee02ad24e8e81eb7a26f2dcda8c56abec133cb7eeb0"
+      }
+    },
+    "topics/requirement-007-project-sync-shared-get.md": {
+      "sha256": "d51ae9afbc32a27f53a315a941b14a134a9877acd87461fff52b5e7333a40a9c",
+      "sources": {
+        "docs/007-project-sync-shared-get/intent.md": "5448716927cc17585342c21945e75942a4e345945f21deefe1eb38ef694fb68c",
+        "docs/007-project-sync-shared-get/spec.md": "c5844419bc9450dbb60c9e88e35b80fb61b4b69e081aa2c78b2f2198d658f2f9",
+        "docs/007-project-sync-shared-get/plan.md": "926ef2344cedcf87f4bacbf9909cf1da6fa0f55a7099deedd0ac05d8f0a7f794"
+      }
+    }
+  },
+  "updated_at": "2026-09-29T14:06:14.113905+00:00"
+}
