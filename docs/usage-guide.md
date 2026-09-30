@@ -775,21 +775,28 @@ scope (a user-scope directory or an HTTP read-only team repo is rejected with
 guidance) and prints `[push] scope: project=<id>, agent=<tool|all>, types=<list>`
 before writing. It publishes six resource types: `skills`, `rules`, `env`,
 `agents`, plus the one-way `docs` and `wiki`. The one-way bundle publishes the
-project's own `docs/` read-only into `docs/<project>/`, and **every wiki root**
-of the project — each dot-prefixed, lowercase-wiki-suffixed direct child
-directory of the project root (`.wiki/`, `.dev_wiki/`, `.researchwiki/`, …) —
-into `<rootName>/<project>/` in the team repo, so other projects read the
-published copies from the clone. The `.wiki/` root keeps its historical
-`.wiki/<project>/` target, so nothing already published moves. Two roots' pages
-never collide (identity is root + path: both roots may have their own
-`index.md`); a directory whose name does not match (`.wiki_backup/`, `wiki/`,
-`.dev_Wiki/`), a plain file, or a nested `child/.wiki/` is not a root.
-`--agent` does not change where they land, and a missing `docs/` or wiki root
-simply publishes nothing. `--exclude-wiki-root <name>` (repeatable) skips one
-root for this run: it is neither published nor considered for deletion — its
-published content stays exactly as it is, which is also how a renamed or
-missing root behaves: an absent root never reads as "delete everything
-published from it". Publishing needs a project to publish
+project's own `docs/` read-only into `docs/<project>/`, and the project's
+**default wiki** — the `.wiki/` direct child of the project root — into its
+historical `.wiki/<project>/` target, so nothing already published moves and
+other projects read the copies from the clone. Every other directory is ignored
+until it is named explicitly: `--wiki-source <dir>=<name>` (repeatable)
+publishes that project directory as `.wiki/<project>_<name>/`, and
+`--docs-source <dir>=<name>` (repeatable) publishes it as
+`docs/<project>_<name>/` beside the default `docs/<project>/` bundle. The name
+is that source's identity in the team repo — never inferred from the
+directory's basename — so two sources' same-named pages never collide (the
+default root and a named source may each have their own `index.md`); a name is
+rejected when malformed, duplicated in one run, or used to re-specify the
+default `.wiki`/`docs` source, and a directory must exist inside the project
+root — explicit sources never read beyond it. A wiki-shaped sibling that is
+not named (`.dev_wiki/`, `.researchwiki/`, …) is neither published nor
+considered for deletion, and `--dry-run` lists the default root, each named
+source with its target, and the ignored siblings. A source that is absent
+(renamed or moved) or simply not specified this run never reads as "delete
+everything published from it": its baselines are skipped whole, with a report,
+and its published content stays exactly as it is. `--agent` does not change
+where they land, and a missing `docs/` or wiki root simply publishes nothing.
+Publishing needs a project to publish
 under: `--project` must be active here and declared in the manifest, and without
 it the single active project is derived — several active projects and a
 docs/wiki push stop with the candidates listed, while a team without project
@@ -1339,9 +1346,11 @@ collection (e.g. `WIKI_DIR=".wiki/teamai-cli/docs-wiki" wiki.py search --root
 The retrieved page carries its `sources[]`; this mode then decides whether an
 original may be cited.
 
-- `--wiki-page` takes a repo-relative path under any wiki root (`.wiki/`, `.dev_wiki/`, …) and implies `--json`.
+- `--wiki-page` takes a repo-relative path under any wiki root (`.wiki/<pid>/…`,
+  `.wiki/<pid>_<name>/…`, or a legacy beta root like `.dev_wiki/<pid>/…`) and
+  implies `--json`.
   Only anchors that map to a single existing file inside the allowed
-  `docs/<pid>/` scope whose SHA-256 matches are reported `verified` with a
+  `docs/<pid>/` or `docs/<pid>_<name>/` scope whose SHA-256 matches are reported `verified` with a
   ready-to-open `resolved` path. Anything else carries a closed status —
   `missing`, `out_of_scope`, `content_changed`, `unmapped`, `unverifiable` —
   plus a human-readable `reason`; never cite an anchor that is not `verified`

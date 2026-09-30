@@ -22,7 +22,9 @@ import type {
 import { getDataHome, SELF_KNOWLEDGE_SCAN_KEY, SYNC_LOCK_FILENAME } from './types.js';
 import { acquireLock, releaseLock } from './update.js';
 import { assertSafeResourceName } from './utils/path-safety.js';
-import { discoverWikiRoots, isWikiRootName, matchWikiPublishPrefix } from './utils/wiki-roots.js';
+import { matchWikiPublishPrefix } from './utils/wiki-roots.js';
+import { matchDocsPublishPrefix } from './resources/docs.js';
+import type { NamedPublishSource } from './resources/base.js';
 import { loadRolesManifest, resolveRoleResourceNamespaces, RolesManifestNotFoundError } from './roles.js';
 import type { ProjectsManifest } from './projects.js';
 import { isSafeNamespaceSegment, NAMESPACE_RULE, fallbackNamespaceError } from './manifest-schema.js';
@@ -31,7 +33,7 @@ import {
   resolveProjectNamespace, skillNamespacePath, withNamespace, type PlaceableType,
 } from './push-namespaces.js';
 import { askQuestion, askSelection, isInteractive } from './utils/prompt.js';
-import { pathExists, pruneEmptyDirs, readFileSafe, remove, writeFile } from './utils/fs.js';
+import { isDirectory, pathExists, pruneEmptyDirs, readFileSafe, remove, writeFile } from './utils/fs.js';
 import { brokenTeamProfileFiles } from './models/profile.js';
 import {
   PUSH_RESOURCE_TYPES, parseResourceTypes, resolveProjectScope, deriveSingleActiveProject,
@@ -723,6 +725,49 @@ export async function pushGroup(args: {
   }
 }
 
+/**
+ * Parse `--wiki-source`/`--docs-source <dir>=<name>` entries into sources: the
+ * syntax and duplicate-target rules both entry points of `push` agree on, with
+ * no filesystem access (the directory checks run once in `push`, where the
+ * project root is known). A name is the source's team-repo identity
+ * (`<projectId>_<name>/`), so two of the same name would write one target and
+ * are rejected up front; the default sources (`.wiki`, `docs`) publish on
+ * their own and cannot be re-specified.
+ */
+function parseNamedSources(
+  raw: readonly string[] | undefined,
+  flag: string,
+  defaultDir: string,
+): NamedPublishSource[] {
+  const sources: NamedPublishSource[] = [];
+  const names = new Set<string>();
+  const dirs = new Set<string>();
+  for (const entry of raw ?? []) {
+    const eq = entry.indexOf('=');
+    const dir = eq === -1 ? '' : entry.slice(0, eq);
+    const name = eq === -1 ? '' : entry.slice(eq + 1);
+    if (!dir || !name) {
+      throw new ScopeError(`${flag} expects <dir>=<name> (e.g. ${defaultDir === '.wiki' ? '.dev_wiki=dev' : 'docs/api=api'}); got "${entry}".`, 2);
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
+      throw new ScopeError(`${flag} name "${name}" must start with a letter or digit and contain only letters, digits, ".", "_" and "-".`, 2);
+    }
+    if (dir === defaultDir) {
+      throw new ScopeError(`${flag} cannot re-specify "${defaultDir}": it is the default source and always publishes on its own. Give a different directory.`, 2);
+    }
+    if (names.has(name)) {
+      throw new ScopeError(`${flag} name "${name}" is given twice: both sources would publish into one target.`, 2);
+    }
+    if (dirs.has(dir)) {
+      throw new ScopeError(`${flag} directory "${dir}" is given twice.`, 2);
+    }
+    names.add(name);
+    dirs.add(dir);
+    sources.push({ dir, name });
+  }
+  return sources;
+}
+
 export async function push(
   options: GlobalOptions & {
     all?: boolean;
@@ -733,7 +778,8 @@ export async function push(
     agent?: string;
     rule?: string;
     force?: boolean;
-    excludeWikiRoot?: string[];
+    wikiSource?: string[];
+    docsSource?: string[];
   },
   /**
    * Optional out-param: set to `{ completed: true }` only when a real push
@@ -800,19 +846,48 @@ export async function push(
       return;
     }
   }
-  const excludeWikiRoots = options.excludeWikiRoot ?? [];
-  for (const name of excludeWikiRoots) {
-    if (!isWikiRootName(name)) {
-      log.error(
-        `--exclude-wiki-root expects a wiki root directory name (dot-prefixed, lowercase-wiki-suffixed, e.g. ".dev_wiki"); got "${name}".`,
-      );
-      process.exitCode = 2;
+  // Explicitly named publish sources (007 revision 2026-09-30): syntax,
+  // duplicate targets and the --types pairing fail before anything is written;
+  // then each directory must sit inside the project root and exist — an
+  // explicit path may never read outside the project, and a typo'd one should
+  // stop the push rather than silently publish nothing.
+  let wikiSources: NamedPublishSource[];
+  let docsSources: NamedPublishSource[];
+  try {
+    wikiSources = parseNamedSources(options.wikiSource, '--wiki-source', '.wiki');
+    docsSources = parseNamedSources(options.docsSource, '--docs-source', 'docs');
+  } catch (e) {
+    if (e instanceof ScopeError) {
+      log.error(e.message);
+      process.exitCode = e.exitCode;
       return;
     }
-    if (!resourceTypes.includes('wiki')) {
-      log.error('--exclude-wiki-root selects wiki roots, but --types does not include wiki.');
-      process.exitCode = 2;
-      return;
+    throw e;
+  }
+  if (wikiSources.length > 0 && !resourceTypes.includes('wiki')) {
+    log.error('--wiki-source selects wiki sources, but --types does not include wiki.');
+    process.exitCode = 2;
+    return;
+  }
+  if (docsSources.length > 0 && !resourceTypes.includes('docs')) {
+    log.error('--docs-source selects docs sources, but --types does not include docs.');
+    process.exitCode = 2;
+    return;
+  }
+  for (const [flag, sources] of [['--wiki-source', wikiSources], ['--docs-source', docsSources]] as const) {
+    for (const { dir } of sources) {
+      const abs = path.resolve(localConfig.projectRoot, dir);
+      const rel = path.relative(localConfig.projectRoot, abs);
+      if (rel === '' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+        log.error(`${flag} directory "${dir}" resolves outside the project root; explicit sources may not read beyond it.`);
+        process.exitCode = 2;
+        return;
+      }
+      if (!await isDirectory(abs)) {
+        log.error(`${flag} directory "${dir}" not found inside the project root.`);
+        process.exitCode = 2;
+        return;
+      }
     }
   }
 
@@ -940,15 +1015,30 @@ async function pushCore(
     agent?: string;
     rule?: string;
     force?: boolean;
-    excludeWikiRoot?: string[];
+    wikiSource?: string[];
+    docsSource?: string[];
   },
   initialPendingTeamConfig: string | null = null,
   result?: { completed: boolean },
 ): Promise<void> {
   const selfMode = localConfig.repo.kind === 'self';
-  // Validated once in push() (name shape + --types wiki); the self-mode
-  // worktree path re-enters here directly, so re-derive defensively.
-  const excludeWikiRoots = (options.excludeWikiRoot ?? []).filter(isWikiRootName);
+  // Validated once in push() (syntax, duplicates, --types pairing, filesystem
+  // checks); the self-mode worktree path re-enters here directly, so re-derive
+  // the pure part defensively. A parse failure here means a caller skipped
+  // push()'s gate — report it rather than guess a source.
+  let wikiSources: NamedPublishSource[];
+  let docsSources: NamedPublishSource[];
+  try {
+    wikiSources = parseNamedSources(options.wikiSource, '--wiki-source', '.wiki');
+    docsSources = parseNamedSources(options.docsSource, '--docs-source', 'docs');
+  } catch (e) {
+    if (e instanceof ScopeError) {
+      log.error(e.message);
+      process.exitCode = e.exitCode;
+      return;
+    }
+    throw e;
+  }
 
   // The --types selection pushCore scans by (validated once in push(); the
   // worktree path in self mode re-enters here without it).
@@ -1261,9 +1351,9 @@ async function pushCore(
     const scanOptions = type === 'agents'
       ? { namespace: requestedAgentsNamespace }
       : type === 'wiki'
-        ? { projectId: publishProjectId ?? undefined, excludeRoots: excludeWikiRoots }
+        ? { projectId: publishProjectId ?? undefined, wikiSources }
         : type === 'docs'
-          ? { projectId: publishProjectId ?? undefined }
+          ? { projectId: publishProjectId ?? undefined, docsSources }
           : undefined;
     try {
       const items = await handler.scanLocalForPush(
@@ -1351,16 +1441,18 @@ async function pushCore(
   const staleBaselines: string[] = [];
   if (publishProjectId && localConfig.projectRoot) {
     const state = await loadStateForScope(localConfig);
-    // A wiki root that is absent (renamed/moved away) or excluded this run is
-    // never read as "delete everything published from it" (change 2026-09-30):
-    // its baselines are skipped whole, published content untouched.
-    const rootsOnDisk = new Set(await discoverWikiRoots(localConfig.projectRoot));
-    const excludedRoots = new Set(excludeWikiRoots);
+    const projectRoot = localConfig.projectRoot;
+    const namedWiki = new Map(wikiSources.map((source) => [source.name, source]));
+    const namedDocs = new Map(docsSources.map((source) => [source.name, source]));
+    // A source that is absent (renamed/moved away) or not specified this run
+    // is never read as "delete everything published from it" (change
+    // 2026-09-30, revised same day): its baselines are skipped whole,
+    // published content untouched. Reported once per source directory.
+    const skippedSources = new Map<string, string>();
     for (const [key, baseline] of Object.entries(state.publishedFiles ?? {})) {
       const wikiPrefix = matchWikiPublishPrefix(key, publishProjectId);
-      const prefix = key.startsWith(`docs/${publishProjectId}/`)
-        ? `docs/${publishProjectId}/`
-        : wikiPrefix?.prefix ?? null;
+      const docsPrefix = wikiPrefix ? null : matchDocsPublishPrefix(key, publishProjectId);
+      const prefix = wikiPrefix?.prefix ?? docsPrefix?.prefix ?? null;
       if (!prefix) continue;
       const repoFile = path.join(localConfig.repo.localPath, key);
       if (!(await pathExists(repoFile))) {
@@ -1369,23 +1461,44 @@ async function pushCore(
         staleBaselines.push(key);
         continue;
       }
-      if (wikiPrefix) {
-        if (!rootsOnDisk.has(wikiPrefix.root)) {
+      if (wikiPrefix?.legacy) {
+        const reason = `${wikiPrefix.prefix} comes from a pre-explicit-roots release; that layout is no longer written`;
+        if (!skippedSources.has(wikiPrefix.prefix)) {
+          skippedSources.set(wikiPrefix.prefix, reason);
           log.info(
-            `[pending-delete] Kept ${key}: wiki root ${wikiPrefix.root} is absent from the project (renamed or moved). ` +
-              'Its published content stays untouched; delete it from the team repo explicitly if that is intended.',
+            `[pending-delete] Kept everything under ${wikiPrefix.prefix}: ${reason}. `
+            + 'Delete it from the team repo explicitly if that is intended.',
           );
-          continue;
         }
-        if (excludedRoots.has(wikiPrefix.root)) {
-          log.debug(`[pending-delete] Skipped ${key}: wiki root ${wikiPrefix.root} is excluded this run.`);
-          continue;
-        }
+        continue;
       }
-      const sourceRoot = prefix.startsWith('docs/')
-        ? path.join(localConfig.projectRoot, 'docs')
-        : path.join(localConfig.projectRoot, wikiPrefix!.root);
-      if (await pathExists(path.join(sourceRoot, key.slice(prefix.length)))) continue;
+      const name = wikiPrefix?.name ?? docsPrefix?.name;
+      const sourceDir = name === undefined
+        ? (wikiPrefix ? '.wiki' : 'docs')
+        : (wikiPrefix ? namedWiki.get(name) : namedDocs.get(name))?.dir;
+      if (sourceDir === undefined) {
+        const reason = `source "${name}" is not specified this run`;
+        if (!skippedSources.has(name!)) {
+          skippedSources.set(name!, reason);
+          log.info(
+            `[pending-delete] Kept everything published as ${name}: the source is not specified this run `
+            + '(no --wiki-source/--docs-source for it). Its published content stays untouched.',
+          );
+        }
+        continue;
+      }
+      if (!await isDirectory(path.join(projectRoot, sourceDir))) {
+        const reason = `source directory ${sourceDir} is absent from the project (renamed or moved)`;
+        if (!skippedSources.has(sourceDir)) {
+          skippedSources.set(sourceDir, reason);
+          log.info(
+            `[pending-delete] Kept everything from ${sourceDir}: ${reason}. `
+            + 'Its published content stays untouched; delete it from the team repo explicitly if that is intended.',
+          );
+        }
+        continue;
+      }
+      if (await pathExists(path.join(projectRoot, sourceDir, key.slice(prefix.length)))) continue;
       pendingDeletes.push({ rel: key, remoteChanged: (await fileDigest(repoFile)) !== baseline });
     }
   }

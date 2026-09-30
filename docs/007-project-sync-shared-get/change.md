@@ -147,3 +147,58 @@ Status: implemented（见下方验证记录；发布另行授权）
 - 验证：`npx tsc --noEmit` 通过；`npm run lint` 3 条预存警告（零新增）；`npx vitest run` 全量除本机预存的 21 个失败（init + wiki-source-anchor）外全绿；`npm run build` 后 `npx vitest run --config vitest.e2e.config.ts docs-pull-boundary-e2e` 通过（真实 CLI 记录见上）。
 
 边界保持不变：项目 `pull` 对 docs/Wiki 零写入、零覆盖、零清理；本变更只动 doctor 的读取面与一条信息提示。
+
+### 后续变更 — 2026-09-30：Wiki 默认根与显式附加根
+
+需求方重新确认 Wiki 的发现和发布边界，覆盖本变更前面“自动处理所有 `^\\..*wiki$` 根目录”的设计：
+
+- 默认只处理项目根目录下的 `.wiki/`。
+- `.dev_wiki/`、`.researchwiki/` 等其他目录默认忽略，即使名称符合 `^\\..*wiki$` 也不自动发布。
+- 其他 Wiki 只能通过显式参数或配置指定；未指定时不得扫描、上传、清理或生成 pending-delete。
+- 显式指定后，为每个 Wiki 分配稳定的发布名称，统一放在团队仓的 `.wiki/` 下。例如 `project_wikiA` 和 `project_wikiB` 的目标分别为：
+
+  ```text
+  .wiki/project_wikiA/...
+  .wiki/project_wikiB/...
+  ```
+
+- 显式名称是团队仓中的 Wiki 身份，不能只用源目录 basename 推断；同名目标必须在写入前报告冲突并停止相关发布。
+- 既有默认 `.wiki` 的发布路径和引用保持兼容；增加显式 Wiki 时不能覆盖既有 `.wiki` 内容，也不能改变 docs/Wiki 的项目级 push、pull 零写入边界。
+- `dry-run` 必须列出默认发现的 `.wiki`、显式指定的附加 Wiki、目标路径以及被忽略的目录；未显式指定的附加目录不参与删除判断。
+
+此前实现记录中的“所有匹配根目录自动发布”、`--exclude-wiki-root` 作为首期主要选择机制，以及将附加根发布到各自顶层（如 `.dev_wiki/<projectId>/`）的方案均由本决定覆盖。具体 CLI 参数或配置字段名称待实现设计确定，但必须支持显式源目录到目标 Wiki 名称的映射。
+
+当前只更新需求边界，尚未修改代码或验证命令；实现后需补充多根发现、显式映射、目标冲突、旧 `.wiki` 兼容及未指定目录不产生副作用的测试记录。
+
+### 后续变更 — 2026-09-30：docs 支持显式源路径发布
+
+需求方补充确认：docs 也需要支持通过显式路径上传到团队仓，不应被固定的项目根 `docs/` 目录限制。
+
+- 默认行为保持项目 docs 的既有约定：项目级 `push --types docs` 发布项目声明的默认 docs 来源，目标仍位于团队仓对应项目命名空间 `docs/<projectId>/`。
+- 增加显式 docs 源路径能力（具体 CLI 参数或配置字段名称待实现设计确定），允许一次指定一个或多个项目内路径；路径必须经过项目根约束校验，不能读取项目外的任意目录。
+- 显式路径发布到团队仓 `docs/<projectId>/` 下的稳定相对路径，保留源路径的相对层级，避免不同 docs 源中的同名文件互相覆盖。源路径到目标路径的映射必须出现在 dry-run 和发布结果中。
+- 同一目标文件发生多个源映射、远端基线冲突或源路径越界时，发布前报告并阻止受影响文件；不能静默覆盖。
+- 未显式指定的 docs 目录不参与本次扫描、上传、删除判断或 pending-delete；显式路径缺失也不能解释为删除整个默认 docs 包。
+- 该能力仍是 docs 的单向项目 `push`；项目 `pull` 不因支持显式 docs 路径而恢复 docs 镜像或向业务项目写入 docs。消费项目从团队仓副本检索和引用。
+
+实现时需要补充路径规范化、目录/文件选择、目标映射、冲突保护、dry-run 和跨平台路径测试，并与 Wiki 的显式根目录映射保持一致的“来源—目标—基线”记录格式。
+
+#### 实现记录 — 2026-09-30（Wiki 默认根与显式附加根 + docs 显式源路径）
+
+需求方确认命名方案：名称内嵌项目 ID——Wiki 显式源发布到 `.wiki/<projectId>_<wikiName>/`，docs 显式源发布到 `docs/<projectId>_<docsName>/`（后者覆盖上一节"发布到 `docs/<projectId>/` 下稳定相对路径"的旧表述）。接口采用可重复的 CLI 选项 `--wiki-source <dir>=<name>`、`--docs-source <dir>=<name>`；暂未加 manifest 配置字段。
+
+- `src/utils/wiki-roots.ts`：`matchWikiPublishPrefix` 识别三种键——默认 `.wiki/<pid>/`、命名 `.wiki/<pid>_<name>/`（携带 `name`）、旧版 beta 的 `<rootName>/<pid>/`（标记 `legacy`）。`wikiPublishTarget(repoRoot, pid, name?)` 统一目标推导。`discoverWikiRoots` 保留但只用于报告被忽略的同级目录；`parseWikiPagePath` 同时接受新旧布局（recall 校验用途）。
+- `src/resources/wiki.ts`：扫描改为"默认 `.wiki`（存在才发布，目标不变）+ 显式 `wikiSources`"。每次扫描输出一行 `[wiki] default root: .wiki → .wiki/<pid>/; source <dir> → .wiki/<pid>_<name>/; ignored (not specified): <dirs>`，dry-run 由此列全三类信息。条目 `relativePath` 携带命名命名空间，冲突闸门（unmanaged/baseline 对比）按既有机制自动覆盖新目标。
+- `src/resources/docs.ts`：`publishTargetDir(localConfig, pid, name?)`；`scanLocalForPush` 改为多源扫描——默认 `docs/`（整树，含与显式源重叠的部分）+ 每个 `docsSources` 条目到 `docs/<pid>_<name>/`；默认 `docs/` 缺失时显式源仍可发布。新增 `matchDocsPublishPrefix`（默认/命名两种前缀）。
+- `src/resources/base.ts`：`ScanForPushOptions.excludeRoots` 移除，新增 `NamedPublishSource` 与 `wikiSources`/`docsSources`。
+- `src/push.ts`：
+  - `parseNamedSources`（纯解析）：`<dir>=<name>` 语法、名称字符集（字母数字开头，`[A-Za-z0-9._-]`）、重复名称/目录、重新指定默认源（`.wiki`/`docs`）一律拒绝。`push()` 在写任何文件前完成解析 + `--types` 配对 + 文件系统校验（目录必须解析进项目根且存在，`isDirectory`）；`pushCore`（self 模式重入）只重跑纯解析。
+  - pending-delete 重写：基线键经 `matchWikiPublishPrefix`/`matchDocsPublishPrefix` 解析后——legacy 布局整体跳过并报告一次；命名源本次未指定 → 整体跳过并报告"Kept everything published as <name>"；源目录缺失（改名/移走）→ 整体跳过并报告（对默认 `.wiki`/`docs` 同样生效，比旧实现多了 docs 侧的改名保护）；仅"源在且被指定、单个原文消失"才进入显式删除确认流程。
+  - `--exclude-wiki-root` 及其校验/传递全部移除（被本决定明确覆盖）。
+- `src/index.ts`：注册 `--wiki-source`/`--docs-source`（collect 可重复）；`skill-data/core/references/commands.md` 经 `commands-reference -u` 再生成。
+- `src/utils/wiki-source-anchor.ts`：`resolveWikiPageSources` 的允许范围按映射目标推导——`docs/<pid>/` 或 `docs/<pid>_<name>/` 命名空间均视为本项目的可引用范围（realpath 逃逸检查不变），使 wiki 页面可以引用显式 docs 源发布的文件。
+- 测试：`wiki-roots.test.ts`（新前缀判定表：默认/命名/`demo2` 非误判/legacy/跨项目拒绝 + `wikiPublishTarget`）；`get-cmd.test.ts`（WikiHandler：默认忽略未命名根、命名源发布到 `.wiki/proj_dev/`、同名隔离）；`publish-handlers.test.ts`（DocsHandler：命名源与默认包并存、无默认 `docs/` 时仍可发布命名源）。
+- e2e（`scripts/e2e-007.sh`，扩至 77/77 通过，真实 CLI）：默认 `.wiki` 单根发布且 `.dev_wiki` 不带选项不发布；`--wiki-source .dev_wiki=dev` 发布到 `.wiki/demo_dev/` 且与默认根同名页隔离；dry-run 列出默认根/忽略同级；未指定命名源时本地改动与目录缺失都不触发删除（"Kept everything published as dev"）；`--docs-source docs/api=api` 发布 `docs/demo_api/` 且默认包照常覆盖 `docs/api/`；六项 flag 校验（缺 `=`、名称含 `/`、越界路径、目录不存在、`--types` 不含对应类型、重指定默认源）全部以非零退出拒绝。
+- 门槛：`npx tsc --noEmit` 通过；`npm run lint` 3 条预存警告（零新增）；`npx vitest run` 全量除本机预存的 21 个失败（init + wiki-source-anchor，失败项与基线逐一一致）外全绿；双语 usage-guide（push 单向发布段、`--wiki-page` 段）同步。
+
+边界保持不变：项目 `pull` 仍只处理 skills/rules/env/agents；docs/Wiki 仍单向发布；`dry-run` 零写入；旧 `.wiki/<pid>/` 目标与既有引用兼容，beta 版已发布到 `<rootName>/<pid>/` 的存量副本不迁移、不清理，仅报告。

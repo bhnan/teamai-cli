@@ -214,7 +214,17 @@ export async function resolveWikiPageSources(
       continue;
     }
 
-    const allowedRoot = path.join(cloneRoot, 'docs', projectId ?? '');
+    // The mapped target decides the allowed scope: this project's default
+    // `docs/<pid>/`, or a named source's `docs/<pid>_<name>/` that an explicit
+    // `--docs-source` publish created. Any other mapped namespace stays
+    // constrained to the default, as before — citation never reaches into
+    // another project's docs.
+    let allowedNs = projectId ?? '';
+    if (mapped.startsWith('docs/') && projectId) {
+      const ns = mapped.split('/')[1] ?? '';
+      if (ns === projectId || ns.startsWith(`${projectId}_`)) allowedNs = ns;
+    }
+    const allowedRoot = path.join(cloneRoot, 'docs', allowedNs);
     out.push(await verifyWikiSource(p, mapped, { cloneRoot, allowedRoot, expectedSha256: anchor.sha256 }));
   }
   return out;

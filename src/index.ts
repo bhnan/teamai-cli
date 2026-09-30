@@ -153,7 +153,11 @@ program
     + 'docs and wiki publish to docs/<id>/ and .wiki/<id>/, and other new resources go to that project\'s namespaces')
   .option('--branch <name>', 'Push to this destination branch instead of a generated teamai/push branch')
   .option('--force', 'Overwrite held docs/wiki publish conflicts listed before the push (their paths are shown first)')
-  .option('--exclude-wiki-root <name>', 'Skip this wiki root directory this run (e.g. .dev_wiki); repeatable. Its published content is kept untouched, not deleted',
+  .option('--wiki-source <dir=name>', 'Publish this project directory as an additional wiki under .wiki/<projectId>_<name>/ (e.g. .dev_wiki=dev); repeatable. '
+    + 'The default .wiki/ root always publishes as .wiki/<projectId>/; other wiki-shaped directories are ignored until named here',
+    (val: string, acc: string[]) => acc.concat(val), [] as string[])
+  .option('--docs-source <dir=name>', 'Publish this project directory as a named docs source under docs/<projectId>_<name>/ (e.g. docs/api=api); repeatable. '
+    + 'The default project docs/ still publishes as docs/<projectId>/ alongside',
     (val: string, acc: string[]) => acc.concat(val), [] as string[])
   .action(async (cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;

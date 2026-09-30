@@ -699,7 +699,7 @@ teamai push --rule my-rule      # 发布单个 rule
 teamai push --force             # 接管先前列出的 docs/wiki 发布冲突
 ```
 
-`push` 与 pull 一样是项目级命令：只在已初始化的 project scope 中运行（user scope 目录与 HTTP 只读团队仓会被拒绝并给出指引），写入前打印 `[push] scope: project=<id>, agent=<tool|all>, types=<list>`。它发布六类资源：`skills`、`rules`、`env`、`agents`，加上单向的 `docs` 与 `wiki`。单向发布把项目自己的 `docs/` 只读发布到团队仓的 `docs/<project>/`，并把项目的**每一个 Wiki 根目录**——项目根下以点开头、以小写 wiki 结尾的直接子目录（`.wiki/`、`.dev_wiki/`、`.researchwiki/` 等）——分别发布到团队仓的 `<根目录名>/<project>/`，供其他项目从 clone 中读取已发布副本。`.wiki/` 根沿用历史的 `.wiki/<project>/` 目标，已发布内容一律不动。两个根的同名页面互不覆盖（资源身份是根+路径，两个根都可以有自己的 `index.md`）；名称不匹配的目录（`.wiki_backup/`、`wiki/`、`.dev_Wiki/`）、普通文件、嵌套的 `child/.wiki/` 都不是 Wiki 根。`--agent` 不改变它们的落点，缺失的 `docs/` 或 Wiki 根只是无可发布。`--exclude-wiki-root <name>`（可重复）本次跳过指定根：既不发布、也不参与删除——它已发布的内容原样保留；根被改名或缺失时同样如此，绝不会解读成"删除该根已发布的全部内容"。发布需要一个归属项目：`--project` 必须在本目录激活且在 manifest 中声明；未指定时从唯一激活项目推导——多个项目激活且本次要发布 docs/wiki 时会列出候选并停止，而没有项目分区的团队会报告 docs/wiki `unconfigured`，工具资源照常推送。
+`push` 与 pull 一样是项目级命令：只在已初始化的 project scope 中运行（user scope 目录与 HTTP 只读团队仓会被拒绝并给出指引），写入前打印 `[push] scope: project=<id>, agent=<tool|all>, types=<list>`。它发布六类资源：`skills`、`rules`、`env`、`agents`，加上单向的 `docs` 与 `wiki`。单向发布把项目自己的 `docs/` 只读发布到团队仓的 `docs/<project>/`，把项目的**默认 Wiki**——项目根下的 `.wiki/` 直接子目录——发布到沿用历史的 `.wiki/<project>/` 目标，已发布内容一律不动，其他项目从 clone 中读取已发布副本。其余目录在被显式命名之前一律忽略：`--wiki-source <dir>=<name>`（可重复）把该项目目录发布为 `.wiki/<project>_<name>/`，`--docs-source <dir>=<name>`（可重复）把它发布为默认 `docs/<project>/` 包之外的 `docs/<project>_<name>/`。名称是该来源在团队仓中的身份——绝不从源目录 basename 推断——因此两个来源的同名页面互不覆盖（默认根和命名来源都可以有自己的 `index.md`）；名称畸形、一次运行内重复、或用于重新指定默认 `.wiki`/`docs` 来源时会被拒绝，目录必须存在于项目根内——显式来源绝不读取项目之外。未被命名的 wiki 形状同级目录（`.dev_wiki/`、`.researchwiki/` 等）既不发布也不参与删除，`--dry-run` 会列出默认根、每个命名来源及其目标、以及被忽略的同级目录。来源缺失（改名或移走）或本次未被指定时，绝不会解读成"删除该来源已发布的全部内容"：其基线被整体跳过并报告，已发布内容原样保留。`--agent` 不改变它们的落点，缺失的 `docs/` 或 Wiki 根只是无可发布。发布需要一个归属项目：`--project` 必须在本目录激活且在 manifest 中声明；未指定时从唯一激活项目推导——多个项目激活且本次要发布 docs/wiki 时会列出候选并停止，而没有项目分区的团队会报告 docs/wiki `unconfigured`，工具资源照常推送。
 
 **单向发布安全：** 每个已发布文件都会与团队仓副本、以及本机上次推送的基线做三方比较。团队仓副本在你上次发布后被他人修改（或本机从未推送过）的文件会被**暂缓**：报告、排除出本次推送，并以非零退出码反映——其他资源照常发出。`--force` 只接管先前列出的冲突项。项目里已删除原文的已发布文件属于 pending-delete：只有在删除清单被显式确认后才从团队仓删除（交互式运行会询问；非交互运行保留文件并以非零退出），且仅当团队仓副本仍与你的基线一致时才可删——远端已改动的副本会被保留并点名。
 
@@ -1194,8 +1194,8 @@ teamai recall --wiki-page ".wiki/teamai-cli/docs-wiki/topics/usage-guide.md"
 或读该集合的 `index.md`/`overview.md` 导引。检索命中的页面自带 `sources[]`；
 本模式只决定「这条原文能否被引用」。
 
-- `--wiki-page` 接收任意 Wiki 根（`.wiki/`、`.dev_wiki/` 等）下的仓库相对路径，隐含 `--json`。只有映射到
-  `docs/<pid>/` 允许范围内唯一存在、且 SHA-256 一致的文件才报告为
+- `--wiki-page` 接收任意 Wiki 根下的仓库相对路径（`.wiki/<pid>/…`、`.wiki/<pid>_<name>/…`，或旧版 beta 的 `.dev_wiki/<pid>/…`），隐含 `--json`。只有映射到
+  `docs/<pid>/` 或 `docs/<pid>_<name>/` 允许范围内唯一存在、且 SHA-256 一致的文件才报告为
   `verified`，并给出可直接打开的 `resolved` 路径；其余锚点一律携带封闭状态
   —— `missing`、`out_of_scope`、`content_changed`、`unmapped`、
   `unverifiable` 之一加人类可读的 `reason`。**不要引用任何非 `verified` 的锚点**

@@ -33,22 +33,37 @@ export async function isToolInstalledForConfig(
  * when the user has named a namespace (see `AgentsHandler.scanLocalForPush`).
  * Rules and skills are placed after selection, so their scan needs nothing.
  */
+/** An explicitly selected publish source (`--wiki-source` / `--docs-source <dir>=<name>`). */
+export interface NamedPublishSource {
+  /** The source directory, project-root relative (e.g. `.dev_wiki` or `docs/api`). */
+  dir: string;
+  /** The stable team-repo identity it publishes under: `<projectId>_<name>/`. */
+  name: string;
+}
+
 export interface ScanForPushOptions {
   /** The namespace `--role <ns>` / `--project <id>` resolved to, if any. */
   namespace?: string;
   /**
    * The logical project this push runs as, resolved from the directory's
    * active projects (007). Only the one-way published types read it: docs and
-   * wiki land under `docs/<projectId>/` and `<wikiRoot>/<projectId>/`, so their
+   * wiki land under `docs/<projectId>/` and `.wiki/<projectId>/`, so their
    * scan cannot decide new-vs-modified without it.
    */
   projectId?: string;
   /**
-   * Wiki root names (`--exclude-wiki-root`) to skip this run (wiki only). An
-   * excluded root is neither published nor considered for deletion: its
-   * published content stays exactly as it is.
+   * Wiki sources beyond the default (wiki only): the default `.wiki/` always
+   * publishes as `.wiki/<projectId>/`; each entry publishes its directory as
+   * `.wiki/<projectId>_<name>/`. Nothing else is scanned, uploaded, cleaned or
+   * pending-deleted — pattern-matching siblings stay ignored.
    */
-  excludeRoots?: string[];
+  wikiSources?: NamedPublishSource[];
+  /**
+   * Docs sources beyond the default (docs only): the project's `docs/` always
+   * publishes as `docs/<projectId>/`; each entry publishes its directory as
+   * `docs/<projectId>_<name>/`.
+   */
+  docsSources?: NamedPublishSource[];
 }
 
 export abstract class ResourceHandler {

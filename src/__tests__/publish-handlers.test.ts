@@ -64,6 +64,45 @@ describe('DocsHandler one-way publish', () => {
     expect(items).toEqual([]);
   });
 
+  it('reports a named source against docs/<projectId>_<name>/ beside the default bundle', async () => {
+    const handler = new DocsHandler();
+    write('project/docs/api/reference.md', 'api doc');
+    write('project/docs/manual/guide.md', 'manual doc');
+    write('team-repo/docs/proj_api/reference.md', 'api old');
+
+    const items = await handler.scanLocalForPush({} as never, makeConfig(), {
+      projectId: 'proj',
+      docsSources: [{ dir: 'docs/api', name: 'api' }],
+    });
+    const byName = new Map(items.map((i) => [i.name, i]));
+    // The named source publishes under its own namespace...
+    expect(byName.get('docs/api/reference.md')).toMatchObject({
+      status: 'modified',
+      relativePath: 'docs/proj_api/reference.md',
+    });
+    // ...while the default docs/ scan still covers the whole tree.
+    expect(byName.get('api/reference.md')).toMatchObject({
+      status: 'new',
+      relativePath: 'docs/proj/api/reference.md',
+    });
+    expect(byName.has('manual/guide.md')).toBe(true);
+  });
+
+  it('publishes named sources without a default docs/ directory', async () => {
+    const handler = new DocsHandler();
+    write('project/manual/guide.md', 'manual doc');
+    const items = await handler.scanLocalForPush({} as never, makeConfig(), {
+      projectId: 'proj',
+      docsSources: [{ dir: 'manual', name: 'manual' }],
+    });
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      name: 'manual/guide.md',
+      status: 'new',
+      relativePath: 'docs/proj_manual/guide.md',
+    });
+  });
+
   it('publishItem copies into docs/<projectId>/ and never writes the source', async () => {
     const handler = new DocsHandler();
     const source = path.join(tmp, 'project', 'docs', 'a.md');

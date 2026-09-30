@@ -7,6 +7,7 @@ import {
   isWikiRootName,
   matchWikiPublishPrefix,
   parseWikiPagePath,
+  wikiPublishTarget,
 } from '../utils/wiki-roots.js';
 
 let tmp: string;
@@ -57,20 +58,32 @@ describe('discoverWikiRoots', () => {
   });
 });
 
-describe('matchWikiPublishPrefix', () => {
-  it('matches any wiki root for the given project', () => {
+describe('matchWikiPublishPrefix (007 revision 2026-09-30)', () => {
+  it('matches the default root and a named source for the given project', () => {
     expect(matchWikiPublishPrefix('.wiki/demo/spec/a.md', 'demo')).toEqual({
       root: '.wiki',
       prefix: '.wiki/demo/',
     });
+    expect(matchWikiPublishPrefix('.wiki/demo_dev/index.md', 'demo')).toEqual({
+      root: '.wiki',
+      prefix: '.wiki/demo_dev/',
+      name: 'dev',
+    });
+    // A namespace that merely starts with the project id is another project's.
+    expect(matchWikiPublishPrefix('.wiki/demo2/a.md', 'demo')).toBeNull();
+  });
+
+  it('still matches legacy beta keys under other roots, marked legacy', () => {
     expect(matchWikiPublishPrefix('.dev_wiki/demo/index.md', 'demo')).toEqual({
       root: '.dev_wiki',
       prefix: '.dev_wiki/demo/',
+      legacy: true,
     });
   });
 
   it('rejects other projects, docs keys, and non-wiki prefixes', () => {
     expect(matchWikiPublishPrefix('.wiki/other/a.md', 'demo')).toBeNull();
+    expect(matchWikiPublishPrefix('.wiki/other_dev/a.md', 'demo')).toBeNull();
     expect(matchWikiPublishPrefix('docs/demo/a.md', 'demo')).toBeNull();
     expect(matchWikiPublishPrefix('skills/demo/a.md', 'demo')).toBeNull();
     expect(matchWikiPublishPrefix('wiki/demo/a.md', 'demo')).toBeNull();
@@ -87,11 +100,23 @@ describe('parseWikiPagePath', () => {
       root: '.dev_wiki',
       projectId: 'teamai-cli',
     });
+    // A named source's namespace segment is returned verbatim.
+    expect(parseWikiPagePath('.wiki/teamai-cli_dev/docs-wiki/x.md')).toEqual({
+      root: '.wiki',
+      projectId: 'teamai-cli_dev',
+    });
   });
 
   it('rejects non-wiki roots and too-short paths', () => {
     expect(parseWikiPagePath('docs/a/b.md')).toBeNull();
     expect(parseWikiPagePath('wiki/a/b.md')).toBeNull();
     expect(parseWikiPagePath('.wiki/only-pid')).toBeNull();
+  });
+});
+
+describe('wikiPublishTarget', () => {
+  it('keeps the default layout and appends the name for a named source', () => {
+    expect(wikiPublishTarget('/repo', 'demo')).toBe(path.join('/repo', '.wiki', 'demo'));
+    expect(wikiPublishTarget('/repo', 'demo', 'dev')).toBe(path.join('/repo', '.wiki', 'demo_dev'));
   });
 });

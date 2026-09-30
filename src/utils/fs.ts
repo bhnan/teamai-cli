@@ -336,6 +336,18 @@ export async function pathExists(p: string): Promise<boolean> {
 }
 
 /**
+ * Whether `p` exists and is a directory (a symlink to one counts). `pathExists`
+ * alone cannot tell a directory from a file sitting on the name.
+ */
+export async function isDirectory(p: string): Promise<boolean> {
+  try {
+    return (await fse.stat(expandHome(p))).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Remove a file or directory
  */
 export async function remove(p: string): Promise<void> {

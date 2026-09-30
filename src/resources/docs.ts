@@ -2,6 +2,7 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import fse from 'fs-extra';
 import { ResourceHandler } from './base.js';
+import type { NamedPublishSource } from './base.js';
 import { resolveBaseDir, type ResourceItem, type TeamaiConfig, type LocalConfig } from '../types.js';
 import { expandHome, listDirs, pruneEmptyDirs, pathExists, readFileSafe } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
@@ -21,6 +22,27 @@ export function resolveDocsDestination(teamConfig: TeamaiConfig, localConfig: Lo
   }
   const expanded = expandHome(localDir);
   return path.isAbsolute(expanded) ? expanded : path.resolve(resolveBaseDir(localConfig), expanded);
+}
+
+/**
+ * Parse a repo-relative docs publish key for one project: the default
+ * `docs/<projectId>/…` or a named source's `docs/<projectId>_<name>/…`. Keys
+ * under any other `docs/<namespace>/` never match.
+ */
+export function matchDocsPublishPrefix(
+  key: string,
+  projectId: string,
+): { prefix: string; name?: string } | null {
+  if (!key.startsWith('docs/')) return null;
+  const rest = key.slice('docs/'.length);
+  const nsSlash = rest.indexOf('/');
+  if (nsSlash <= 0) return null;
+  const ns = rest.slice(0, nsSlash);
+  if (ns === projectId) return { prefix: `docs/${projectId}/` };
+  if (ns.startsWith(`${projectId}_`)) {
+    return { prefix: `docs/${ns}/`, name: ns.slice(projectId.length + 1) };
+  }
+  return null;
 }
 
 /** Only absence means an empty bundle; permission and I/O errors must stop pruning. */
@@ -248,38 +270,60 @@ export class DocsHandler extends ResourceHandler {
     return path.join(localConfig.projectRoot, 'docs');
   }
 
-  /** The team repo copy for one project: `docs/<projectId>/`. */
-  publishTargetDir(localConfig: LocalConfig, projectId: string): string {
-    return path.join(localConfig.repo.localPath, 'docs', projectId);
+  /** The team repo copy for one project: `docs/<projectId>/`, or `docs/<projectId>_<name>/` for a named source. */
+  publishTargetDir(localConfig: LocalConfig, projectId: string, name?: string): string {
+    return path.join(localConfig.repo.localPath, 'docs', name ? `${projectId}_${name}` : projectId);
   }
 
   async scanLocalForPush(
     _teamConfig: TeamaiConfig,
     localConfig: LocalConfig,
-    options?: { projectId?: string },
+    options?: { projectId?: string; docsSources?: NamedPublishSource[] },
   ): Promise<ResourceItem[]> {
-    // One-way publish (007): compare the project's own docs/ with the team
-    // repo's docs/<projectId>/ copy. A file that matches byte-for-byte is
-    // unchanged; push.ts decides modified-vs-conflict against the recorded
-    // baseline. Only visible files publish — dotfiles stay project-local.
+    // One-way publish (007): the default `docs/` source against the team
+    // repo's `docs/<projectId>/` copy, plus each explicitly named source
+    // (`--docs-source <dir>=<name>`) against its own `docs/<projectId>_<name>/`
+    // namespace — a stable target that keeps same-named files apart. A file
+    // that matches byte-for-byte is unchanged; push.ts decides
+    // modified-vs-conflict against the recorded baseline. Only visible files
+    // publish — dotfiles stay project-local.
     const projectId = options?.projectId;
-    const source = this.publishSourceDir(localConfig);
-    if (!projectId || !source || !(await pathExists(source))) return [];
+    if (!projectId || !localConfig.projectRoot) return [];
+    const sources: Array<{ dir: string; repoPrefix: string; named: boolean }> = [];
+    const defaultSource = this.publishSourceDir(localConfig);
+    if (defaultSource && await pathExists(defaultSource)) {
+      sources.push({ dir: 'docs', repoPrefix: `docs/${projectId}`, named: false });
+    }
+    for (const { dir, name } of options?.docsSources ?? []) {
+      sources.push({ dir, repoPrefix: `docs/${projectId}_${name}`, named: true });
+    }
+    if (sources.length > 1) {
+      log.info(
+        `[docs] default source: docs → docs/${projectId}/`
+        + sources.slice(1).map(({ dir, repoPrefix }) => `; source ${dir} → ${repoPrefix}/`).join(''),
+      );
+    }
+
     const items: ResourceItem[] = [];
-    for (const rel of await listDocFiles(source)) {
-      const localFile = path.join(source, rel);
-      const targetFile = path.join(this.publishTargetDir(localConfig, projectId), rel);
-      const exists = await pathExists(targetFile);
-      const same = exists
-        && (await readFileSafe(localFile)) === (await readFileSafe(targetFile));
-      if (!same) {
-        items.push({
-          name: rel,
-          type: 'docs',
-          sourcePath: localFile,
-          relativePath: `docs/${projectId}/${rel}`,
-          status: exists ? 'modified' : 'new',
-        });
+    for (const { dir, repoPrefix, named } of sources) {
+      const source = path.join(localConfig.projectRoot!, dir);
+      for (const rel of await listDocFiles(source)) {
+        const localFile = path.join(source, rel);
+        const targetFile = path.join(localConfig.repo.localPath, repoPrefix, rel);
+        const exists = await pathExists(targetFile);
+        const same = exists
+          && (await readFileSafe(localFile)) === (await readFileSafe(targetFile));
+        if (!same) {
+          items.push({
+            // Source-prefixed for named sources, so a named source's files stay
+            // distinguishable from the default bundle's in every listing.
+            name: named ? `${dir}/${rel}` : rel,
+            type: 'docs',
+            sourcePath: localFile,
+            relativePath: `${repoPrefix}/${rel}`,
+            status: exists ? 'modified' : 'new',
+          });
+        }
       }
     }
     return items;

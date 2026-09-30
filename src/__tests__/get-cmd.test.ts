@@ -163,7 +163,7 @@ describe('WikiHandler', () => {
     };
   }
 
-  it('scanLocalForPush publishes against <root>/<projectId>/ and needs one', async () => {
+  it('scanLocalForPush publishes against .wiki/<projectId>/ and needs one', async () => {
     write('.wiki/changed.md', 'local-v2');
     write('.wiki/same.md', 'same');
     write('.wiki/new.md', 'n');
@@ -181,33 +181,34 @@ describe('WikiHandler', () => {
     expect(items.find((i) => i.name === '.wiki/new.md')?.relativePath).toBe('.wiki/proj/new.md');
   });
 
-  it('scanLocalForPush discovers every wiki root and keeps same-named pages apart', async () => {
+  it('scanLocalForPush ignores other wiki-shaped directories until they are named', async () => {
+    write('.wiki/index.md', 'business');
+    write('.dev_wiki/index.md', 'dev');
+    write('.wiki_backup/ignored.md', 'i'); // suffix does not match: not a root
+    const { localConfig, teamConfig } = makeConfigs();
+    const handler = new WikiHandler();
+    const items = await handler.scanLocalForPush(teamConfig, localConfig, { projectId: 'proj' });
+    expect(items.map((i) => i.name)).toEqual(['.wiki/index.md']);
+  });
+
+  it('scanLocalForPush publishes a named source as .wiki/<projectId>_<name>/ and keeps same-named pages apart', async () => {
     write('.wiki/index.md', 'business');
     write('.dev_wiki/index.md', 'dev');
     write('.dev_wiki/guide.md', 'g');
     write('.wiki_backup/ignored.md', 'i'); // suffix does not match: not a root
-    write('repo/.dev_wiki/proj/index.md', 'dev-old'); // modified
-    const { localConfig, teamConfig } = makeConfigs();
-    const handler = new WikiHandler();
-    const items = await handler.scanLocalForPush(teamConfig, localConfig, { projectId: 'proj' });
-    const byName = new Map(items.map((i) => [i.name, i]));
-    expect(byName.get('.wiki/index.md')?.relativePath).toBe('.wiki/proj/index.md');
-    expect(byName.get('.dev_wiki/index.md')?.relativePath).toBe('.dev_wiki/proj/index.md');
-    expect(byName.get('.dev_wiki/index.md')?.status).toBe('modified');
-    expect(byName.get('.dev_wiki/guide.md')?.status).toBe('new');
-    expect(byName.has('.wiki_backup/ignored.md')).toBe(false);
-  });
-
-  it('scanLocalForPush skips excluded roots entirely', async () => {
-    write('.wiki/index.md', 'business');
-    write('.dev_wiki/index.md', 'dev');
+    write('repo/.wiki/proj_dev/index.md', 'dev-old'); // modified
     const { localConfig, teamConfig } = makeConfigs();
     const handler = new WikiHandler();
     const items = await handler.scanLocalForPush(teamConfig, localConfig, {
       projectId: 'proj',
-      excludeRoots: ['.dev_wiki'],
+      wikiSources: [{ dir: '.dev_wiki', name: 'dev' }],
     });
-    expect(items.map((i) => i.name)).toEqual(['.wiki/index.md']);
+    const byName = new Map(items.map((i) => [i.name, i]));
+    expect(byName.get('.wiki/index.md')?.relativePath).toBe('.wiki/proj/index.md');
+    expect(byName.get('.dev_wiki/index.md')?.relativePath).toBe('.wiki/proj_dev/index.md');
+    expect(byName.get('.dev_wiki/index.md')?.status).toBe('modified');
+    expect(byName.get('.dev_wiki/guide.md')?.status).toBe('new');
+    expect(byName.has('.wiki_backup/ignored.md')).toBe(false);
   });
 
   it('localWikiDir binds to the project in project scope', () => {
