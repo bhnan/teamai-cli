@@ -371,13 +371,15 @@ The directory match is case-folded, so `docs/Checkout/` is withheld for an
 inactive `checkout` on every filesystem. When a namespace stops being active,
 pull removes the local copies that are byte-equal to the team file, or to any
 earlier commit of it (`isPastVersionOf`: the team edited it after delivery), and keeps
-edited ones, naming them. The docs mirror (#817) targets this resolved set: it
-copies only the delivered files and prunes every local file the team repo does
-not have, inside a withheld namespace too, but never a local copy of a withheld
-namespace's team doc; those follow the byte-equal rule. The search index and
-`doctor`'s `Team docs delivered` use the same filter as pull: doctor expects
-only the delivered files, and does not report a withheld namespace's team doc
-as stale, since pull names the edited copies it keeps.
+edited ones, naming them. The docs mirror (#817) targeted this resolved set — a
+legacy deployment no current pull writes (007): it copied only the delivered
+files and pruned every local file the team repo does not have, inside a withheld
+namespace too, but never a local copy of a withheld namespace's team doc; those
+follow the byte-equal rule. The search index and `doctor`'s `Team docs readable
+in the team repo clone` use the same delivered filter: recall indexes only the
+docs you receive, and doctor reads them in the team-repo clone — neither
+requires a local mirror. Where one remains from an older release, doctor notes
+it may be removed by hand.
 
 `team-codebase` (any case) is rejected as a docs namespace at the manifest schema,
 so the manifest fails to load like any invalid namespace:

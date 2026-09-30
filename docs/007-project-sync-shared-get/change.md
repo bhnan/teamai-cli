@@ -109,3 +109,41 @@ Status: implemented（见下方验证记录；发布另行授权）
 - 门槛：`npx tsc --noEmit` 通过；`npm run lint` 仍为 3 条预存警告（零新增）；`npx vitest run` 全量除本机预存的 21 个失败（init + wiki-source-anchor 的 macOS tmpdir realpath 环境问题）外全绿；`commands.md` 经 `commands-reference -u` 再生成（新增 `--exclude-wiki-root` 行）；双语 usage-guide 同步。
 
 边界保持不变：pull 仍只处理 skills/rules/env/agents；docs/Wiki 仍仅 push 单向发布；共享 get 边界不变；`project-wiki` skill 未修改。
+
+### 后续问题 — 2026-09-30：doctor 仍要求已废弃的 docs 镜像
+
+#### 现象
+
+团队仓本地 clone 的 `docs/` 已有 455 篇文档，但项目作用域下的 `.teamai/docs/` 没有镜像时，`teamai doctor` 仍可能使 `Team docs delivered` 检查失败。将用户作用域的 `~/.teamai/docs/`（相同 revision）复制到项目作用域的 `.teamai/docs/` 后，doctor 变为通过；执行 `pull --force` 不能修复缺失镜像。
+
+#### 原因
+
+旧版实现把 `sharing.docs.localDir` 当作下行镜像目标：项目作用域下的 `~/docs` 会重锚定到项目根目录，`DocsHandler.pullDocs()` 从团队仓 clone 的 `docs/` 复制文档，并由 `pruneDocs()` 清理目标中团队包不存在的可见文件。旧版 `doctor` 的 `buildDocsCheck()` 延续了这一契约，逐文件比较本地镜像与团队仓 docs。
+
+007 已将项目 `pull` 的资源边界收窄为 `skills`、`rules`、`env`、`agents`，docs/Wiki 只通过项目 `push` 单向发布到团队仓，消费项目直接从团队仓副本检索。当前 `pull` 不再调用 `DocsHandler.pullDocs()`，`pull --force` 也不会写入或清理项目 docs。`doctor` 的 docs 检查仍保留旧镜像假设，造成“pull 不负责修复、doctor 却要求存在”的契约冲突。复制镜像能使检查变绿，只证明旧检查的文件比较满足，不能证明当前 pull 会继续维护它。
+
+#### 需求与修复方向
+
+- 保持 007 边界：项目 `pull` 对 docs/Wiki 零写入、零覆盖、零清理；不得为使 doctor 通过而重新引入镜像部署。
+- 将 `Team docs delivered` 从项目本地交付检查中移除，或改为检查团队仓 docs 副本、来源映射和索引是否可用；不再要求 `.teamai/docs/` 或 `sharing.docs.localDir` 存在。
+- `sharing.docs.localDir` 作为旧版本遗留配置保留兼容读取，但不参与当前 pull/doctor 的通过条件；旧镜像允许用户手工清理。
+- 增加回归验证：团队仓有 docs、项目本地没有旧镜像时，`pull` 不写入项目 docs，`doctor` 不因旧镜像缺失失败；项目 push 后，团队仓副本和检索来源仍可核验。
+
+当前记录的是需求和问题定位，尚未修改 doctor 实现。
+
+#### 实现记录 — 2026-09-30
+
+选择了修复方向的第二条：doctor 的 docs 检查改为验证团队仓副本本身，而不是移除检查。
+
+- `src/doctor-delivery.ts` `buildDocsCheck()` 重写：
+  - 检查名从 `Team docs delivered` 改为 `Team docs readable in the team repo clone`。检查内容变为：`resolveDocsForDirectory()` 解析本机应收到的 docs 集合（与 recall 索引同一过滤器，#707），并逐一验证这些文件在团队仓 clone 的 `docs/` 下可读（`isReadableFile`，防目录占名/悬空链接）。不再读取、比较或要求 `sharing.docs.localDir` 镜像；解析失败时输出 `Team docs can be resolved from the team repo`（说明 recall 无法索引 docs）而不是建议 `pull --force`。
+  - 旧镜像不再影响通过条件：新增 `buildLegacyDocsMirrorNote()`，当 `sharing.docs.localDir`（兼容读取，仅此用途）指向一个仍存在的目录时，doctor 在 notes（信息行，非检查）里提示该目录由旧版 pull 写入、不会再被写入或清理、可手工删除。localDir 不是独立目录（与团队仓或 home/项目根重叠，即旧 pull 自己也会拒绝写入的位置）时不给删除建议。`informational` 检查形态被有意排除：它失败仍会翻转 doctor 整体 `ok`，等于让旧镜像参与通过条件。
+  - `unresolvableCheck()` 的类型收窄为 `skills | agents`。
+- `src/resources/docs.ts`：`containsPath()` 导出，供镜像提示复用旧 pull 的目录独立性规则；`listStaleDocDirectories()` 随旧检查一并删除（已无任何调用方）。`DocsHandler` 的镜像机制（`pullDocs` 等）未动，`uninstall` 仍用它定位并清除旧镜像。
+- 测试：
+  - `src/__tests__/doctor-delivery.test.ts`：`team docs` 块按新契约重写——clone 可读且无镜像时通过（原始问题场景）；旧镜像存在（含 stale 内容）时检查仍绿；clone 中不可读的文档被点名；无 docs 时无检查；只读激活 namespace 的 docs；解析失败时报原因；`legacy docs mirror note` 三例（提示/无镜像沉默/非独立目录沉默）。
+  - `src/__tests__/docs-prune-e2e.test.ts` 删除（断言 007 前的 user-scope 镜像行为，与当前边界矛盾，属预存失败），新增 `src/__tests__/docs-pull-boundary-e2e.test.ts`：真实 CLI + git remote，项目作用域 `pull --force` 后无 `.teamai/docs` 镜像、预置旧镜像原样保留、项目 `docs/` 原文不变、doctor 的 docs 检查通过、notes 提示旧镜像；删除旧镜像后 doctor 依然通过且无提示。
+- 文档：`docs/usage-guide.md` / `usage-guide.zh-CN.md` doctor 段落改为新检查名与新行为；`docs/designs/multi-project-management.md` 的 `Team docs delivered` 句子同步并标注镜像为 legacy。
+- 验证：`npx tsc --noEmit` 通过；`npm run lint` 3 条预存警告（零新增）；`npx vitest run` 全量除本机预存的 21 个失败（init + wiki-source-anchor）外全绿；`npm run build` 后 `npx vitest run --config vitest.e2e.config.ts docs-pull-boundary-e2e` 通过（真实 CLI 记录见上）。
+
+边界保持不变：项目 `pull` 对 docs/Wiki 零写入、零覆盖、零清理；本变更只动 doctor 的读取面与一条信息提示。

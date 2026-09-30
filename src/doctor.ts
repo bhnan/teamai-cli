@@ -31,6 +31,7 @@ import {
   buildEntryScopeKeyCheck,
   entryNamespaceNotes,
   buildDocsCheck,
+  buildLegacyDocsMirrorNote,
 } from './doctor-delivery.js';
 
 /**
@@ -565,10 +566,11 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
     ? codexTrustReminder()
     : null;
   // Info, not checks: which namespace item or entry replaces which root one
-  // (#707).
+  // (#707), and where a legacy docs mirror sits for whoever wants it gone.
   const notes = [
     ...await buildNamespaceNotes(ctx),
     ...await entryNamespaceNotes(ctx),
+    ...await buildLegacyDocsMirrorNote(ctx),
     ...(codexNote ? [codexNote] : []),
   ];
 

@@ -2,7 +2,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { expandHome, listFilesRecursive, pathExists, readFileSafe } from './utils/fs.js';
-import { getDataHome, getMcpSharing, isAgentExcluded } from './types.js';
+import { getDataHome, getMcpSharing, isAgentExcluded, resolveBaseDir } from './types.js';
 import type { DeliveryTarget, LocalConfig, ResourceItem, TeamaiConfig } from './types.js';
 import type { EntryResolution, EntryType } from './namespaced-entries.js';
 import { splitFrontmatter } from './utils/frontmatter.js';
@@ -150,7 +150,7 @@ function nameList(names: string[]): string {
  * reason, and the command whose job is explaining bad state must report it,
  * not stack-trace on it.
  */
-function unresolvableCheck(type: 'skills' | 'agents' | 'docs', reason: string): Check[] {
+function unresolvableCheck(type: 'skills' | 'agents', reason: string): Check[] {
   const noun = type[0].toUpperCase() + type.slice(1);
   return [{
     name: `${noun} to deliver can be resolved`,
@@ -717,66 +717,81 @@ async function envDeliveryProblems(
 }
 
 /**
- * The docs bundle has one destination rather than one per tool: `DocsHandler`
- * mirrors the team's visible `docs/` tree into `sharing.docs.localDir`. So this
- * check compares the delivered set with that directory, file by file, rather
- * than asking each tool.
+ * Docs are read from the team repo clone, not delivered (007): `pull` never
+ * writes or prunes a local docs mirror, and what recall indexes and other
+ * projects cite is the clone's own `docs/` tree. So this check verifies that
+ * copy — the delivered set resolves, and every file it names is readable where
+ * the clone holds it — instead of comparing a mirror no command maintains
+ * (`sharing.docs.localDir` is read only by `buildLegacyDocsMirrorNote`).
  */
 export async function buildDocsCheck(ctx: DoctorContext): Promise<Check[]> {
-  const { localConfig, teamConfig } = ctx;
-  if (!teamConfig) return [];
+  const { localConfig } = ctx;
 
-  const { listDocFiles, listStaleDocDirectories, resolveDocsForDirectory, resolveDocsDestination } = await import('./resources/docs.js');
-  // The set pull delivers: no dotfiles, nothing of a docs namespace this member
-  // does not have active (#707). Manifests that cannot be read leave nothing to
-  // compare against, and pull stops the scope over them.
+  const { resolveDocsForDirectory } = await import('./resources/docs.js');
+  // The set this member receives: no dotfiles, nothing of a docs namespace
+  // this member does not have active (#707) — the same filter recall indexes.
+  // Manifests that cannot be read leave nothing to compare against.
   let desired: Awaited<ReturnType<typeof resolveDocsForDirectory>>;
   try {
     desired = await resolveDocsForDirectory(localConfig);
   } catch (e) {
-    return unresolvableCheck('docs', e instanceof Error ? e.message : String(e));
-  }
-
-  const dest = resolveDocsDestination(teamConfig, localConfig);
-  let localFiles: string[];
-  let staleDirectories: string[];
-  try {
-    localFiles = await listDocFiles(dest);
-    staleDirectories = await listStaleDocDirectories(desired.sourceDir, dest);
-  } catch (e) {
+    const reason = e instanceof Error ? e.message : String(e);
     return [{
-      name: 'Team docs delivered', source: 'local', check: async () => false,
-      fix: `Could not inspect the docs mirror: ${e instanceof Error ? e.message : String(e)}. Check directory access, then run \`teamai pull --force\`.`,
+      name: 'Team docs can be resolved from the team repo',
+      source: 'local',
+      check: async () => false,
+      fix: `${reason}. Until the team repo is fixed, recall cannot index docs for this scope.`,
     }];
   }
-  const teamFiles = desired.files;
-  if (teamFiles.length === 0 && localFiles.length === 0 && staleDirectories.length === 0) return [];
-  // A team doc of a namespace not active here is not stale: pull removes the
-  // unchanged copy and names the edited one it keeps.
-  const known = new Set([
-    ...teamFiles,
-    ...desired.withheld.flatMap(({ dir, files }) => files.map((file) => `${dir}/${file}`)),
-  ]);
-  const stale = [...localFiles.filter(file => !known.has(file)), ...staleDirectories];
+  if (desired.files.length === 0) return [];
 
   // isFile, not merely "something is there": a directory sitting on the
   // expected name, or a symlink with nothing behind it, would satisfy a plain
   // existence check while the doc is no more readable than a missing one.
-  const missing: string[] = [];
-  for (const file of teamFiles) {
-    if (!await isReadableFile(path.join(dest, file))) missing.push(file);
+  const unreadable: string[] = [];
+  for (const file of desired.files) {
+    if (!await isReadableFile(path.join(desired.sourceDir, file))) unreadable.push(file);
   }
 
   return [{
-    name: 'Team docs delivered',
+    name: 'Team docs readable in the team repo clone',
     source: 'local',
-    check: async () => missing.length === 0 && stale.length === 0,
-    fix: [
-      ...(missing.length ? [`Missing from ${dest}: ${nameList(missing)}.`] : []),
-      ...(stale.length ? [`Stale docs in ${dest}: ${nameList(stale)}.`] : []),
-      'Run `teamai pull --force` to restore the docs mirror; a plain pull skips an already-synced revision.',
-    ].join(' '),
+    check: async () => unreadable.length === 0,
+    fix: unreadable.length
+      ? `Cannot read ${nameList(unreadable)} from ${desired.sourceDir}. Docs are consumed from the team `
+        + 'repo clone: restore it with `git -C <repo> checkout -- docs` (or re-clone), then `teamai pull`.'
+      : undefined,
   }];
+}
+
+/**
+ * One advisory line, not a check, for a docs mirror an older release left at
+ * `sharing.docs.localDir`: no current command writes, prunes or reads it, so
+ * doctor must neither fail over it nor stay silent about it — the leftover
+ * would otherwise look required (007). The key stays readable for exactly
+ * this: naming where the leftover sits. A localDir that is not a dedicated
+ * directory — one the old pull would itself have refused to write — gets no
+ * advice about deleting it, because it is not a mirror.
+ */
+export async function buildLegacyDocsMirrorNote(ctx: DoctorContext): Promise<string[]> {
+  const { localConfig, teamConfig } = ctx;
+  if (!teamConfig) return [];
+
+  const { resolveDocsDestination, containsPath } = await import('./resources/docs.js');
+  const mirror = resolveDocsDestination(teamConfig, localConfig);
+  if (!await pathExists(mirror)) return [];
+  // The same dedication rule the old pull enforced before writing: the mirror
+  // overlaps neither the team repo (its own docs/ included) nor the home or
+  // project root. Anything else may hold files that are still live.
+  const repo = localConfig.repo.localPath;
+  if (containsPath(mirror, repo) || containsPath(repo, mirror) || containsPath(mirror, resolveBaseDir(localConfig))) {
+    return [];
+  }
+
+  return [
+    `Legacy docs mirror: ${mirror} was written by an older release's pull. Docs are now read from the team `
+    + 'repo clone, and this directory is never written or cleaned again — you may delete it by hand.',
+  ];
 }
 
 /**

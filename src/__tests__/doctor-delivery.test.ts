@@ -20,6 +20,7 @@ vi.mock('../utils/logger.js', () => ({
 import { loadLocalConfig, loadTeamConfig } from '../config.js';
 import { log } from '../utils/logger.js';
 import { buildChecks, resolveDoctorContext, type Check } from '../doctor.js';
+import { buildDocsCheck, buildLegacyDocsMirrorNote } from '../doctor-delivery.js';
 import type { LocalConfig, TeamaiConfig } from '../types.js';
 
 /**
@@ -288,10 +289,11 @@ describe('doctor — skills delivered on disk', () => {
     });
   });
 
-  // Docs are the one payload with a single destination instead of one per tool:
-  // DocsHandler copies the whole bundle into `sharing.docs.localDir`.
+  // Docs are consumed from the team repo clone, not delivered (007): pull
+  // never writes or prunes a local mirror, so the check reads the clone's own
+  // docs/ tree, and a mirror an older release left is only a cleanup note.
   describe('team docs', () => {
-    const CHECK = 'Team docs delivered';
+    const CHECK = 'Team docs readable in the team repo clone';
 
     async function writeTeamDoc(...segments: string[]): Promise<void> {
       const file = path.join(repoPath, 'docs', ...segments);
@@ -306,15 +308,14 @@ describe('doctor — skills delivered on disk', () => {
     }
 
     beforeEach(() => {
+      // Deliberately configured, and deliberately never written: the check
+      // must ask nothing of the legacy mirror directory (007).
       teamConfig.sharing.docs.localDir = '~/team-docs';
     });
 
-    it('passes when the bundle is on disk', async () => {
+    it('passes when the clone holds every doc and no local mirror exists', async () => {
       await writeTeamDoc('guide.md');
       await writeTeamDoc('api', 'reference.md');
-      await fse.ensureDir(path.join(homeDir, 'team-docs', 'api'));
-      await fse.writeFile(path.join(homeDir, 'team-docs', 'guide.md'), '# doc\n');
-      await fse.writeFile(path.join(homeDir, 'team-docs', 'api', 'reference.md'), '# doc\n');
 
       const check = await docsCheck();
 
@@ -322,147 +323,109 @@ describe('doctor — skills delivered on disk', () => {
       expect(await check!.check()).toBe(true);
     });
 
-    it('fails and names what is missing from the bundle', async () => {
+    it('stays green while a legacy mirror sits in place, stale content included', async () => {
       await writeTeamDoc('guide.md');
-      await writeTeamDoc('api', 'reference.md');
-      await fse.ensureDir(path.join(homeDir, 'team-docs'));
-      await fse.writeFile(path.join(homeDir, 'team-docs', 'guide.md'), '# doc\n');
-
-      const check = await docsCheck();
-
-      expect(await check!.check()).toBe(false);
-      expect(check!.fix).toContain('api/reference.md');
-      expect(check!.fix).not.toContain('guide.md');
-      expect(check!.fix).toContain('teamai pull --force');
-    });
-
-    it('does not accept a directory sitting on a doc\'s name', async () => {
-      // pathExists follows symlinks and says yes to a directory, so on its own
-      // it cannot tell a delivered document from a name occupied by something
-      // else. The bundle is no more readable than if the file were missing.
-      await writeTeamDoc('guide.md');
-      await fse.ensureDir(path.join(homeDir, 'team-docs', 'guide.md'));
+      await fse.outputFile(path.join(homeDir, 'team-docs', 'old', 'retired.md'), 'stale');
+      await fse.outputFile(path.join(homeDir, 'team-docs', '.keep'), 'hidden');
 
       const check = await docsCheck();
 
       expect(check).toBeDefined();
+      expect(await check!.check()).toBe(true);
+    });
+
+    it('fails and names a doc the clone can no longer read', async () => {
+      // A name occupied by something other than a file — here a link to a
+      // directory — lists as a doc but reads as none.
+      await writeTeamDoc('guide.md');
+      const outside = path.join(tempDir, 'outside');
+      await fse.ensureDir(outside);
+      await fse.symlink(outside, path.join(repoPath, 'docs', 'linked.md'), process.platform === 'win32' ? 'junction' : 'file');
+
+      const check = await docsCheck();
+
       expect(await check!.check()).toBe(false);
-      expect(check!.fix).toContain('guide.md');
+      expect(check!.fix).toContain('linked.md');
+      expect(check!.fix).not.toContain('guide.md');
+      expect(check!.fix).toContain(path.join(repoPath, 'docs'));
     });
 
     it('asks nothing when the team repo ships no docs', async () => {
       expect(await docsCheck()).toBeUndefined();
     });
 
-    // The same filter pull applies (#707): a declared namespace this member
-    // does not have active is not owed, and an active one is.
-    it('does not expect the docs of a namespace declared elsewhere, and does expect the active one', async () => {
+    // The same filter recall indexes (#707): a docs namespace this member does
+    // not have active is not owed, so it is not read either.
+    it('expects only the active namespace\'s docs, and does not read an inactive namespace\'s', async () => {
       await fse.outputFile(
         path.join(repoPath, 'manifest', 'projects.yaml'),
         'version: 1\nprojects:\n  - id: alpha\n    resources:\n      docs: [alpha]\n  - id: beta\n    resources:\n      docs: [beta]\n',
       );
       localConfig.projects = ['alpha'];
-      await writeTeamDoc('guide.md');
       await writeTeamDoc('alpha', 'gateway.md');
       await writeTeamDoc('beta', 'billing.md');
-      await fse.outputFile(path.join(homeDir, 'team-docs', 'guide.md'), '# doc\n');
+      // A dangling link where beta's second doc sits: unreadable, and never stat'ed.
+      await fse.symlink('nowhere', path.join(repoPath, 'docs', 'beta', 'broken.md'));
 
       const check = await docsCheck();
 
-      expect(await check!.check()).toBe(false);
-      expect(check!.fix).toContain('alpha/gateway.md');
-      expect(check!.fix).not.toContain('beta');
-
-      await fse.outputFile(path.join(homeDir, 'team-docs', 'alpha', 'gateway.md'), '# doc\n');
-      expect(await (await docsCheck())!.check()).toBe(true);
+      expect(check).toBeDefined();
+      expect(await check!.check()).toBe(true);
+      expect(check!.fix).toBeUndefined();
     });
 
-    // Pull keeps an edited copy of an inactive namespace's doc and names it, so
-    // doctor does not call it stale; a file the team has nowhere still is.
-    it('does not report a kept doc of an inactive namespace as stale, only a file the team lacks', async () => {
-      await fse.outputFile(
-        path.join(repoPath, 'manifest', 'projects.yaml'),
-        'version: 1\nprojects:\n  - id: alpha\n    resources:\n      docs: [alpha]\n  - id: beta\n    resources:\n      docs: [beta]\n',
-      );
-      localConfig.projects = ['alpha'];
-      await writeTeamDoc('beta', 'billing.md');
-      await fse.outputFile(path.join(homeDir, 'team-docs', 'beta', 'billing.md'), '# my notes\n');
-
-      expect(await (await docsCheck())!.check()).toBe(true);
-
-      await fse.outputFile(path.join(homeDir, 'team-docs', 'beta', 'retired.md'), '# gone upstream\n');
-      const check = await docsCheck();
-      expect(await check!.check()).toBe(false);
-      expect(check!.fix).toContain('beta/retired.md');
-      expect(check!.fix).not.toContain('billing.md');
-    });
-
-    it('reports missing and stale docs together without changing local files', async () => {
+    it('names the reason when the delivered set cannot be resolved', async () => {
       await writeTeamDoc('guide.md');
-      const stale = path.join(homeDir, 'team-docs', 'old', 'retired.md');
-      await fse.outputFile(stale, 'stale');
-      const check = await docsCheck();
-      expect(await check!.check()).toBe(false);
-      expect(check!.fix).toContain('Missing from');
-      expect(check!.fix).toContain('guide.md');
-      expect(check!.fix).toContain('Stale docs');
-      expect(check!.fix).toContain('old/retired.md');
-      expect(await fse.readFile(stale, 'utf8')).toBe('stale');
+      await fse.ensureDir(path.join(repoPath, 'manifest'));
+      await fse.writeFile(path.join(repoPath, 'manifest', 'roles.yaml'), 'roles: [oops\n');
+
+      // Called directly: through buildChecks, the doctor-stage rules builder
+      // hits the same broken manifest first and throws (a pre-existing gap,
+      // not this check's contract). The pull-stage post-checks reach this.
+      const ctx = await resolveDoctorContext();
+      if (!ctx) throw new Error('expected a resolved doctor context');
+      const check = (await buildDocsCheck(ctx))[0];
+
+      expect(check.name).toBe('Team docs can be resolved from the team repo');
+      expect(await check.check()).toBe(false);
+      expect(check.fix).toContain('recall cannot index docs');
     });
 
-    it.each(['missing', 'empty', 'hidden-only'])('detects stale docs when the team bundle is %s', async (state) => {
-      if (state === 'empty') await fse.ensureDir(path.join(repoPath, 'docs'));
-      if (state === 'hidden-only') await writeTeamDoc('.keep');
-      await fse.outputFile(path.join(homeDir, 'team-docs', 'old.md'), 'stale');
-      const check = await docsCheck();
-      expect(await check!.check()).toBe(false);
-      expect(check!.fix).toContain('Stale docs');
-      expect(check!.fix).toContain('old.md');
-      expect(check!.fix).not.toContain('Missing from');
-      expect(check!.fix).toContain('teamai pull --force');
-    });
+    // The mirror an older release may have left is a note, not a check: it
+    // must not gate doctor, only tell the user where the leftover sits.
+    describe('legacy docs mirror note', () => {
+      async function mirrorNote(): Promise<string[]> {
+        const ctx = await resolveDoctorContext();
+        if (!ctx) throw new Error('expected a resolved doctor context');
+        return buildLegacyDocsMirrorNote(ctx);
+      }
 
-    it.each(['missing', 'empty'])('reports stale empty directories when the team bundle is %s', async (state) => {
-      if (state === 'empty') await fse.ensureDir(path.join(repoPath, 'docs'));
-      const empty = path.join(homeDir, 'team-docs', 'old', 'nested');
-      await fse.ensureDir(empty);
-      await fse.outputFile(path.join(homeDir, 'team-docs', 'private', '.keep'), 'hidden');
-      const check = await docsCheck();
-      expect(await check!.check()).toBe(false);
-      expect(check!.fix).toContain('old/nested/');
-      expect(check!.fix).not.toContain('private');
-      expect(await fse.pathExists(empty)).toBe(true);
-    });
+      it('names the leftover directory and says it may be deleted', async () => {
+        await writeTeamDoc('guide.md');
+        await fse.outputFile(path.join(homeDir, 'team-docs', 'guide.md'), 'old mirror copy');
 
-    it('accepts an empty directory that still exists in the team bundle', async () => {
-      await fse.ensureDir(path.join(repoPath, 'docs', 'empty'));
-      await fse.ensureDir(path.join(homeDir, 'team-docs', 'empty'));
-      expect(await docsCheck()).toBeUndefined();
-    });
+        const notes = await mirrorNote();
 
-    it('ignores hidden local docs and hidden subdirectories', async () => {
-      await fse.outputFile(path.join(homeDir, 'team-docs', '.draft.md'), 'hidden');
-      await fse.outputFile(path.join(homeDir, 'team-docs', 'old', '.private', 'draft.md'), 'hidden');
-      expect(await docsCheck()).toBeUndefined();
-    });
+        expect(notes).toHaveLength(1);
+        expect(notes[0]).toContain(path.join(homeDir, 'team-docs'));
+        expect(notes[0]).toContain('delete');
+      });
 
-    it('reports a stale directory link without traversing its target', async () => {
-      const outside = path.join(tempDir, 'outside');
-      await fse.outputFile(path.join(outside, 'keep.md'), 'outside');
-      await fse.ensureDir(path.join(homeDir, 'team-docs'));
-      await fse.symlink(outside, path.join(homeDir, 'team-docs', 'linked'), process.platform === 'win32' ? 'junction' : 'dir');
-      const check = await docsCheck();
-      expect(await check!.check()).toBe(false);
-      expect(check!.fix).toContain('linked');
-      expect(check!.fix).not.toContain('keep.md');
-      expect(await fse.readFile(path.join(outside, 'keep.md'), 'utf8')).toBe('outside');
-    });
+      it('says nothing without a mirror', async () => {
+        await writeTeamDoc('guide.md');
 
-    it('reports a destination that cannot be inspected instead of throwing', async () => {
-      await fse.outputFile(path.join(homeDir, 'team-docs'), 'not a directory');
-      const check = await docsCheck();
-      expect(await check!.check()).toBe(false);
-      expect(check!.fix).toContain('Could not inspect the docs mirror');
+        expect(await mirrorNote()).toEqual([]);
+      });
+
+      it('says nothing when the localDir is not a dedicated directory', async () => {
+        await writeTeamDoc('guide.md');
+        // The team repo itself, and the home directory: both overlap live
+        // state, so neither may be advised for deletion.
+        teamConfig.sharing.docs.localDir = repoPath;
+        expect(await mirrorNote()).toEqual([]);
+        teamConfig.sharing.docs.localDir = '~';
+        expect(await mirrorNote()).toEqual([]);
+      });
     });
   });
 
