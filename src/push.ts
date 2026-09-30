@@ -22,6 +22,7 @@ import type {
 import { getDataHome, SELF_KNOWLEDGE_SCAN_KEY, SYNC_LOCK_FILENAME } from './types.js';
 import { acquireLock, releaseLock } from './update.js';
 import { assertSafeResourceName } from './utils/path-safety.js';
+import { discoverWikiRoots, isWikiRootName, matchWikiPublishPrefix } from './utils/wiki-roots.js';
 import { loadRolesManifest, resolveRoleResourceNamespaces, RolesManifestNotFoundError } from './roles.js';
 import type { ProjectsManifest } from './projects.js';
 import { isSafeNamespaceSegment, NAMESPACE_RULE, fallbackNamespaceError } from './manifest-schema.js';
@@ -732,6 +733,7 @@ export async function push(
     agent?: string;
     rule?: string;
     force?: boolean;
+    excludeWikiRoot?: string[];
   },
   /**
    * Optional out-param: set to `{ completed: true }` only when a real push
@@ -794,6 +796,21 @@ export async function push(
   if (options.rule) {
     if (!resourceTypes.includes('rules')) {
       log.error('--rule selects a rule, but --types does not include rules.');
+      process.exitCode = 2;
+      return;
+    }
+  }
+  const excludeWikiRoots = options.excludeWikiRoot ?? [];
+  for (const name of excludeWikiRoots) {
+    if (!isWikiRootName(name)) {
+      log.error(
+        `--exclude-wiki-root expects a wiki root directory name (dot-prefixed, lowercase-wiki-suffixed, e.g. ".dev_wiki"); got "${name}".`,
+      );
+      process.exitCode = 2;
+      return;
+    }
+    if (!resourceTypes.includes('wiki')) {
+      log.error('--exclude-wiki-root selects wiki roots, but --types does not include wiki.');
       process.exitCode = 2;
       return;
     }
@@ -923,11 +940,15 @@ async function pushCore(
     agent?: string;
     rule?: string;
     force?: boolean;
+    excludeWikiRoot?: string[];
   },
   initialPendingTeamConfig: string | null = null,
   result?: { completed: boolean },
 ): Promise<void> {
   const selfMode = localConfig.repo.kind === 'self';
+  // Validated once in push() (name shape + --types wiki); the self-mode
+  // worktree path re-enters here directly, so re-derive defensively.
+  const excludeWikiRoots = (options.excludeWikiRoot ?? []).filter(isWikiRootName);
 
   // The --types selection pushCore scans by (validated once in push(); the
   // worktree path in self mode re-enters here without it).
@@ -1239,9 +1260,11 @@ async function pushCore(
     const handler = getHandler(type);
     const scanOptions = type === 'agents'
       ? { namespace: requestedAgentsNamespace }
-      : type === 'docs' || type === 'wiki'
-        ? { projectId: publishProjectId ?? undefined }
-        : undefined;
+      : type === 'wiki'
+        ? { projectId: publishProjectId ?? undefined, excludeRoots: excludeWikiRoots }
+        : type === 'docs'
+          ? { projectId: publishProjectId ?? undefined }
+          : undefined;
     try {
       const items = await handler.scanLocalForPush(
         scanTeamConfig,
@@ -1328,12 +1351,16 @@ async function pushCore(
   const staleBaselines: string[] = [];
   if (publishProjectId && localConfig.projectRoot) {
     const state = await loadStateForScope(localConfig);
+    // A wiki root that is absent (renamed/moved away) or excluded this run is
+    // never read as "delete everything published from it" (change 2026-09-30):
+    // its baselines are skipped whole, published content untouched.
+    const rootsOnDisk = new Set(await discoverWikiRoots(localConfig.projectRoot));
+    const excludedRoots = new Set(excludeWikiRoots);
     for (const [key, baseline] of Object.entries(state.publishedFiles ?? {})) {
+      const wikiPrefix = matchWikiPublishPrefix(key, publishProjectId);
       const prefix = key.startsWith(`docs/${publishProjectId}/`)
         ? `docs/${publishProjectId}/`
-        : key.startsWith(`.wiki/${publishProjectId}/`)
-          ? `.wiki/${publishProjectId}/`
-          : null;
+        : wikiPrefix?.prefix ?? null;
       if (!prefix) continue;
       const repoFile = path.join(localConfig.repo.localPath, key);
       if (!(await pathExists(repoFile))) {
@@ -1342,9 +1369,22 @@ async function pushCore(
         staleBaselines.push(key);
         continue;
       }
+      if (wikiPrefix) {
+        if (!rootsOnDisk.has(wikiPrefix.root)) {
+          log.info(
+            `[pending-delete] Kept ${key}: wiki root ${wikiPrefix.root} is absent from the project (renamed or moved). ` +
+              'Its published content stays untouched; delete it from the team repo explicitly if that is intended.',
+          );
+          continue;
+        }
+        if (excludedRoots.has(wikiPrefix.root)) {
+          log.debug(`[pending-delete] Skipped ${key}: wiki root ${wikiPrefix.root} is excluded this run.`);
+          continue;
+        }
+      }
       const sourceRoot = prefix.startsWith('docs/')
         ? path.join(localConfig.projectRoot, 'docs')
-        : path.join(localConfig.projectRoot, '.wiki');
+        : path.join(localConfig.projectRoot, wikiPrefix!.root);
       if (await pathExists(path.join(sourceRoot, key.slice(prefix.length)))) continue;
       pendingDeletes.push({ rel: key, remoteChanged: (await fileDigest(repoFile)) !== baseline });
     }

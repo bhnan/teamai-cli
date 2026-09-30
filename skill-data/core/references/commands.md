@@ -43,6 +43,7 @@ Generated: do not edit by hand. Regenerate with
   - `--project <id>` — Project scope for this push. The project must be active in this directory and declared in manifest/projects.yaml; docs and wiki publish to docs/<id>/ and .wiki/<id>/, and other new resources go to that project's namespaces
   - `--branch <name>` — Push to this destination branch instead of a generated teamai/push branch
   - `--force` — Overwrite held docs/wiki publish conflicts listed before the push (their paths are shown first)
+  - `--exclude-wiki-root <name>` — Skip this wiki root directory this run (e.g. .dev_wiki); repeatable. Its published content is kept untouched, not deleted
 
 ## pull
 

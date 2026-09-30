@@ -4,6 +4,7 @@ import { requireInit, detectProjectConfig, describeUnreadableConfig, loadLocalCo
 import { loadIndex, buildIndex, search, isLegacyIndex } from './utils/search-index.js';
 import type { BuildIndexOptions, SearchResult } from './utils/search-index.js';
 import { ensureDir, pathExists, readFileSafe } from './utils/fs.js';
+import { parseWikiPagePath } from './utils/wiki-roots.js';
 import { log } from './utils/logger.js';
 import type { GlobalOptions, SearchIndex, LocalConfig } from './types.js';
 import { getProjectSearchIndexPath, getUserSearchIndexPath, getVotesDir, getWikiSharing } from './types.js';
@@ -457,15 +458,19 @@ export async function recall(
 
   // ── Wiki page source resolution mode ─────────────────────────────────
   // The agent reads a wiki page from the team-repo clone (convention:
-  // `.wiki/<pid>/<name>wiki/…`), then asks the CLI to resolve and verify the
-  // page's frontmatter `sources[].path` against the clone. Only anchors that
-  // map to a unique in-scope file whose SHA-256 matches are `verified` and may
-  // be cited; everything else is reported with a reason. Retrieval is never
-  // gated on these checks — this mode only decides citability.
+  // `<wikiRoot>/<pid>/<name>wiki/…` — `.wiki/` and any other discovered root),
+  // then asks the CLI to resolve and verify the page's frontmatter
+  // `sources[].path` against the clone. Only anchors that map to a unique
+  // in-scope file whose SHA-256 matches are `verified` and may be cited;
+  // everything else is reported with a reason. Retrieval is never gated on
+  // these checks — this mode only decides citability.
   if (options.wikiPage) {
     const pageRepoPath = options.wikiPage.replace(/^\.\//, '');
-    if (!pageRepoPath.startsWith('.wiki/') || pageRepoPath.split('/').includes('..')) {
-      log.error(`Invalid wiki page path: ${options.wikiPage} (expected a repo-relative path under .wiki/)`);
+    if (parseWikiPagePath(pageRepoPath) === null || pageRepoPath.split('/').includes('..')) {
+      log.error(
+        `Invalid wiki page path: ${options.wikiPage} ` +
+          '(expected a repo-relative path under a wiki root, e.g. .wiki/<projectId>/<collection>/…)',
+      );
       process.exitCode = 1;
       return;
     }

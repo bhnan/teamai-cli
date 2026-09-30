@@ -164,6 +164,21 @@ export async function verifyWikiSource(
   return { ...base, status: 'verified', resolved: candidate, sha256: actual };
 }
 
+
+/**
+ * The explicit `map` rules of the wiki source config a page belongs to, keyed
+ * by the collection id in the page path (`<wikiRoot>/<pid>/<collection>/…`).
+ * Pure: any wiki root name qualifies, `.wiki` like the rest (change 2026-09-30).
+ */
+export function matchWikiSourceCollection(
+  pageRepoPath: string,
+  wiki: WikiSharingConfig | undefined,
+): WikiPathMap[] | undefined {
+  const m = pageRepoPath.match(/^(\.[^/]*wiki)\/[^/]+\/([^/]+)\//);
+  if (!m || !wiki?.sources) return undefined;
+  return wiki.sources.find((s) => s.id === m[2])?.map;
+}
+
 /**
  * Resolve and verify every source anchor of a wiki page.
  *
@@ -189,14 +204,9 @@ export async function resolveWikiPageSources(
     if (p.endsWith('/')) continue; // bare directories are not file anchors.
 
     // Find the source config this page belongs to (by the collection id in
-    // the page path: `.wiki/<pid>/<name>wiki/...`). Without a match the
+    // the page path: `<wikiRoot>/<pid>/<name>wiki/...`). Without a match the
     // default convention still applies — mapping is never blocked by config.
-    let map: WikiPathMap[] | undefined;
-    const m = pageRepoPath.match(/^\.wiki\/[^/]+\/([^/]+)\//);
-    if (m && wiki?.sources) {
-      const cfg = wiki.sources.find((s) => s.id === m[1]);
-      if (cfg) map = cfg.map;
-    }
+    const map = matchWikiSourceCollection(pageRepoPath, wiki);
 
     const { mapped, reason } = mapAnchorPath(p, { pageRepoPath, projectId, map });
     if (!mapped) {

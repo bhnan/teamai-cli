@@ -95,10 +95,16 @@ step "push requires active --project"
 node "$CLI" push --project other >"$WORK/push-bad.log" 2>&1; rc=$?
 [ $rc -ne 0 ] && grep -Eq "not active in this directory|not declared in manifest" "$WORK/push-bad.log" && ok "unknown/inactive project rejected" || { bad "inactive project accepted"; cat "$WORK/push-bad.log"; }
 
-step "push: one-way docs and wiki publish"
-mkdir -p "$PROJ/docs" "$PROJ/.wiki/spec"
+step "push: one-way docs and wiki publish (multi-root discovery)"
+mkdir -p "$PROJ/docs" "$PROJ/.wiki/spec" "$PROJ/.dev_wiki" "$PROJ/.wiki_backup" "$PROJ/.dev_Wiki" "$PROJ/child/.wiki"
 echo "# project handbook" > "$PROJ/docs/handbook.md"
 echo "# wiki page" > "$PROJ/.wiki/spec/overview.md"
+echo "# business index" > "$PROJ/.wiki/index.md"
+echo "# dev index" > "$PROJ/.dev_wiki/index.md"
+echo "# dev guide" > "$PROJ/.dev_wiki/guide.md"
+echo "# ignored backup" > "$PROJ/.wiki_backup/ignored.md"
+echo "# capital W" > "$PROJ/.dev_Wiki/capital.md"
+echo "# nested child" > "$PROJ/child/.wiki/nested.md"
 TEAMAI_NONINTERACTIVE=1 node "$CLI" push --all >"$WORK/push1.log" 2>&1; rc=$?
 # provider git on a file:// remote opens no PR (exit 1); the pushed branch is the publish.
 if [ $rc -eq 0 ] || grep -q "has been pushed" "$WORK/push1.log"; then ok "push published (rc=$rc)"; else bad "push failed rc=$rc: $(tail -5 "$WORK/push1.log")"; fi
@@ -111,6 +117,12 @@ done
 git -C "$SEED" push -q origin main
 git -C "$SEED" show origin/main:docs/demo/handbook.md >/dev/null 2>&1 && ok "docs/demo/handbook.md on main" || bad "handbook not on main"
 git -C "$SEED" show origin/main:.wiki/demo/spec/overview.md >/dev/null 2>&1 && ok ".wiki/demo/spec/overview.md on main" || bad "wiki page not on main"
+git -C "$SEED" show origin/main:.wiki/demo/index.md >/dev/null 2>&1 && ok ".wiki/demo/index.md on main" || bad ".wiki index not on main"
+git -C "$SEED" show origin/main:.dev_wiki/demo/index.md >/dev/null 2>&1 && ok ".dev_wiki/demo/index.md on main (same-name isolated)" || bad ".dev_wiki index not on main"
+git -C "$SEED" show origin/main:.dev_wiki/demo/guide.md >/dev/null 2>&1 && ok ".dev_wiki/demo/guide.md on main" || bad ".dev_wiki guide not on main"
+git -C "$SEED" show origin/main:.wiki_backup/demo/ignored.md >/dev/null 2>&1 && bad ".wiki_backup was published" || ok ".wiki_backup not published"
+git -C "$SEED" show origin/main:.dev_Wiki/demo/capital.md >/dev/null 2>&1 && bad ".dev_Wiki was published" || ok ".dev_Wiki (capital W) not published"
+git -C "$SEED" show origin/main:child/.wiki/nested.md >/dev/null 2>&1 && bad "nested child wiki published" || ok "child/.wiki not published"
 
 step "published baseline: unchanged second push is a no-op, remote edit is held"
 TEAMAI_NONINTERACTIVE=1 node "$CLI" push --all >"$WORK/push2.log" 2>&1
@@ -132,6 +144,36 @@ rm "$PROJ/docs/handbook.md"
 sleep 1.2
 TEAMAI_NONINTERACTIVE=1 node "$CLI" push --types docs,wiki --all >"$WORK/push4.log" 2>&1
 grep -q "Kept docs/demo/handbook.md\|kept" "$WORK/push4.log" && ok "pending-delete kept non-interactively" || bad "pending-delete not kept: $(tail -5 "$WORK/push4.log")"
+
+step "multi-root: push --dry-run previews without publishing"
+echo "# wiki page v2" > "$PROJ/.wiki/spec/overview.md"
+WIKI_DRY_BEFORE=$(git -C "$CLONE" ls-remote --heads origin | wc -l | tr -d ' ')
+TEAMAI_NONINTERACTIVE=1 node "$CLI" push --types wiki --dry-run >"$WORK/push-wdry.log" 2>&1
+WIKI_DRY_AFTER=$(git -C "$CLONE" ls-remote --heads origin | wc -l | tr -d ' ')
+grep -q "roots: .dev_wiki, .wiki" "$WORK/push-wdry.log" && ok "dry-run lists discovered roots" || bad "roots line missing: $(grep 'roots:' "$WORK/push-wdry.log" | head -1)"
+grep -q "\[wiki\] .wiki/spec/overview.md" "$WORK/push-wdry.log" && ok "dry-run lists the changed wiki page" || bad "dry-run preview missing the wiki item: $(tail -3 "$WORK/push-wdry.log")"
+[ "$WIKI_DRY_BEFORE" = "$WIKI_DRY_AFTER" ] && ok "wiki dry-run pushed no branch" || bad "wiki dry-run changed remote branches"
+
+step "multi-root: --exclude-wiki-root keeps that root's published content untouched"
+echo "# dev index v2" > "$PROJ/.dev_wiki/index.md"
+TEAMAI_NONINTERACTIVE=1 node "$CLI" push --types wiki --exclude-wiki-root .dev_wiki --all >"$WORK/push-excl.log" 2>&1; rc=$?
+if [ $rc -eq 0 ] || grep -q "has been pushed" "$WORK/push-excl.log"; then ok "excluded push published (rc=$rc)"; else bad "excluded push failed rc=$rc: $(tail -5 "$WORK/push-excl.log")"; fi
+grep -q "excluded this run: .dev_wiki" "$WORK/push-excl.log" && ok "exclusion reported" || bad "exclusion not reported: $(grep 'roots:' "$WORK/push-excl.log" | head -1)"
+git -C "$SEED" fetch -q origin
+git -C "$SEED" checkout -q main && git -C "$SEED" reset -q --hard origin/main
+for b in $(git -C "$SEED" for-each-ref --format='%(refname:short)' refs/remotes/origin | grep -v 'origin/main$'); do
+  git -C "$SEED" merge --no-edit -q "$b" || bad "merge of $b failed"
+done
+git -C "$SEED" push -q origin main
+git -C "$SEED" show origin/main:.wiki/demo/spec/overview.md | grep -q "v2" && ok ".wiki update published" || bad ".wiki update missing"
+git -C "$SEED" show origin/main:.dev_wiki/demo/index.md | grep -q "# dev index$" && ok "excluded root untouched on main" || bad "excluded root changed on main"
+
+step "multi-root: an absent root never reads as delete-everything"
+mv "$PROJ/.dev_wiki" "$PROJ/.dev_wiki_holding"
+TEAMAI_NONINTERACTIVE=1 node "$CLI" push --types wiki >"$WORK/push-absent.log" 2>&1
+grep -q "wiki root .dev_wiki is absent from the project" "$WORK/push-absent.log" && ok "absent root kept explicitly" || bad "absent-root protection missing: $(grep -i "absent\|pending-delete" "$WORK/push-absent.log" | head -3)"
+git -C "$SEED" show origin/main:.dev_wiki/demo/index.md >/dev/null 2>&1 && ok "absent root's published content still on main" || bad "absent root content vanished"
+mv "$PROJ/.dev_wiki_holding" "$PROJ/.dev_wiki"
 
 step "shared get: install → unchanged → conflict → force (user-global only)"
 CLAUDE_HOME="$HOME/.claude"; mkdir -p "$CLAUDE_HOME/skills"

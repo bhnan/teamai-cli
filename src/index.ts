@@ -153,6 +153,8 @@ program
     + 'docs and wiki publish to docs/<id>/ and .wiki/<id>/, and other new resources go to that project\'s namespaces')
   .option('--branch <name>', 'Push to this destination branch instead of a generated teamai/push branch')
   .option('--force', 'Overwrite held docs/wiki publish conflicts listed before the push (their paths are shown first)')
+  .option('--exclude-wiki-root <name>', 'Skip this wiki root directory this run (e.g. .dev_wiki); repeatable. Its published content is kept untouched, not deleted',
+    (val: string, acc: string[]) => acc.concat(val), [] as string[])
   .action(async (cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;
     const { push } = await import('./push.js');

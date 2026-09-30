@@ -39,10 +39,16 @@ export interface ScanForPushOptions {
   /**
    * The logical project this push runs as, resolved from the directory's
    * active projects (007). Only the one-way published types read it: docs and
-   * wiki land under `docs/<projectId>/` and `.wiki/<projectId>/`, so their
+   * wiki land under `docs/<projectId>/` and `<wikiRoot>/<projectId>/`, so their
    * scan cannot decide new-vs-modified without it.
    */
   projectId?: string;
+  /**
+   * Wiki root names (`--exclude-wiki-root`) to skip this run (wiki only). An
+   * excluded root is neither published nor considered for deletion: its
+   * published content stays exactly as it is.
+   */
+  excludeRoots?: string[];
 }
 
 export abstract class ResourceHandler {
